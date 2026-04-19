@@ -1,0 +1,30 @@
+# Verisim — Gas Station / Convenience Store industry generator
+# Requires: verisim-base stack running first (provides postgres + verisim_network)
+# 260320 - initial setup
+# 260320 - config.yaml moved to stacks/verisim-gas-station/ (self-contained redeploy)
+# 260321 - renamed from datagen-gasstation to verisim-gas-station
+
+services:
+
+  verisim-gas-station:
+    container_name: verisim-gas-station
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: verisim-base-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${VERISIM_POSTGRES_DB}
+      CONF_PATH: /config/config.yaml
+      TZ: ${TZ}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    restart: always
+    networks:
+      - verisim_network
+
+networks:
+  verisim_network:
+    external: true

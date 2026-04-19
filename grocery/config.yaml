@@ -1,0 +1,188 @@
+# =============================================================================
+# Data Generator — Grocery / Supermarket
+# Configuration file — mounted read-only into the generator container.
+# Changes here take effect on the next tick (no restart needed).
+# =============================================================================
+
+generator:
+  tick_interval_seconds: 30        # wall-clock seconds between generation ticks
+  simulation_minutes_per_tick: 15  # simulated time each tick represents
+
+locations:
+  store_count: 3                   # number of store locations
+  warehouse_count: 1               # number of warehouse / DC locations
+  store_employees_per_location:
+    min: 20
+    max: 40
+  warehouse_employees_per_location:
+    min: 10
+    max: 20
+
+volumes:
+  pos_transactions_per_day:
+    min: 800
+    max: 3000
+
+  # 24 hourly weights — grocery peaks at late morning/early afternoon and after work
+  hourly_weights:
+    - 0.00   # 0  closed
+    - 0.00   # 1
+    - 0.00   # 2
+    - 0.00   # 3
+    - 0.00   # 4
+    - 0.01   # 5  early stocking/open
+    - 0.02   # 6
+    - 0.04   # 7  morning shoppers
+    - 0.06   # 8
+    - 0.08   # 9  busy morning
+    - 0.09   # 10 peak morning
+    - 0.09   # 11
+    - 0.08   # 12 lunch rush
+    - 0.07   # 13
+    - 0.07   # 14
+    - 0.07   # 15
+    - 0.08   # 16 after-school/work
+    - 0.09   # 17 PM rush peak
+    - 0.08   # 18 dinner prep
+    - 0.06   # 19
+    - 0.04   # 20
+    - 0.03   # 21 late shoppers
+    - 0.01   # 22
+    - 0.00   # 23
+
+  day_of_week_multipliers:
+    monday:    0.88
+    tuesday:   0.85
+    wednesday: 0.90
+    thursday:  0.95
+    friday:    1.10
+    saturday:  1.25   # biggest grocery day
+    sunday:    1.15
+
+loyalty:
+  signup_rate: 0.06        # slightly higher than gas station
+  loyalty_usage_rate: 0.40 # grocery loyalty cards used more often
+
+products:
+  initial_count: 500       # more SKUs than gas station
+  departments:
+    - name: Produce
+      code: PRD
+      categories:
+        - name: Vegetables
+          subcategories: [Leafy Greens, Root Vegetables, Squash, Peppers, Onions, Tomatoes]
+        - name: Fruits
+          subcategories: [Apples, Citrus, Berries, Tropical, Melons, Stone Fruit]
+    - name: Dairy & Eggs
+      code: DAI
+      categories:
+        - name: Dairy
+          subcategories: [Milk, Cheese, Yogurt, Butter, Cream, Sour Cream]
+        - name: Eggs
+          subcategories: [Large, Extra Large, Organic, Free Range]
+    - name: Meat & Seafood
+      code: MEA
+      categories:
+        - name: Beef
+          subcategories: [Ground Beef, Steaks, Roasts, Short Ribs]
+        - name: Pork
+          subcategories: [Chops, Ribs, Sausage, Bacon, Ham]
+        - name: Poultry
+          subcategories: [Chicken Breast, Chicken Thighs, Whole Chicken, Turkey, Ground Turkey]
+        - name: Seafood
+          subcategories: [Salmon, Tilapia, Shrimp, Tuna, Cod]
+    - name: Bakery
+      code: BAK
+      categories:
+        - name: Bread
+          subcategories: [White, Wheat, Sourdough, Rye, Rolls, Baguettes]
+        - name: Pastries
+          subcategories: [Muffins, Croissants, Donuts, Danish, Cakes, Cookies]
+    - name: Deli
+      code: DEL
+      categories:
+        - name: Prepared Foods
+          subcategories: [Rotisserie, Salads, Hot Foods, Sandwiches, Soups]
+        - name: Deli Meats
+          subcategories: [Turkey, Ham, Salami, Roast Beef, Bologna]
+        - name: Cheese Counter
+          subcategories: [Cheddar, Swiss, Provolone, Brie, Gouda, Pepper Jack]
+    - name: Frozen Foods
+      code: FRZ
+      categories:
+        - name: Frozen Meals
+          subcategories: [Pizza, Burritos, TV Dinners, Pot Pies, Pasta]
+        - name: Frozen Vegetables
+          subcategories: [Peas, Corn, Green Beans, Broccoli, Mixed Vegetables]
+        - name: Ice Cream
+          subcategories: [Vanilla, Chocolate, Novelty Bars, Sherbet, Gelato]
+    - name: Beverages
+      code: BEV
+      categories:
+        - name: Cold Drinks
+          subcategories: [Soda, Juice, Water, Sports Drinks, Energy Drinks, Tea, Coffee]
+        - name: Alcohol
+          subcategories: [Beer, Wine, Hard Cider, Hard Seltzer, Spirits]
+    - name: Snacks & Candy
+      code: SNK
+      categories:
+        - name: Snacks
+          subcategories: [Chips, Pretzels, Popcorn, Crackers, Nuts, Granola Bars, Rice Cakes]
+        - name: Candy
+          subcategories: [Chocolate, Gummies, Hard Candy, Mints, Licorice]
+    - name: Canned & Dry Goods
+      code: CDG
+      categories:
+        - name: Canned Goods
+          subcategories: [Soup, Vegetables, Beans, Tomatoes, Tuna, Fruit]
+        - name: Dry Goods
+          subcategories: [Pasta, Rice, Cereal, Oatmeal, Flour, Sugar, Dried Beans]
+    - name: Household
+      code: HOU
+      categories:
+        - name: Cleaning
+          subcategories: [Laundry, Dish Soap, All-Purpose Cleaner, Paper Towels, Toilet Paper]
+        - name: Kitchen
+          subcategories: [Foil, Plastic Wrap, Bags, Storage Containers]
+    - name: Personal Care
+      code: PCR
+      categories:
+        - name: Health
+          subcategories: [Pain Relievers, Vitamins, Cold & Flu, First Aid, Digestion]
+        - name: Beauty
+          subcategories: [Shampoo, Conditioner, Body Wash, Deodorant, Lotion, Razors]
+
+pricing:
+  product_price_change_frequency_days: 14   # grocery prices change more often than gas station
+  tax_rate: 0.07                            # most groceries taxed lower / exempt
+
+inventory:
+  initial_stock_per_product: 200
+  restock_check_frequency_hours: 24
+  restock_threshold_pct: 0.25
+
+coupons:
+  active_at_any_time: 8            # how many coupons are active at once
+  valid_duration_days: 14          # coupon validity window
+  coupon_use_rate: 0.20            # probability a loyalty member uses a coupon
+
+combo_deals:
+  active_at_any_time: 4            # how many combo deals active at once
+  valid_duration_days: 7
+  combo_use_rate: 0.15             # probability a transaction triggers a deal
+
+scenarios:
+  rush_hour:
+    volume_multiplier: 2.0
+    hours: [9, 10, 11, 17, 18, 19]
+  weekend:
+    volume_multiplier: 1.3
+  holiday_week:
+    volume_multiplier: 1.6
+    coupon_use_boost: 1.5
+  double_coupons:
+    coupon_multiplier: 2.0
+    volume_multiplier: 1.1
+  promotion:
+    discount_pct: 0.15
+    affected_departments: [Produce, Dairy & Eggs, Snacks & Candy]

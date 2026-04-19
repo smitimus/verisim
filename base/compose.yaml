@@ -1,0 +1,87 @@
+# Verisim Base — shared infrastructure for all industry generators
+# Services: postgres (shared DB), api (FastAPI), ui (Streamlit control panel)
+# Industry generator stacks connect to verisim_network as an external network.
+# 260320 - initial setup
+# 260320 - moved init scripts to stacks/verisim-base/db/ for self-contained redeployment
+# 260321 - renamed from datagen to verisim-base
+# 260321 - added multi-industry DB env vars (GAS_STATION_DB, GROCERY_DB)
+
+services:
+
+  verisim-base-postgres:
+    container_name: verisim-base-postgres
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${VERISIM_POSTGRES_DB}
+      TZ: ${TZ}
+    volumes:
+      - ${CONF}/verisim-base/postgres/data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${VERISIM_POSTGRES_PORT:-5499}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${VERISIM_POSTGRES_USER}", "-d", "${VERISIM_POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: always
+    networks:
+      - verisim_network
+
+  verisim-base-api:
+    container_name: verisim-base-api
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: verisim-base-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
+      GAS_STATION_DB: ${VERISIM_POSTGRES_DB}
+      GROCERY_DB: ${VERISIM_GROCERY_DB}
+      TZ: ${TZ}
+    ports:
+      - "${VERISIM_API_PORT:-8010}:8000"
+    depends_on:
+      verisim-base-postgres:
+        condition: service_healthy
+    restart: always
+    labels:
+      - homepage.group=${HOMEPAGE_GROUP}
+      - homepage.name=Verisim API
+      - homepage.icon=fastapi.png
+      - homepage.href=http://${IP}:${VERISIM_API_PORT:-8010}/docs
+      - homepage.description=Multi-industry mock data REST API
+    networks:
+      - verisim_network
+
+  verisim-base-ui:
+    container_name: verisim-base-ui
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    environment:
+      API_BASE_URL: http://verisim-base-api:8000
+      TZ: ${TZ}
+    ports:
+      - "${VERISIM_UI_PORT:-8501}:8501"
+    depends_on:
+      - verisim-base-api
+    restart: always
+    labels:
+      - homepage.group=${HOMEPAGE_GROUP}
+      - homepage.name=Verisim UI
+      - homepage.icon=streamlit.png
+      - homepage.href=http://${IP}:${VERISIM_UI_PORT:-8501}/
+      - homepage.description=Data generator control panel
+    networks:
+      - verisim_network
+
+networks:
+  verisim_network:
+    name: verisim_network
+    driver: bridge

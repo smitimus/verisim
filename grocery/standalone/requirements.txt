@@ -1,0 +1,16 @@
+# API (verisim-base/api)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+psycopg2-binary==2.9.10
+pydantic==2.10.4
+python-dateutil==2.9.0
+
+# UI (verisim-base/ui)
+streamlit==1.41.1
+requests==2.32.3
+pandas==2.2.3
+plotly==5.24.1
+
+# Generator (verisim-grocery/generator)
+faker==24.0.0
+pyyaml==6.0.1

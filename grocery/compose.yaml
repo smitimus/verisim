@@ -1,0 +1,104 @@
+# Verisim Grocery — self-contained dev stack
+# Services: postgres, api (grocery-only, gas-station routes stripped), ui, generator
+# 260321 - initial setup (generator only, required verisim-base)
+# 260405 - redesigned: self-contained dev stack, no longer depends on verisim-base
+
+services:
+
+  verisim-grocery-dev-postgres:
+    container_name: verisim-grocery-dev-postgres
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${VERISIM_GROCERY_DB}
+      TZ: ${TZ}
+    volumes:
+      - ${CONF}/verisim-grocery-dev:/var/lib/postgresql/data
+    ports:
+      - "${VERISIM_POSTGRES_PORT:-5499}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${VERISIM_POSTGRES_USER}", "-d", "${VERISIM_GROCERY_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - verisim_grocery_dev
+
+  verisim-grocery-dev-api:
+    container_name: verisim-grocery-dev-api
+    build:
+      context: ../
+      dockerfile: grocery/api/Dockerfile
+    environment:
+      POSTGRES_HOST: verisim-grocery-dev-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
+      GROCERY_DB: ${VERISIM_GROCERY_DB}
+      TZ: ${TZ}
+    ports:
+      - "${VERISIM_API_PORT:-8010}:8000"
+    depends_on:
+      verisim-grocery-dev-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      - homepage.group=${HOMEPAGE_GROUP}
+      - homepage.name=Verisim API
+      - homepage.icon=fastapi.png
+      - homepage.href=http://${IP}:${VERISIM_API_PORT:-8010}/docs
+      - homepage.description=Verisim Grocery API (dev)
+    networks:
+      - verisim_grocery_dev
+
+  verisim-grocery-dev-ui:
+    container_name: verisim-grocery-dev-ui
+    build:
+      context: ../base/ui
+      dockerfile: Dockerfile
+    environment:
+      API_BASE_URL: http://verisim-grocery-dev-api:8000
+      TZ: ${TZ}
+    ports:
+      - "${VERISIM_UI_PORT:-8501}:8501"
+    depends_on:
+      - verisim-grocery-dev-api
+    restart: unless-stopped
+    labels:
+      - homepage.group=${HOMEPAGE_GROUP}
+      - homepage.name=Verisim UI
+      - homepage.icon=streamlit.png
+      - homepage.href=http://${IP}:${VERISIM_UI_PORT:-8501}/
+      - homepage.description=Verisim Grocery UI (dev)
+    networks:
+      - verisim_grocery_dev
+
+  verisim-grocery-dev-generator:
+    container_name: verisim-grocery-dev-generator
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: verisim-grocery-dev-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${VERISIM_GROCERY_DB}
+      CONF_PATH: /config/config.yaml
+      TZ: ${TZ}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    depends_on:
+      verisim-grocery-dev-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - verisim_grocery_dev
+
+networks:
+  verisim_grocery_dev:
+    name: verisim_grocery_dev
+    driver: bridge

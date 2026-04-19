@@ -1,0 +1,28 @@
+# Verisim Grocery — local standalone test stack
+# Runs the locally-built standalone image (verisim-grocery:local) before pushing to Docker Hub.
+# Build the image first via: ./switch.sh test  (or manually: docker build -t verisim-grocery:local -f grocery/standalone/Dockerfile .)
+# 260405 - initial setup
+
+services:
+
+  verisim-grocery-test:
+    container_name: verisim-grocery-test
+    image: verisim-grocery:local
+    ports:
+      - "${VERISIM_POSTGRES_PORT:-5499}:5432"
+      - "${VERISIM_API_PORT:-8010}:8000"
+      - "${VERISIM_UI_PORT:-8501}:8501"
+    environment:
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER:-verisim}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD:-verisim}
+      POSTGRES_DB: ${VERISIM_GROCERY_DB:-grocery}
+      TZ: ${TZ}
+    volumes:
+      - ${CONF}/verisim-grocery-test:/var/lib/postgresql/data
+    restart: unless-stopped
+    labels:
+      - homepage.group=${HOMEPAGE_GROUP}
+      - homepage.name=Verisim Grocery (test)
+      - homepage.icon=docker.png
+      - homepage.href=http://${IP}:${VERISIM_UI_PORT:-8501}/
+      - homepage.description=Grocery mock data generator — local standalone test

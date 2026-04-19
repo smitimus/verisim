@@ -1,0 +1,110 @@
+# =============================================================================
+# Data Generator — Gas Station / Convenience Store
+# Configuration file — mounted read-only into the generator container.
+# Changes here take effect on the next tick (no restart needed).
+# =============================================================================
+
+generator:
+  tick_interval_seconds: 30        # wall-clock seconds between generation ticks
+  simulation_minutes_per_tick: 15  # simulated time each tick represents
+
+locations:
+  count: 3
+  employees_per_location:
+    min: 8
+    max: 15
+  pumps_per_location:
+    min: 4
+    max: 8
+
+volumes:
+  pos_transactions_per_day:
+    min: 500
+    max: 2000
+  fuel_transactions_per_day:
+    min: 300
+    max: 1000
+
+  # 24 hourly weights (index 0 = midnight, index 7-8 = AM rush, index 16-17 = PM rush)
+  # Values are relative weights; they are normalised internally.
+  hourly_weights:
+    - 0.01   # 0  midnight
+    - 0.01   # 1
+    - 0.01   # 2
+    - 0.01   # 3
+    - 0.02   # 4
+    - 0.03   # 5  early commuters
+    - 0.05   # 6
+    - 0.08   # 7  AM rush start
+    - 0.09   # 8  AM rush peak
+    - 0.07   # 9
+    - 0.05   # 10
+    - 0.05   # 11
+    - 0.06   # 12 lunch
+    - 0.05   # 13
+    - 0.04   # 14
+    - 0.05   # 15
+    - 0.07   # 16 PM rush start
+    - 0.09   # 17 PM rush peak
+    - 0.07   # 18
+    - 0.05   # 19
+    - 0.04   # 20
+    - 0.03   # 21
+    - 0.02   # 22
+    - 0.01   # 23
+
+  day_of_week_multipliers:
+    monday:    0.90
+    tuesday:   0.88
+    wednesday: 0.92
+    thursday:  0.95
+    friday:    1.15
+    saturday:  1.20
+    sunday:    1.00
+
+loyalty:
+  signup_rate: 0.05          # probability a new loyalty member is created per transaction
+  loyalty_usage_rate: 0.25   # probability an existing member uses their card
+
+products:
+  initial_count: 200
+  categories:
+    - name: Beverages
+      subcategories: [Coffee, Fountain, Bottled Water, Energy Drinks, Juice, Sports Drinks]
+    - name: Snacks
+      subcategories: [Chips, Candy, Nuts, Crackers, Jerky]
+    - name: Food
+      subcategories: [Hot Dogs, Sandwiches, Pizza Slices, Pastries]
+    - name: Tobacco
+      subcategories: [Cigarettes, Cigars, Chewing Tobacco, Vape]
+    - name: Automotive
+      subcategories: [Motor Oil, Wiper Fluid, Air Fresheners, Car Wash]
+    - name: Health & Beauty
+      subcategories: [Pain Relievers, Bandages, Chapstick, Sunscreen]
+    - name: Grocery
+      subcategories: [Bread, Dairy, Eggs, Canned Goods]
+
+pricing:
+  fuel_price_change_frequency_days: 3.5    # average days between fuel price changes
+  fuel_price_change_pct_max: 0.08          # max swing ±8% per change
+  product_price_change_frequency_days: 30  # average days between product price changes
+  tax_rate: 0.08                           # sales tax rate applied to POS subtotals
+
+inventory:
+  initial_stock_per_product: 150           # starting quantity_on_hand per product per location
+  restock_check_frequency_hours: 24        # how often to check for low stock (simulated)
+  restock_threshold_pct: 0.20             # restock when below 20% of initial stock
+
+scenarios:
+  rush_hour:
+    volume_multiplier: 2.5
+    hours: [7, 8, 16, 17, 18]
+  weekend:
+    volume_multiplier: 1.3
+  promotion:
+    discount_pct: 0.15
+    affected_categories: [Snacks, Beverages]
+    duration_hours: 4
+  fuel_spike:
+    price_increase_pct: 0.12
+    duration_hours: 48
