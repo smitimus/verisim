@@ -495,6 +495,7 @@ def hr_employees(
     department: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = Query(500, le=2000),
+    offset: int = 0,
 ):
     pool_for(industry)
     filters, params = ["TRUE"], []
@@ -508,12 +509,14 @@ def hr_employees(
         filters.append("status = %s")
         params.append(status)
     where = " AND ".join(filters)
-    return query(f"""
+    total = query(f"SELECT COUNT(*) AS n FROM hr.employees WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
         SELECT employee_id, location_id, first_name, last_name, email,
                hire_date, termination_date, department, job_title, hourly_rate, status
         FROM hr.employees WHERE {where}
-        ORDER BY last_name, first_name LIMIT %s
-    """, params + [limit], industry)
+        ORDER BY last_name, first_name LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +638,7 @@ def pos_products(
     department: Optional[str] = None,
     is_active: Optional[bool] = None,
     limit: int = Query(500, le=2000),
+    offset: int = 0,
 ):
     pool_for(industry)
     filters, params = ["TRUE"], []
@@ -651,7 +655,12 @@ def pos_products(
             filters.append("d.name = %s")
             params.append(department)
             where = " AND ".join(filters)
-        return query(f"""
+        total = query(f"""
+            SELECT COUNT(*) AS n FROM pos.products p
+            JOIN pos.departments d ON d.department_id = p.department_id
+            WHERE {where}
+        """, params, industry)[0]["n"]
+        rows = query(f"""
             SELECT p.product_id, p.sku, p.upc, p.name, p.brand,
                    d.name AS department, p.category, p.subcategory,
                    p.unit_size, p.unit_of_measure, p.cost, p.current_price,
@@ -659,14 +668,17 @@ def pos_products(
             FROM pos.products p
             JOIN pos.departments d ON d.department_id = p.department_id
             WHERE {where}
-            ORDER BY d.name, p.category, p.name LIMIT %s
-        """, params + [limit], industry)
+            ORDER BY d.name, p.category, p.name LIMIT %s OFFSET %s
+        """, params + [limit, offset], industry)
+        return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
-    return query(f"""
+    total = query(f"SELECT COUNT(*) AS n FROM pos.products p WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
         SELECT product_id, sku, name, category, subcategory, cost, current_price, is_active
         FROM pos.products p WHERE {where}
-        ORDER BY category, name LIMIT %s
-    """, params + [limit], industry)
+        ORDER BY category, name LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/{industry}/pos/loyalty-members", tags=["POS"])
@@ -696,6 +708,7 @@ def pos_price_history(
     industry: str,
     product_id: Optional[str] = None,
     limit: int = Query(200, le=1000),
+    offset: int = 0,
 ):
     pool_for(industry)
     filters, params = ["TRUE"], []
@@ -703,14 +716,18 @@ def pos_price_history(
         filters.append("ph.product_id = %s::uuid")
         params.append(product_id)
     where = " AND ".join(filters)
-    return query(f"""
+    total = query(f"""
+        SELECT COUNT(*) AS n FROM pos.price_history ph WHERE {where}
+    """, params, industry)[0]["n"]
+    rows = query(f"""
         SELECT ph.price_history_id, p.name AS product_name, p.category,
                ph.old_price, ph.new_price, ph.changed_at
         FROM pos.price_history ph
         JOIN pos.products p ON p.product_id = ph.product_id
         WHERE {where}
-        ORDER BY ph.changed_at DESC LIMIT %s
-    """, params + [limit], industry)
+        ORDER BY ph.changed_at DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1072,7 @@ def inventory_stock_levels(
     location_id: Optional[str] = None,
     below_reorder_point: bool = False,
     limit: int = Query(500, le=5000),
+    offset: int = 0,
 ):
     pool_for(industry)
     filters, params = ["TRUE"], []
@@ -1064,7 +1082,12 @@ def inventory_stock_levels(
     if below_reorder_point:
         filters.append("sl.quantity_on_hand < ip.reorder_point")
     where = " AND ".join(filters)
-    return query(f"""
+    total = query(f"""
+        SELECT COUNT(*) AS n FROM inv.stock_levels sl
+        JOIN inv.products ip ON ip.product_id = sl.product_id
+        WHERE {where}
+    """, params, industry)[0]["n"]
+    rows = query(f"""
         SELECT sl.stock_id, sl.product_id, sl.location_id, p.name AS product_name,
                p.category, sl.quantity_on_hand, sl.quantity_reserved,
                ip.reorder_point, ip.reorder_qty, sl.last_updated
@@ -1072,8 +1095,9 @@ def inventory_stock_levels(
         JOIN pos.products p ON p.product_id = sl.product_id
         JOIN inv.products ip ON ip.product_id = sl.product_id
         WHERE {where}
-        ORDER BY sl.quantity_on_hand ASC LIMIT %s
-    """, params + [limit], industry)
+        ORDER BY sl.quantity_on_hand ASC LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/{industry}/inventory/receipts", tags=["Inventory"])
@@ -1109,16 +1133,18 @@ def inventory_receipts(
 
 
 @app.get("/{industry}/inventory/products", tags=["Inventory"])
-def inventory_products(industry: str, limit: int = Query(500, le=2000)):
+def inventory_products(industry: str, limit: int = Query(500, le=2000), offset: int = 0):
     pool_for(industry)
-    return query("""
+    total = query("SELECT COUNT(*) AS n FROM inv.products ip", [], industry)[0]["n"]
+    rows = query("""
         SELECT ip.inv_product_id, ip.product_id, p.name AS product_name,
                p.category, p.sku, ip.reorder_point, ip.reorder_qty,
                ip.unit_of_measure, ip.supplier_name, ip.lead_time_days
         FROM inv.products ip
         JOIN pos.products p ON p.product_id = ip.product_id
-        ORDER BY p.category, p.name LIMIT %s
-    """, [limit], industry)
+        ORDER BY p.category, p.name LIMIT %s OFFSET %s
+    """, [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/{industry}/inventory/receipt-items", tags=["Inventory"])
