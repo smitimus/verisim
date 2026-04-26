@@ -839,7 +839,7 @@ def pos_departments():
 def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
     filters, params = ["TRUE"], []
     if active_only:
-        filters.append("is_active = TRUE AND valid_until >= CURRENT_DATE")
+        filters.append("c.is_active = TRUE AND c.valid_until >= CURRENT_DATE")
     where = " AND ".join(filters)
     return query(f"""
         SELECT c.coupon_id, c.code, c.description, c.coupon_type, c.discount_value,
@@ -856,7 +856,7 @@ def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
 def pos_combo_deals(active_only: bool = True):
     filters, params = ["TRUE"], []
     if active_only:
-        filters.append("is_active = TRUE AND valid_until >= CURRENT_DATE")
+        filters.append("cd.is_active = TRUE AND cd.valid_until >= CURRENT_DATE")
     where = " AND ".join(filters)
     return query(f"""
         SELECT cd.deal_id, cd.name, cd.description, cd.deal_type, cd.trigger_qty,
