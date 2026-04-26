@@ -38,12 +38,12 @@ install_docker() {
   apt-get update -qq
   apt-get install -y -qq ca-certificates curl gnupg lsb-release
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/debian/gpg \
+  curl -fsSL "https://download.docker.com/linux/${ID:-debian}/gpg" \
     | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo \
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/debian \
+    https://download.docker.com/linux/${ID:-debian} \
     $(lsb_release -cs) stable" \
     > /etc/apt/sources.list.d/docker.list
   apt-get update -qq
@@ -54,6 +54,8 @@ install_docker() {
 }
 
 main() {
+  [[ -t 0 ]] || { [[ -c /dev/tty ]] && exec </dev/tty; }
+
   banner
 
   echo -e "${BOLD}Press ENTER to continue or Ctrl+C to cancel...${NC}"
