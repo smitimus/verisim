@@ -1577,7 +1577,7 @@ def stats_distributions(industry: str, days: int = Query(30, ge=1, le=365)):
     result["employees_by_department"] = query("""
         SELECT department, COUNT(*) AS employee_count
         FROM hr.employees
-        WHERE is_active = TRUE
+        WHERE status = 'active'
         GROUP BY 1 ORDER BY 2 DESC
     """, None, industry)
 
