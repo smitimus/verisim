@@ -1726,15 +1726,20 @@ with tab6:
     tkeys = [p[0] for p in pairs]
     tlabels = {p[0]: p[1] for p in pairs}
 
-    # Reset stored table when it doesn't belong to the current schema
-    if st.session_state.get("ex_table") not in tkeys:
-        st.session_state["ex_table"] = tkeys[0]
+    # Versioned key: when schema changes, the version increments and the table
+    # selectbox gets a brand-new key with no stored state, so it defaults to the
+    # first option. This avoids mutating a widget key mid-run (which triggers an
+    # extra Streamlit rerun that resets the active tab back to Dashboard).
+    if st.session_state.get("_ex_last_schema") != schema:
+        st.session_state["_ex_schema_ver"] = st.session_state.get("_ex_schema_ver", -1) + 1
+        st.session_state["_ex_last_schema"] = schema
+    _table_key = f"ex_table_v{st.session_state['_ex_schema_ver']}"
 
     with col_t:
         table = st.selectbox(
             "Table", tkeys,
             format_func=lambda k: f"{k}  —  {tlabels[k]}",
-            key="ex_table",
+            key=_table_key,
         )
 
     # ── Row 2: date range (only for tables that need it) ─────────────────────
