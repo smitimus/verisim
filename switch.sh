@@ -11,7 +11,7 @@ set -e
 
 VERISIM_DIR="$(cd "$(dirname "$0")" && pwd)"
 GROCERY_DIR="$VERISIM_DIR/grocery"
-STACKS_DIR="/opt/stacks"
+STACKS_DIR="/opt/data-lab"
 
 # Load env vars for IP/port display
 source "$GROCERY_DIR/.env" 2>/dev/null || true

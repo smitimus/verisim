@@ -958,7 +958,9 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
         r = api_get(path, params)
         if not r:
             return pd.DataFrame(), 0
-        rows = r if isinstance(r, list) else []
+        rows = r.get("data", r) if isinstance(r, dict) else r
+        if not isinstance(rows, list):
+            rows = []
         return pd.DataFrame(rows), len(rows)
 
     p: dict = {}
@@ -1509,7 +1511,8 @@ with tab4:
             st.markdown("#### Weekly Ads")
             ads_resp = api_get("/grocery/pricing/weekly-ads", {"limit": 100})
             ads = (ads_resp.get("data") if isinstance(ads_resp, dict) else ads_resp) or []
-            products_list = api_get("/grocery/pos/products", {"limit": 2000}) or []
+            _products_resp = api_get("/grocery/pos/products", {"limit": 2000}) or {}
+            products_list = (_products_resp.get("data") if isinstance(_products_resp, dict) else _products_resp) or []
             prod_options = {p["name"]: p["product_id"] for p in products_list}
 
             if ads:
