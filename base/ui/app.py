@@ -1724,14 +1724,18 @@ with tab6:
         schema = st.selectbox("Schema", list(SCHEMA_TABLES.keys()), key="ex_schema")
     pairs = SCHEMA_TABLES[schema]
     tkeys = [p[0] for p in pairs]
-    tlabels = [p[1] for p in pairs]
+    tlabels = {p[0]: p[1] for p in pairs}
+
+    # Reset stored table when it doesn't belong to the current schema
+    if st.session_state.get("ex_table") not in tkeys:
+        st.session_state["ex_table"] = tkeys[0]
+
     with col_t:
-        tidx = st.selectbox(
-            "Table", range(len(pairs)),
-            format_func=lambda i: f"{tkeys[i]}  —  {tlabels[i]}",
+        table = st.selectbox(
+            "Table", tkeys,
+            format_func=lambda k: f"{k}  —  {tlabels[k]}",
             key="ex_table",
         )
-    table = tkeys[tidx]
 
     # ── Row 2: date range (only for tables that need it) ─────────────────────
     start_date = end_date = None
