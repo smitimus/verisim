@@ -89,3 +89,23 @@ Both are confirmed fixed on fresh backfill data:
 ## Gas Station Status
 
 Gas station source is fully preserved in `gas-station/`. It requires `verisim-base` running (the shared postgres + api + ui platform in `base/`). Not the active development path — grocery standalone is the primary product.
+
+## Streamlit UI Architecture (`base/ui/app.py`)
+
+**Tab reset bug**: `st.tabs` has no `key` param and resets to tab 0 on every full-app rerun. Fix: every tab's content is wrapped in `@st.fragment` so interactions stay isolated.
+
+**Fragment pattern** — used in every interactive tab:
+```python
+with tabN:
+    @st.fragment          # add run_every=N for auto-refresh tabs (dashboard, distributions)
+    def _tab_name():
+        ...               # all tab content here
+    _tab_name()
+```
+
+**Rules**:
+- `st.rerun()` inside a fragment → must be `st.rerun(scope="fragment")`
+- Module-level vars needed across fragments (e.g. `SCHEMA_TABLES`, `TABLE_DOCS`) must be assigned **before** `st.tabs(...)`, not inside a tab block — fragment functions create local scope
+- New tabs: wrap in `@st.fragment` from the start; don't add bare widget code at tab level
+
+**Current fragment inventory**: `_dashboard` (run_every=15), `_generator_control`, `_scenarios`, `_promotions`, `_distributions` (run_every=15), `_table_explorer`, `_data_dictionary`

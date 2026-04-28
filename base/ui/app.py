@@ -12,7 +12,6 @@ import requests
 import streamlit as st
 
 API = os.environ.get("API_BASE_URL", "http://localhost:8000")
-REFRESH_INTERVAL = 15  # seconds
 
 st.set_page_config(
     page_title="Verisim — Data Generator",
@@ -121,16 +120,6 @@ def api_delete(path: str):
 # ---------------------------------------------------------------------------
 # Auto-refresh logic
 # ---------------------------------------------------------------------------
-
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = time.time()
-
-
-def maybe_rerun():
-    if time.time() - st.session_state.last_refresh > REFRESH_INTERVAL:
-        st.session_state.last_refresh = time.time()
-        st.rerun()
-
 
 # ---------------------------------------------------------------------------
 # Status badge helper
@@ -924,6 +913,139 @@ SCHEMA_TABLES_BY_INDUSTRY = {
     "grocery": GROCERY_SCHEMA_TABLES,
 }
 
+# ---------------------------------------------------------------------------
+# Schema-level documentation (for Data Dictionary tab)
+# ---------------------------------------------------------------------------
+
+GAS_STATION_SCHEMA_DOCS = {
+    "HR": {
+        "description": "Physical store locations and all employees. The root of the data model — every other schema references HR for location and person context.",
+        "tables_summary": [
+            ("hr.locations", "Physical store locations."),
+            ("hr.employees", "All employees across all locations."),
+        ],
+        "notes": "Referenced by POS, Fuel, and Inventory schemas via location_id and employee_id foreign keys.",
+    },
+    "POS": {
+        "description": "Convenience store point-of-sale — transactions, line items, product catalog, and loyalty members.",
+        "tables_summary": [
+            ("pos.transactions", "Every in-store sale. 300–800 transactions/day per location."),
+            ("pos.transaction_items", "Line items for each sale."),
+            ("pos.products", "Product catalog across store categories."),
+            ("pos.loyalty_members", "Loyalty program member records."),
+            ("pos.price_history", "Audit trail of retail price changes."),
+        ],
+        "notes": "The promotion scenario triggers 15% discounts on Snacks and Beverages.",
+    },
+    "Fuel": {
+        "description": "Fuel dispensing operations — pump transactions, grade definitions, price history, and pump hardware at each location.",
+        "tables_summary": [
+            ("fuel.transactions", "Every fuel dispensing event at the pumps."),
+            ("fuel.grades", "Fuel grade definitions and current prices (Regular, Plus, Premium, Diesel)."),
+            ("fuel.price_history", "Audit trail of fuel price changes."),
+            ("fuel.pumps", "Physical pump hardware per location."),
+        ],
+        "notes": "The fuel_spike scenario triggers above-average upward price changes. Prices change every ~3.5 days.",
+    },
+    "Inventory": {
+        "description": "Product stock levels and restocking events. Stock decrements after each POS sale and increments after each supplier delivery.",
+        "tables_summary": [
+            ("inv.stock_levels", "Real-time on-hand quantity per product per location."),
+            ("inv.receipts", "Supplier delivery receipt headers."),
+            ("inv.receipt_items", "Products and quantities in each delivery."),
+            ("inv.products", "Inventory config per product — reorder points, suppliers."),
+        ],
+        "notes": "Restocking receipts are auto-generated when stock drops below the reorder_point threshold.",
+    },
+    "Control": {
+        "description": "Internal generator control tables. Not a business source system — tracks operational state and per-tick generation activity.",
+        "tables_summary": [
+            ("control.generator_state", "Single-row control table. Holds mode, scenario, and timing config."),
+            ("control.generation_stats", "Append-only per-tick activity log. Powers the Dashboard charts."),
+        ],
+        "notes": "These tables exist to support the simulation engine, not the business domain.",
+    },
+}
+
+GROCERY_SCHEMA_DOCS = {
+    "HR": {
+        "description": "Physical locations (stores and warehouses) and all employees. The root of the data model — every other schema references HR for location and person context.",
+        "tables_summary": [
+            ("hr.locations", "All physical stores and distribution warehouses."),
+            ("hr.employees", "All employees across all locations and departments."),
+        ],
+        "notes": "Referenced by POS, Timeclock, Ordering, Transport, and Inventory via location_id and employee_id.",
+    },
+    "POS": {
+        "description": "Point-of-sale layer — the highest-volume schema. Captures every customer transaction, line items, the product catalog, loyalty program, active coupons, and combo deal promotions.",
+        "tables_summary": [
+            ("pos.transactions", "Every in-store sale. Highest-volume event stream."),
+            ("pos.transaction_items", "Line items for each transaction."),
+            ("pos.products", "Product catalog — ~500 SKUs across 11 departments."),
+            ("pos.departments", "Grocery department definitions (Produce, Dairy, Meat, etc.)."),
+            ("pos.coupons", "Active discount coupons applied during checkout."),
+            ("pos.combo_deals", "Multi-buy promotions (2 for $5, BOGO)."),
+            ("pos.loyalty_members", "Loyalty program members with tier and point balance."),
+            ("pos.price_history", "Audit trail of retail price changes."),
+        ],
+        "notes": "coupon_savings and deal_savings on pos.transactions are informational — subtotal already reflects discounts. Formula: total = subtotal + tax - coupon_savings - deal_savings.",
+    },
+    "Timeclock": {
+        "description": "Employee shift tracking. Records clock_in, clock_out, break_start, and break_end events for all store and warehouse employees.",
+        "tables_summary": [
+            ("timeclock.events", "All employee timeclock events across all locations."),
+        ],
+        "notes": "~80% of employees work any given day. Morning shifts 6–9am, afternoon shifts 2–5pm. Breaks generated at shift midpoint.",
+    },
+    "Ordering": {
+        "description": "Store replenishment requests to the warehouse. Orders are auto-created when inventory drops below reorder thresholds — one order per store per day when needed.",
+        "tables_summary": [
+            ("ordering.store_orders", "Order headers placed by stores to the warehouse."),
+            ("ordering.store_order_items", "Line items specifying product and quantity requested."),
+        ],
+        "notes": "Orders are auto-approved in the simulation. Fulfilled by the Fulfillment schema.",
+    },
+    "Fulfillment": {
+        "description": "Warehouse processing of store replenishment orders. Tracks what was actually picked vs. requested — a ~5% short-fill rate is built into the simulation.",
+        "tables_summary": [
+            ("fulfillment.orders", "Fulfillment headers — warehouse processes an approved store order."),
+            ("fulfillment.items", "Actual picked quantities (may be less than requested due to short-fill)."),
+        ],
+        "notes": "Once dispatched, fulfillment orders trigger transport.loads for delivery.",
+    },
+    "Transport": {
+        "description": "Truck fleet and delivery logistics. Loads are dispatched from the warehouse to stores; marking a load delivered triggers inventory receipt creation at the destination store.",
+        "tables_summary": [
+            ("transport.trucks", "Fleet of delivery trucks (make, model, capacity)."),
+            ("transport.loads", "Delivery loads — one per store per day."),
+        ],
+        "notes": "Loads are marked delivered after ~18 simulated hours. Delivery triggers inv.receipts and updates inv.stock_levels.",
+    },
+    "Inventory": {
+        "description": "Per-product, per-store stock levels and receipt tracking. Stock decrements on every POS sale and increments when inventory receipts are created from delivered transport loads.",
+        "tables_summary": [
+            ("inv.stock_levels", "Real-time on-hand quantity per product per store location."),
+            ("inv.receipts", "Delivery receipt headers — created when a transport load is delivered."),
+            ("inv.receipt_items", "Products and quantities received in each delivery."),
+            ("inv.products", "Inventory management config — reorder points, quantities, suppliers."),
+        ],
+        "notes": "Only store locations have stock records. Warehouses do not. Stock below reorder_point triggers ordering.store_orders.",
+    },
+    "Control": {
+        "description": "Internal generator control tables. Not a business source system — tracks operational state and per-tick generation activity for the simulation engine.",
+        "tables_summary": [
+            ("control.generator_state", "Single-row control table. Holds mode, scenario, tick interval, and audit timestamps."),
+            ("control.generation_stats", "Append-only per-tick activity log. Powers the Dashboard charts."),
+        ],
+        "notes": "These tables exist to support the simulation engine. Rarely used in analytics models.",
+    },
+}
+
+SCHEMA_DOCS_BY_INDUSTRY = {
+    "gas-station": GAS_STATION_SCHEMA_DOCS,
+    "grocery": GROCERY_SCHEMA_DOCS,
+}
+
 # Tables that require date filters
 NEEDS_DATES = {
     "pos.transactions", "pos.transaction_items", "fuel.transactions",
@@ -1132,9 +1254,12 @@ SCENARIOS_BY_INDUSTRY = {
 
 st.title(f"{industry_icon} Verisim — {industry_label}")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+SCHEMA_TABLES = SCHEMA_TABLES_BY_INDUSTRY[industry]
+TABLE_DOCS = TABLE_DOCS_BY_INDUSTRY[industry]
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 Dashboard", "⚙️ Generator Control", "🎭 Scenarios", "🏷️ Promotions",
-    "📈 Distributions", "🗄️ Table Explorer", "📖 Documentation"
+    "📈 Distributions", "🗄️ Table Explorer", "📖 Documentation", "📚 Data Dictionary"
 ])
 
 
@@ -1142,744 +1267,777 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 # TAB 1 — Dashboard
 # ===========================================================================
 with tab1:
-    status_data = api_get(f"{pfx}/status")
-    today_data = api_get(f"{pfx}/stats/today")
-    gen_stats = api_get(f"{pfx}/stats/generation", {"last_n_ticks": 200})
+    @st.fragment(run_every=15)
+    def _dashboard():
+        status_data = api_get(f"{pfx}/status")
+        today_data = api_get(f"{pfx}/stats/today")
+        gen_stats = api_get(f"{pfx}/stats/generation", {"last_n_ticks": 200})
 
-    if status_data:
-        state = status_data.get("state", {})
-        col_badge, col_scenario, col_tick = st.columns([2, 2, 3])
-        col_badge.metric("Generator Status", status_badge(state))
-        col_scenario.metric("Active Scenario", state.get("active_scenario", "—").replace("_", " ").title())
-        last_tick = state.get("last_tick_at")
-        col_tick.metric("Last Tick", last_tick[:19].replace("T", " ") if last_tick else "Never")
-    else:
-        st.error(f"Cannot reach API at `{pfx}/status`. Is the generator running?")
-
-    st.divider()
-
-    if today_data:
-        state = (status_data or {}).get("state", {})
-        if industry == "gas-station":
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("POS Transactions Today", f"{today_data.get('pos_transactions', 0):,}")
-            c2.metric("Fuel Transactions Today", f"{today_data.get('fuel_transactions', 0):,}")
-            c3.metric("Ticks Today", f"{today_data.get('ticks', 0):,}")
-            c4.metric("Volume Multiplier", f"{state.get('volume_multiplier', 1.0):.1f}×" if status_data else "—")
+        if status_data:
+            state = status_data.get("state", {})
+            col_badge, col_scenario, col_tick = st.columns([2, 2, 3])
+            col_badge.metric("Generator Status", status_badge(state))
+            col_scenario.metric("Active Scenario", state.get("active_scenario", "—").replace("_", " ").title())
+            last_tick = state.get("last_tick_at")
+            col_tick.metric("Last Tick", last_tick[:19].replace("T", " ") if last_tick else "Never")
         else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("POS Transactions Today", f"{today_data.get('pos_transactions', 0):,}")
-            c2.metric("Timeclock Events Today", f"{today_data.get('timeclock_events', 0):,}")
-            c3.metric("Orders Today", f"{today_data.get('orders', 0):,}")
-            c4.metric("Volume Multiplier", f"{state.get('volume_multiplier', 1.0):.1f}×" if status_data else "—")
+            st.error(f"Cannot reach API at `{pfx}/status`. Is the generator running?")
 
-    st.divider()
+        st.divider()
 
-    if gen_stats:
-        df = pd.DataFrame(gen_stats)
-        if not df.empty:
-            df["recorded_at"] = pd.to_datetime(df["recorded_at"])
-            df = df.sort_values("recorded_at")
+        if today_data:
+            state = (status_data or {}).get("state", {})
+            if industry == "gas-station":
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("POS Transactions Today", f"{today_data.get('pos_transactions', 0):,}")
+                c2.metric("Fuel Transactions Today", f"{today_data.get('fuel_transactions', 0):,}")
+                c3.metric("Ticks Today", f"{today_data.get('ticks', 0):,}")
+                c4.metric("Volume Multiplier", f"{state.get('volume_multiplier', 1.0):.1f}×" if status_data else "—")
+            else:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("POS Transactions Today", f"{today_data.get('pos_transactions', 0):,}")
+                c2.metric("Timeclock Events Today", f"{today_data.get('timeclock_events', 0):,}")
+                c3.metric("Orders Today", f"{today_data.get('orders', 0):,}")
+                c4.metric("Volume Multiplier", f"{state.get('volume_multiplier', 1.0):.1f}×" if status_data else "—")
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("POS Transactions per Tick")
-                fig = px.line(df, x="recorded_at", y="pos_transactions_generated",
-                              color="scenario_tag",
-                              labels={"recorded_at": "Time", "pos_transactions_generated": "Count"})
-                fig.update_layout(height=300, margin=dict(t=20, b=20))
-                st.plotly_chart(fig, use_container_width=True)
+        st.divider()
 
-            with col_b:
-                if industry == "gas-station" and "fuel_transactions_generated" in df.columns:
-                    st.subheader("Fuel Transactions per Tick")
-                    fig2 = px.line(df, x="recorded_at", y="fuel_transactions_generated",
-                                   labels={"recorded_at": "Time", "fuel_transactions_generated": "Count"})
-                    fig2.update_layout(height=300, margin=dict(t=20, b=20))
-                    st.plotly_chart(fig2, use_container_width=True)
-                elif industry == "grocery" and "timeclock_events_generated" in df.columns:
-                    st.subheader("Timeclock Events per Tick")
-                    fig2 = px.line(df, x="recorded_at", y="timeclock_events_generated",
-                                   labels={"recorded_at": "Time", "timeclock_events_generated": "Count"})
-                    fig2.update_layout(height=300, margin=dict(t=20, b=20))
-                    st.plotly_chart(fig2, use_container_width=True)
+        if gen_stats:
+            df = pd.DataFrame(gen_stats)
+            if not df.empty:
+                df["recorded_at"] = pd.to_datetime(df["recorded_at"])
+                df = df.sort_values("recorded_at")
 
-            if "wall_clock_ms" in df.columns:
-                st.subheader("Tick Duration (ms)")
-                fig3 = px.bar(df.tail(50), x="recorded_at", y="wall_clock_ms",
-                              labels={"recorded_at": "Time", "wall_clock_ms": "ms"})
-                fig3.update_layout(height=200, margin=dict(t=10, b=10))
-                st.plotly_chart(fig3, use_container_width=True)
-    else:
-        st.info("No generation stats yet. Start the generator to see live data.")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.subheader("POS Transactions per Tick")
+                    fig = px.line(df, x="recorded_at", y="pos_transactions_generated",
+                                  color="scenario_tag",
+                                  labels={"recorded_at": "Time", "pos_transactions_generated": "Count"})
+                    fig.update_layout(height=300, margin=dict(t=20, b=20))
+                    st.plotly_chart(fig, use_container_width=True)
 
-    bf = api_get(f"{pfx}/stats/backfill-progress")
-    if bf and bf.get("in_progress"):
-        st.subheader("Backfill Progress")
-        st.progress(bf["pct_complete"] / 100,
-                    text=f"{bf['pct_complete']}% — Day {bf['current']} of {bf['end']} ({bf['days_remaining']} days remaining)")
+                with col_b:
+                    if industry == "gas-station" and "fuel_transactions_generated" in df.columns:
+                        st.subheader("Fuel Transactions per Tick")
+                        fig2 = px.line(df, x="recorded_at", y="fuel_transactions_generated",
+                                       labels={"recorded_at": "Time", "fuel_transactions_generated": "Count"})
+                        fig2.update_layout(height=300, margin=dict(t=20, b=20))
+                        st.plotly_chart(fig2, use_container_width=True)
+                    elif industry == "grocery" and "timeclock_events_generated" in df.columns:
+                        st.subheader("Timeclock Events per Tick")
+                        fig2 = px.line(df, x="recorded_at", y="timeclock_events_generated",
+                                       labels={"recorded_at": "Time", "timeclock_events_generated": "Count"})
+                        fig2.update_layout(height=300, margin=dict(t=20, b=20))
+                        st.plotly_chart(fig2, use_container_width=True)
 
-    st.divider()
+                if "wall_clock_ms" in df.columns:
+                    st.subheader("Tick Duration (ms)")
+                    fig3 = px.bar(df.tail(50), x="recorded_at", y="wall_clock_ms",
+                                  labels={"recorded_at": "Time", "wall_clock_ms": "ms"})
+                    fig3.update_layout(height=200, margin=dict(t=10, b=10))
+                    st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("No generation stats yet. Start the generator to see live data.")
 
-    # Last-hour activity
-    recent = api_get(f"{pfx}/stats/recent", {"minutes": 60}) if industry == "grocery" else None
-    if recent:
-        st.subheader("Last Hour")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Transactions", f"{recent.get('pos_transactions', 0):,}")
-        r2.metric("Timeclock Events", f"{recent.get('timeclock_events', 0):,}")
-        r3.metric("Orders", f"{recent.get('orders', 0):,}")
-        r4.metric("Ticks", f"{recent.get('ticks', 0):,}")
+        bf = api_get(f"{pfx}/stats/backfill-progress")
+        if bf and bf.get("in_progress"):
+            st.subheader("Backfill Progress")
+            st.progress(bf["pct_complete"] / 100,
+                        text=f"{bf['pct_complete']}% — Day {bf['current']} of {bf['end']} ({bf['days_remaining']} days remaining)")
 
-        txns = recent.get("recent_transactions", [])
-        if txns:
-            df_recent = pd.DataFrame(txns)
-            if "transaction_dt" in df_recent.columns:
-                df_recent["transaction_dt"] = pd.to_datetime(df_recent["transaction_dt"]).dt.strftime("%H:%M:%S")
-            if "total" in df_recent.columns:
-                df_recent["total"] = df_recent["total"].apply(lambda x: f"${float(x):.2f}" if x else "—")
-            show = [c for c in ["transaction_dt", "store", "total", "payment_method", "scenario_tag"] if c in df_recent.columns]
-            st.dataframe(df_recent[show].rename(columns={
-                "transaction_dt": "Time", "store": "Store", "total": "Total",
-                "payment_method": "Payment", "scenario_tag": "Scenario"
-            }), use_container_width=True, hide_index=True)
+        st.divider()
 
-    st.caption(f"Auto-refreshes every {REFRESH_INTERVAL}s. Last refresh: {datetime.now().strftime('%H:%M:%S')}")
-    maybe_rerun()
+        recent = api_get(f"{pfx}/stats/recent", {"minutes": 60}) if industry == "grocery" else None
+        if recent:
+            st.subheader("Last Hour")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Transactions", f"{recent.get('pos_transactions', 0):,}")
+            r2.metric("Timeclock Events", f"{recent.get('timeclock_events', 0):,}")
+            r3.metric("Orders", f"{recent.get('orders', 0):,}")
+            r4.metric("Ticks", f"{recent.get('ticks', 0):,}")
+
+            txns = recent.get("recent_transactions", [])
+            if txns:
+                df_recent = pd.DataFrame(txns)
+                if "transaction_dt" in df_recent.columns:
+                    df_recent["transaction_dt"] = pd.to_datetime(df_recent["transaction_dt"]).dt.strftime("%H:%M:%S")
+                if "total" in df_recent.columns:
+                    df_recent["total"] = df_recent["total"].apply(lambda x: f"${float(x):.2f}" if x else "—")
+                show = [c for c in ["transaction_dt", "store", "total", "payment_method", "scenario_tag"] if c in df_recent.columns]
+                st.dataframe(df_recent[show].rename(columns={
+                    "transaction_dt": "Time", "store": "Store", "total": "Total",
+                    "payment_method": "Payment", "scenario_tag": "Scenario"
+                }), use_container_width=True, hide_index=True)
+
+        st.caption(f"Auto-refreshes every 15s · Last refresh: {datetime.now().strftime('%H:%M:%S')}")
+
+    _dashboard()
 
 
 # ===========================================================================
 # TAB 2 — Generator Control
 # ===========================================================================
 with tab2:
-    st.subheader("Generator Control")
-    status_data2 = api_get(f"{pfx}/status")
-    state2 = status_data2.get("state", {}) if status_data2 else {}
+    @st.fragment
+    def _generator_control():
+        st.subheader("Generator Control")
+        status_data2 = api_get(f"{pfx}/status")
+        state2 = status_data2.get("state", {}) if status_data2 else {}
 
-    col_left, col_right = st.columns(2)
+        col_left, col_right = st.columns(2)
 
-    with col_left:
-        st.markdown("#### Start / Stop")
-        b1, b2, b3, b4 = st.columns(4)
-        if b1.button("▶ Start", type="primary", use_container_width=True):
-            mode = st.session_state.get("start_mode", "realtime")
-            payload = {"mode": mode}
-            if mode == "backfill":
-                bf_start = st.session_state.get("bf_start", date.today() - timedelta(days=7))
-                bf_end   = st.session_state.get("bf_end",   date.today() - timedelta(days=1))
-                if not bf_start or not bf_end:
-                    st.error("Backfill requires both start and end dates.")
-                    st.stop()
-                if bf_end <= bf_start:
-                    st.error(f"End date ({bf_end}) must be after start date ({bf_start}).")
-                    st.stop()
-                payload["backfill_start"] = str(bf_start)
-                payload["backfill_end"]   = str(bf_end)
-            result = api_post(f"{pfx}/generator/start", payload)
-            if result:
+        with col_left:
+            st.markdown("#### Start / Stop")
+            b1, b2, b3, b4 = st.columns(4)
+            if b1.button("▶ Start", type="primary", use_container_width=True):
+                mode = st.session_state.get("start_mode", "realtime")
+                payload = {"mode": mode}
                 if mode == "backfill":
-                    st.toast(f"Backfill queued: {payload['backfill_start']} → {payload['backfill_end']}. Generator will pick it up within {state2.get('tick_interval_seconds', 30)}s.", icon="🔵")
-                else:
-                    st.toast("Generator started in realtime mode.", icon="🟢")
-                st.rerun()
-        if b2.button("⏹ Stop", use_container_width=True):
-            api_post(f"{pfx}/generator/stop")
-            st.rerun()
-        if b3.button("⏸ Pause", use_container_width=True):
-            api_post(f"{pfx}/generator/pause")
-            st.rerun()
-        if b4.button("▶▶ Resume", use_container_width=True):
-            api_post(f"{pfx}/generator/resume")
-            st.rerun()
+                    bf_start = st.session_state.get("bf_start", date.today() - timedelta(days=7))
+                    bf_end   = st.session_state.get("bf_end",   date.today() - timedelta(days=1))
+                    if not bf_start or not bf_end:
+                        st.error("Backfill requires both start and end dates.")
+                        st.stop()
+                    if bf_end <= bf_start:
+                        st.error(f"End date ({bf_end}) must be after start date ({bf_start}).")
+                        st.stop()
+                    payload["backfill_start"] = str(bf_start)
+                    payload["backfill_end"]   = str(bf_end)
+                result = api_post(f"{pfx}/generator/start", payload)
+                if result:
+                    if mode == "backfill":
+                        st.toast(f"Backfill queued: {payload['backfill_start']} → {payload['backfill_end']}. Generator will pick it up within {state2.get('tick_interval_seconds', 30)}s.", icon="🔵")
+                    else:
+                        st.toast("Generator started in realtime mode.", icon="🟢")
+                    st.rerun(scope="fragment")
+            if b2.button("⏹ Stop", use_container_width=True):
+                api_post(f"{pfx}/generator/stop")
+                st.rerun(scope="fragment")
+            if b3.button("⏸ Pause", use_container_width=True):
+                api_post(f"{pfx}/generator/pause")
+                st.rerun(scope="fragment")
+            if b4.button("▶▶ Resume", use_container_width=True):
+                api_post(f"{pfx}/generator/resume")
+                st.rerun(scope="fragment")
 
-        st.markdown("#### Mode")
-        mode_choice = st.radio("Generation mode", ["realtime", "backfill"], horizontal=True, key="start_mode")
-        if mode_choice == "backfill":
-            st.date_input("Backfill start date", value=date.today() - timedelta(days=30), key="bf_start")
-            st.date_input("Backfill end date", value=date.today() - timedelta(days=1), key="bf_end")
-            st.caption("Set dates above, then click ▶ Start to begin backfill.")
+            st.markdown("#### Mode")
+            mode_choice = st.radio("Generation mode", ["realtime", "backfill"], horizontal=True, key="start_mode")
+            if mode_choice == "backfill":
+                st.date_input("Backfill start date", value=date.today() - timedelta(days=30), key="bf_start")
+                st.date_input("Backfill end date", value=date.today() - timedelta(days=1), key="bf_end")
+                st.caption("Set dates above, then click ▶ Start to begin backfill.")
 
-        st.markdown("#### Volume & Timing")
-        new_multiplier = st.slider(
-            "Volume multiplier", min_value=0.1, max_value=5.0, step=0.1,
-            value=float(state2.get("volume_multiplier", 1.0))
-        )
-        tick_options = {15: "15 sec", 30: "30 sec", 60: "1 min", 300: "5 min", 600: "10 min"}
-        current_tick = int(state2.get("tick_interval_seconds", 30))
-        tick_choice = st.selectbox(
-            "Tick interval", options=list(tick_options.keys()),
-            format_func=lambda x: tick_options[x],
-            index=list(tick_options.keys()).index(current_tick) if current_tick in tick_options else 1
-        )
-        if st.button("Save Config", type="secondary"):
-            api_patch(f"{pfx}/generator/config", {
-                "volume_multiplier": new_multiplier,
-                "tick_interval_seconds": tick_choice,
-            })
-            st.success("Config saved.")
-            st.rerun()
+            st.markdown("#### Volume & Timing")
+            new_multiplier = st.slider(
+                "Volume multiplier", min_value=0.1, max_value=5.0, step=0.1,
+                value=float(state2.get("volume_multiplier", 1.0))
+            )
+            tick_options = {15: "15 sec", 30: "30 sec", 60: "1 min", 300: "5 min", 600: "10 min"}
+            current_tick = int(state2.get("tick_interval_seconds", 30))
+            tick_choice = st.selectbox(
+                "Tick interval", options=list(tick_options.keys()),
+                format_func=lambda x: tick_options[x],
+                index=list(tick_options.keys()).index(current_tick) if current_tick in tick_options else 1
+            )
+            if st.button("Save Config", type="secondary"):
+                api_patch(f"{pfx}/generator/config", {
+                    "volume_multiplier": new_multiplier,
+                    "tick_interval_seconds": tick_choice,
+                })
+                st.success("Config saved.")
+                st.rerun(scope="fragment")
 
-    with col_right:
-        st.markdown("#### Current State")
-        if state2:
-            st.json(state2)
+        with col_right:
+            st.markdown("#### Current State")
+            if state2:
+                st.json(state2)
 
-        bf2 = api_get(f"{pfx}/stats/backfill-progress")
-        if bf2 and bf2.get("in_progress"):
-            st.markdown("#### Backfill Progress")
-            st.progress(bf2["pct_complete"] / 100,
-                        text=f"{bf2['pct_complete']}% complete — {bf2['days_remaining']} days remaining")
+            bf2 = api_get(f"{pfx}/stats/backfill-progress")
+            if bf2 and bf2.get("in_progress"):
+                st.markdown("#### Backfill Progress")
+                st.progress(bf2["pct_complete"] / 100,
+                            text=f"{bf2['pct_complete']}% complete — {bf2['days_remaining']} days remaining")
 
+
+    _generator_control()
 
 # ===========================================================================
 # TAB 3 — Scenarios
 # ===========================================================================
 with tab3:
-    st.subheader("Scenarios")
+    @st.fragment
+    def _scenarios():
+        st.subheader("Scenarios")
 
-    SCENARIOS = SCENARIOS_BY_INDUSTRY[industry]
+        SCENARIOS = SCENARIOS_BY_INDUSTRY[industry]
 
-    if industry == "grocery":
-        active_scenarios_list = api_get("/grocery/generator/scenarios") or []
-        active_scenario_names = {s["scenario_name"] for s in active_scenarios_list}
-    else:
-        status_data3 = api_get(f"{pfx}/status")
-        active_scenario_names = {(status_data3 or {}).get("state", {}).get("active_scenario", "normal")}
+        if industry == "grocery":
+            active_scenarios_list = api_get("/grocery/generator/scenarios") or []
+            active_scenario_names = {s["scenario_name"] for s in active_scenarios_list}
+        else:
+            status_data3 = api_get(f"{pfx}/status")
+            active_scenario_names = {(status_data3 or {}).get("state", {}).get("active_scenario", "normal")}
 
-    cols = st.columns(3)
-    for i, (key, info) in enumerate(SCENARIOS.items()):
-        with cols[i % 3]:
-            is_active = key in active_scenario_names
-            badge = " ✅ Active" if is_active else ""
-            with st.container(border=True):
-                st.markdown(f"### {info['icon']} {info['label']}{badge}")
-                st.caption(info["description"])
-                if industry == "grocery":
-                    if is_active:
-                        if st.button(f"Deactivate", key=f"sc_off_{key}"):
-                            api_delete(f"/grocery/generator/scenarios/{key}")
-                            st.rerun()
+        cols = st.columns(3)
+        for i, (key, info) in enumerate(SCENARIOS.items()):
+            with cols[i % 3]:
+                is_active = key in active_scenario_names
+                badge = " ✅ Active" if is_active else ""
+                with st.container(border=True):
+                    st.markdown(f"### {info['icon']} {info['label']}{badge}")
+                    st.caption(info["description"])
+                    if industry == "grocery":
+                        if is_active:
+                            if st.button(f"Deactivate", key=f"sc_off_{key}"):
+                                api_delete(f"/grocery/generator/scenarios/{key}")
+                                st.rerun(scope="fragment")
+                        else:
+                            if st.button(f"Activate", key=f"sc_on_{key}"):
+                                api_post(f"/grocery/generator/scenarios", {"scenario_name": key})
+                                st.rerun(scope="fragment")
                     else:
-                        if st.button(f"Activate", key=f"sc_on_{key}"):
-                            api_post(f"/grocery/generator/scenarios", {"scenario_name": key})
-                            st.rerun()
-                else:
-                    if not is_active:
-                        if st.button(f"Activate {info['label']}", key=f"sc_{key}"):
-                            api_patch(f"{pfx}/generator/config", {"active_scenario": key})
-                            st.rerun()
+                        if not is_active:
+                            if st.button(f"Activate {info['label']}", key=f"sc_{key}"):
+                                api_patch(f"{pfx}/generator/config", {"active_scenario": key})
+                                st.rerun(scope="fragment")
 
-    if industry == "grocery":
+        if industry == "grocery":
+            st.divider()
+            st.subheader("Scenario Schedules")
+            st.caption("Scheduled scenarios automatically activate during backfill and realtime generation on their date range.")
+
+            schedules = api_get("/grocery/generator/scenario-schedules") or []
+            if schedules:
+                df_sched = pd.DataFrame(schedules)
+                for _, row in df_sched.iterrows():
+                    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 3, 1])
+                    c1.write(row["scenario_name"].replace("_", " ").title())
+                    c2.write(str(row["start_date"]))
+                    c3.write(str(row["end_date"]))
+                    c4.write(row.get("label") or "")
+                    if c5.button("✕", key=f"del_sched_{row['schedule_id']}"):
+                        api_delete(f"/grocery/generator/scenario-schedules/{row['schedule_id']}")
+                        st.rerun(scope="fragment")
+            else:
+                st.info("No scenario schedules. Add one below.")
+
+            with st.expander("Add Schedule"):
+                sc_col1, sc_col2, sc_col3 = st.columns(3)
+                sched_scenario = sc_col1.selectbox("Scenario", [k for k in SCENARIOS if k != "normal"], key="sched_sc")
+                sched_start = sc_col2.date_input("Start date", key="sched_start")
+                sched_end = sc_col3.date_input("End date", key="sched_end")
+                sched_label = st.text_input("Label (optional)", key="sched_label", placeholder="e.g. Summer Sale")
+                if st.button("Add Schedule", type="primary"):
+                    if sched_end < sched_start:
+                        st.error("End date must be after start date.")
+                    else:
+                        api_post("/grocery/generator/scenario-schedules", {
+                            "scenario_name": sched_scenario,
+                            "start_date": str(sched_start),
+                            "end_date": str(sched_end),
+                            "label": sched_label or None,
+                        })
+                        st.rerun(scope="fragment")
+
         st.divider()
-        st.subheader("Scenario Schedules")
-        st.caption("Scheduled scenarios automatically activate during backfill and realtime generation on their date range.")
 
-        schedules = api_get("/grocery/generator/scenario-schedules") or []
-        if schedules:
-            df_sched = pd.DataFrame(schedules)
-            for _, row in df_sched.iterrows():
-                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 3, 1])
-                c1.write(row["scenario_name"].replace("_", " ").title())
-                c2.write(str(row["start_date"]))
-                c3.write(str(row["end_date"]))
-                c4.write(row.get("label") or "")
-                if c5.button("✕", key=f"del_sched_{row['schedule_id']}"):
-                    api_delete(f"/grocery/generator/scenario-schedules/{row['schedule_id']}")
-                    st.rerun()
+        if industry == "gas-station":
+            st.subheader("Current Fuel Prices")
+            grades = api_get(f"{pfx}/fuel/grades")
+            if grades:
+                df_g = pd.DataFrame(grades)[["name", "octane_rating", "current_price", "updated_at"]]
+                df_g.columns = ["Grade", "Octane", "Price/Gallon", "Last Updated"]
+                df_g["Price/Gallon"] = df_g["Price/Gallon"].apply(lambda x: f"${float(x):.4f}")
+                st.table(df_g)
+
+            price_hist = api_get(f"{pfx}/fuel/price-history", {"limit": 50})
+            if price_hist:
+                st.subheader("Recent Fuel Price Changes")
+                df_ph = pd.DataFrame(price_hist)[["grade_name", "old_price", "new_price", "changed_at"]]
+                df_ph.columns = ["Grade", "Old Price", "New Price", "Changed At"]
+                st.dataframe(df_ph, use_container_width=True, hide_index=True)
+
         else:
-            st.info("No scenario schedules. Add one below.")
+            st.subheader("Active Combo Deals")
+            deals = api_get(f"{pfx}/pos/combo-deals")
+            if deals:
+                df_d = pd.DataFrame(deals)
+                show_cols = [c for c in ["name", "deal_type", "trigger_qty", "deal_price", "valid_from", "valid_until"] if c in df_d.columns]
+                if show_cols:
+                    st.dataframe(df_d[show_cols], use_container_width=True, hide_index=True)
+            else:
+                st.info("No active combo deals.")
 
-        with st.expander("Add Schedule"):
-            sc_col1, sc_col2, sc_col3 = st.columns(3)
-            sched_scenario = sc_col1.selectbox("Scenario", [k for k in SCENARIOS if k != "normal"], key="sched_sc")
-            sched_start = sc_col2.date_input("Start date", key="sched_start")
-            sched_end = sc_col3.date_input("End date", key="sched_end")
-            sched_label = st.text_input("Label (optional)", key="sched_label", placeholder="e.g. Summer Sale")
-            if st.button("Add Schedule", type="primary"):
-                if sched_end < sched_start:
-                    st.error("End date must be after start date.")
-                else:
-                    api_post("/grocery/generator/scenario-schedules", {
-                        "scenario_name": sched_scenario,
-                        "start_date": str(sched_start),
-                        "end_date": str(sched_end),
-                        "label": sched_label or None,
-                    })
-                    st.rerun()
 
-    st.divider()
-
-    if industry == "gas-station":
-        st.subheader("Current Fuel Prices")
-        grades = api_get(f"{pfx}/fuel/grades")
-        if grades:
-            df_g = pd.DataFrame(grades)[["name", "octane_rating", "current_price", "updated_at"]]
-            df_g.columns = ["Grade", "Octane", "Price/Gallon", "Last Updated"]
-            df_g["Price/Gallon"] = df_g["Price/Gallon"].apply(lambda x: f"${float(x):.4f}")
-            st.table(df_g)
-
-        price_hist = api_get(f"{pfx}/fuel/price-history", {"limit": 50})
-        if price_hist:
-            st.subheader("Recent Fuel Price Changes")
-            df_ph = pd.DataFrame(price_hist)[["grade_name", "old_price", "new_price", "changed_at"]]
-            df_ph.columns = ["Grade", "Old Price", "New Price", "Changed At"]
-            st.dataframe(df_ph, use_container_width=True, hide_index=True)
-
-    else:
-        st.subheader("Active Combo Deals")
-        deals = api_get(f"{pfx}/pos/combo-deals")
-        if deals:
-            df_d = pd.DataFrame(deals)
-            show_cols = [c for c in ["name", "deal_type", "trigger_qty", "deal_price", "valid_from", "valid_until"] if c in df_d.columns]
-            if show_cols:
-                st.dataframe(df_d[show_cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("No active combo deals.")
-
+    _scenarios()
 
 # ===========================================================================
 # TAB 4 — Promotions (Grocery only)
 # ===========================================================================
 with tab4:
-    if industry != "grocery":
-        st.info("Promotions management is only available for the grocery industry.")
-    else:
-        st.subheader("Promotions")
+    @st.fragment
+    def _promotions():
+        if industry != "grocery":
+            st.info("Promotions management is only available for the grocery industry.")
+        else:
+            st.subheader("Promotions")
 
-        promo_tab_coupons, promo_tab_ads = st.tabs(["🎟️ Coupons", "📰 Weekly Ads"])
+            promo_tab_coupons, promo_tab_ads = st.tabs(["🎟️ Coupons", "📰 Weekly Ads"])
 
-        # ── Coupons ──────────────────────────────────────────────────────────
-        with promo_tab_coupons:
-            st.markdown("#### Active Coupons")
-            coupons_all = api_get("/grocery/pos/coupons", {"active_only": False, "limit": 500}) or []
+            # ── Coupons ──────────────────────────────────────────────────────────
+            with promo_tab_coupons:
+                st.markdown("#### Active Coupons")
+                coupons_all = api_get("/grocery/pos/coupons", {"active_only": False, "limit": 500}) or []
 
-            if coupons_all:
-                for coup in coupons_all:
-                    with st.container(border=True):
-                        cc1, cc2, cc3, cc4, cc5 = st.columns([2, 2, 1, 2, 1])
-                        cc1.markdown(f"**{coup['code']}** — {coup['description']}")
-                        cc2.write(f"{coup['coupon_type'].replace('_',' ').title()} · ${coup['discount_value']}")
-                        cc3.write("✅ Active" if coup.get("is_active") else "❌ Inactive")
-                        cc4.write(f"{coup.get('valid_from','?')} → {coup.get('valid_until','?')}")
-                        with cc5:
-                            if st.button("Deactivate" if coup.get("is_active") else "Activate",
-                                         key=f"coup_toggle_{coup['coupon_id']}"):
-                                api_patch(f"/grocery/pos/coupons/{coup['coupon_id']}",
-                                          {"is_active": not coup.get("is_active")})
-                                st.rerun()
-                            if st.button("🗑", key=f"coup_del_{coup['coupon_id']}"):
-                                api_delete(f"/grocery/pos/coupons/{coup['coupon_id']}")
-                                st.rerun()
-            else:
-                st.info("No coupons found.")
+                if coupons_all:
+                    for coup in coupons_all:
+                        with st.container(border=True):
+                            cc1, cc2, cc3, cc4, cc5 = st.columns([2, 2, 1, 2, 1])
+                            cc1.markdown(f"**{coup['code']}** — {coup['description']}")
+                            cc2.write(f"{coup['coupon_type'].replace('_',' ').title()} · ${coup['discount_value']}")
+                            cc3.write("✅ Active" if coup.get("is_active") else "❌ Inactive")
+                            cc4.write(f"{coup.get('valid_from','?')} → {coup.get('valid_until','?')}")
+                            with cc5:
+                                if st.button("Deactivate" if coup.get("is_active") else "Activate",
+                                             key=f"coup_toggle_{coup['coupon_id']}"):
+                                    api_patch(f"/grocery/pos/coupons/{coup['coupon_id']}",
+                                              {"is_active": not coup.get("is_active")})
+                                    st.rerun(scope="fragment")
+                                if st.button("🗑", key=f"coup_del_{coup['coupon_id']}"):
+                                    api_delete(f"/grocery/pos/coupons/{coup['coupon_id']}")
+                                    st.rerun(scope="fragment")
+                else:
+                    st.info("No coupons found.")
 
-            st.divider()
-            with st.expander("➕ Create Coupon"):
-                departments = api_get("/grocery/pos/departments") or []
-                dept_options = {d["name"]: d["department_id"] for d in departments}
-                c1, c2, c3 = st.columns(3)
-                new_code = c1.text_input("Code", key="nc_code")
-                new_type = c2.selectbox("Type", ["percent_off", "dollar_off", "bogo", "free_item"], key="nc_type")
-                new_val = c3.number_input("Discount value", min_value=0.01, value=5.0, key="nc_val")
-                new_desc = st.text_input("Description", key="nc_desc")
-                c4, c5, c6 = st.columns(3)
-                new_dept = c4.selectbox("Department (optional)", ["— None —"] + list(dept_options.keys()), key="nc_dept")
-                new_from = c5.date_input("Valid from", value=date.today(), key="nc_from")
-                new_until = c6.date_input("Valid until", value=date.today() + timedelta(days=30), key="nc_until")
-                new_min = st.number_input("Min purchase ($, 0 = none)", min_value=0.0, value=0.0, key="nc_min")
-                new_max_uses = st.number_input("Max uses (0 = unlimited)", min_value=0, value=0, step=1, key="nc_maxu")
-                if st.button("Create Coupon", type="primary", key="nc_submit"):
-                    if not new_code or not new_desc:
-                        st.error("Code and description are required.")
-                    else:
-                        payload = {
-                            "code": new_code, "description": new_desc,
-                            "coupon_type": new_type, "discount_value": new_val,
-                            "valid_from": str(new_from), "valid_until": str(new_until),
-                            "min_purchase": new_min if new_min > 0 else None,
-                            "max_uses": int(new_max_uses) if new_max_uses > 0 else None,
-                            "department_id": dept_options.get(new_dept) if new_dept != "— None —" else None,
-                            "is_active": True,
-                        }
-                        result = api_post("/grocery/pos/coupons", payload)
-                        if result:
-                            st.success(f"Coupon '{new_code}' created.")
-                            st.rerun()
+                st.divider()
+                with st.expander("➕ Create Coupon"):
+                    departments = api_get("/grocery/pos/departments") or []
+                    dept_options = {d["name"]: d["department_id"] for d in departments}
+                    c1, c2, c3 = st.columns(3)
+                    new_code = c1.text_input("Code", key="nc_code")
+                    new_type = c2.selectbox("Type", ["percent_off", "dollar_off", "bogo", "free_item"], key="nc_type")
+                    new_val = c3.number_input("Discount value", min_value=0.01, value=5.0, key="nc_val")
+                    new_desc = st.text_input("Description", key="nc_desc")
+                    c4, c5, c6 = st.columns(3)
+                    new_dept = c4.selectbox("Department (optional)", ["— None —"] + list(dept_options.keys()), key="nc_dept")
+                    new_from = c5.date_input("Valid from", value=date.today(), key="nc_from")
+                    new_until = c6.date_input("Valid until", value=date.today() + timedelta(days=30), key="nc_until")
+                    new_min = st.number_input("Min purchase ($, 0 = none)", min_value=0.0, value=0.0, key="nc_min")
+                    new_max_uses = st.number_input("Max uses (0 = unlimited)", min_value=0, value=0, step=1, key="nc_maxu")
+                    if st.button("Create Coupon", type="primary", key="nc_submit"):
+                        if not new_code or not new_desc:
+                            st.error("Code and description are required.")
+                        else:
+                            payload = {
+                                "code": new_code, "description": new_desc,
+                                "coupon_type": new_type, "discount_value": new_val,
+                                "valid_from": str(new_from), "valid_until": str(new_until),
+                                "min_purchase": new_min if new_min > 0 else None,
+                                "max_uses": int(new_max_uses) if new_max_uses > 0 else None,
+                                "department_id": dept_options.get(new_dept) if new_dept != "— None —" else None,
+                                "is_active": True,
+                            }
+                            result = api_post("/grocery/pos/coupons", payload)
+                            if result:
+                                st.success(f"Coupon '{new_code}' created.")
+                                st.rerun(scope="fragment")
 
-        # ── Weekly Ads ────────────────────────────────────────────────────────
-        with promo_tab_ads:
-            st.markdown("#### Weekly Ads")
-            ads_resp = api_get("/grocery/pricing/weekly-ads", {"limit": 100})
-            ads = (ads_resp.get("data") if isinstance(ads_resp, dict) else ads_resp) or []
-            _products_resp = api_get("/grocery/pos/products", {"limit": 2000}) or {}
-            products_list = (_products_resp.get("data") if isinstance(_products_resp, dict) else _products_resp) or []
-            prod_options = {p["name"]: p["product_id"] for p in products_list}
+            # ── Weekly Ads ────────────────────────────────────────────────────────
+            with promo_tab_ads:
+                st.markdown("#### Weekly Ads")
+                ads_resp = api_get("/grocery/pricing/weekly-ads", {"limit": 100})
+                ads = (ads_resp.get("data") if isinstance(ads_resp, dict) else ads_resp) or []
+                _products_resp = api_get("/grocery/pos/products", {"limit": 2000}) or {}
+                products_list = (_products_resp.get("data") if isinstance(_products_resp, dict) else _products_resp) or []
+                prod_options = {p["name"]: p["product_id"] for p in products_list}
 
-            if ads:
-                for ad in ads:
-                    ad_items_resp = api_get("/grocery/pricing/ad-items", {"ad_id": ad["ad_id"], "limit": 200})
-                    ad_items = (ad_items_resp.get("data") if isinstance(ad_items_resp, dict) else ad_items_resp) or []
-                    with st.expander(f"📰 {ad['ad_name']} ({ad['start_date']} → {ad['end_date']}) — {len(ad_items)} items"):
-                        ac1, ac2 = st.columns([5, 1])
-                        with ac2:
-                            if st.button("Delete Ad", key=f"ad_del_{ad['ad_id']}"):
-                                api_delete(f"/grocery/pricing/weekly-ads/{ad['ad_id']}")
-                                st.rerun()
+                if ads:
+                    for ad in ads:
+                        ad_items_resp = api_get("/grocery/pricing/ad-items", {"ad_id": ad["ad_id"], "limit": 200})
+                        ad_items = (ad_items_resp.get("data") if isinstance(ad_items_resp, dict) else ad_items_resp) or []
+                        with st.expander(f"📰 {ad['ad_name']} ({ad['start_date']} → {ad['end_date']}) — {len(ad_items)} items"):
+                            ac1, ac2 = st.columns([5, 1])
+                            with ac2:
+                                if st.button("Delete Ad", key=f"ad_del_{ad['ad_id']}"):
+                                    api_delete(f"/grocery/pricing/weekly-ads/{ad['ad_id']}")
+                                    st.rerun(scope="fragment")
 
-                        if ad_items:
-                            for item in ad_items:
-                                ic1, ic2, ic3, ic4 = st.columns([3, 2, 2, 1])
-                                ic1.write(item.get("product_id", "")[:8] + "…")
-                                ic2.write(f"${item['promoted_price']}" if item.get("promoted_price") else "—")
-                                ic3.write(f"{item['discount_pct']}% off" if item.get("discount_pct") else "—")
-                                if ic4.button("✕", key=f"aditem_del_{item['ad_item_id']}"):
-                                    api_delete(f"/grocery/pricing/ad-items/{item['ad_item_id']}")
-                                    st.rerun()
+                            if ad_items:
+                                for item in ad_items:
+                                    ic1, ic2, ic3, ic4 = st.columns([3, 2, 2, 1])
+                                    ic1.write(item.get("product_id", "")[:8] + "…")
+                                    ic2.write(f"${item['promoted_price']}" if item.get("promoted_price") else "—")
+                                    ic3.write(f"{item['discount_pct']}% off" if item.get("discount_pct") else "—")
+                                    if ic4.button("✕", key=f"aditem_del_{item['ad_item_id']}"):
+                                        api_delete(f"/grocery/pricing/ad-items/{item['ad_item_id']}")
+                                        st.rerun(scope="fragment")
 
-                        st.markdown("**Add item to this ad:**")
-                        ai1, ai2, ai3, ai4 = st.columns([3, 2, 2, 1])
-                        sel_prod = ai1.selectbox("Product", ["— select —"] + list(prod_options.keys()), key=f"ai_prod_{ad['ad_id']}")
-                        ai_price = ai2.number_input("Promoted price", min_value=0.0, value=0.0, key=f"ai_price_{ad['ad_id']}")
-                        ai_pct = ai3.number_input("Discount %", min_value=0.0, max_value=100.0, value=0.0, key=f"ai_pct_{ad['ad_id']}")
-                        if ai4.button("Add", key=f"ai_add_{ad['ad_id']}"):
-                            if sel_prod == "— select —":
-                                st.error("Select a product.")
-                            else:
-                                api_post("/grocery/pricing/ad-items", {
-                                    "ad_id": ad["ad_id"],
-                                    "product_id": prod_options[sel_prod],
-                                    "promoted_price": ai_price if ai_price > 0 else None,
-                                    "discount_pct": ai_pct if ai_pct > 0 else None,
-                                })
-                                st.rerun()
-            else:
-                st.info("No weekly ads found.")
+                            st.markdown("**Add item to this ad:**")
+                            ai1, ai2, ai3, ai4 = st.columns([3, 2, 2, 1])
+                            sel_prod = ai1.selectbox("Product", ["— select —"] + list(prod_options.keys()), key=f"ai_prod_{ad['ad_id']}")
+                            ai_price = ai2.number_input("Promoted price", min_value=0.0, value=0.0, key=f"ai_price_{ad['ad_id']}")
+                            ai_pct = ai3.number_input("Discount %", min_value=0.0, max_value=100.0, value=0.0, key=f"ai_pct_{ad['ad_id']}")
+                            if ai4.button("Add", key=f"ai_add_{ad['ad_id']}"):
+                                if sel_prod == "— select —":
+                                    st.error("Select a product.")
+                                else:
+                                    api_post("/grocery/pricing/ad-items", {
+                                        "ad_id": ad["ad_id"],
+                                        "product_id": prod_options[sel_prod],
+                                        "promoted_price": ai_price if ai_price > 0 else None,
+                                        "discount_pct": ai_pct if ai_pct > 0 else None,
+                                    })
+                                    st.rerun(scope="fragment")
+                else:
+                    st.info("No weekly ads found.")
 
-            st.divider()
-            with st.expander("➕ Create Weekly Ad"):
-                na1, na2, na3 = st.columns(3)
-                new_ad_name = na1.text_input("Ad name", key="na_name")
-                new_ad_start = na2.date_input("Start date", value=date.today(), key="na_start")
-                new_ad_end = na3.date_input("End date", value=date.today() + timedelta(days=6), key="na_end")
-                if st.button("Create Ad", type="primary", key="na_submit"):
-                    if not new_ad_name:
-                        st.error("Ad name is required.")
-                    elif new_ad_end < new_ad_start:
-                        st.error("End date must be after start date.")
-                    else:
-                        result = api_post("/grocery/pricing/weekly-ads", {
-                            "ad_name": new_ad_name,
-                            "start_date": str(new_ad_start),
-                            "end_date": str(new_ad_end),
-                        })
-                        if result:
-                            st.success(f"Ad '{new_ad_name}' created.")
-                            st.rerun()
+                st.divider()
+                with st.expander("➕ Create Weekly Ad"):
+                    na1, na2, na3 = st.columns(3)
+                    new_ad_name = na1.text_input("Ad name", key="na_name")
+                    new_ad_start = na2.date_input("Start date", value=date.today(), key="na_start")
+                    new_ad_end = na3.date_input("End date", value=date.today() + timedelta(days=6), key="na_end")
+                    if st.button("Create Ad", type="primary", key="na_submit"):
+                        if not new_ad_name:
+                            st.error("Ad name is required.")
+                        elif new_ad_end < new_ad_start:
+                            st.error("End date must be after start date.")
+                        else:
+                            result = api_post("/grocery/pricing/weekly-ads", {
+                                "ad_name": new_ad_name,
+                                "start_date": str(new_ad_start),
+                                "end_date": str(new_ad_end),
+                            })
+                            if result:
+                                st.success(f"Ad '{new_ad_name}' created.")
+                                st.rerun(scope="fragment")
 
+
+    _promotions()
 
 # ===========================================================================
 # TAB 5 — Distributions
 # ===========================================================================
 with tab5:
-    st.subheader("Data Distributions")
-    st.caption("Record counts grouped by day and key classifications. Adjust the look-back window to explore different time ranges.")
+    @st.fragment(run_every=15)
+    def _distributions():
+        st.subheader("Data Distributions")
+        st.caption("Record counts grouped by day and key classifications. Adjust the look-back window to explore different time ranges.")
 
-    _days_opts = {
-        "Last 7 days": 7, "Last 14 days": 14, "Last 30 days": 30,
-        "Last 60 days": 60, "Last 90 days": 90, "Last 180 days": 180, "Last year": 365
-    }
-    _days_sel = st.selectbox("Look-back window", list(_days_opts.keys()), index=2, key="dist_days")
-    _days = _days_opts[_days_sel]
+        _days_opts = {
+            "Last 7 days": 7, "Last 14 days": 14, "Last 30 days": 30,
+            "Last 60 days": 60, "Last 90 days": 90, "Last 180 days": 180, "Last year": 365
+        }
+        _days_sel = st.selectbox("Look-back window", list(_days_opts.keys()), index=2, key="dist_days")
+        _days = _days_opts[_days_sel]
 
-    dist = api_get(f"{pfx}/stats/distributions", {"days": _days})
+        dist = api_get(f"{pfx}/stats/distributions", {"days": _days})
 
-    if not dist:
-        st.warning("No distribution data available. Run the generator first.")
-    else:
-        def _bar(data, x, y, title, color=None, labels=None):
-            if not data:
-                st.info(f"No data for: {title}")
-                return
-            df = pd.DataFrame(data)
-            fig = px.bar(df, x=x, y=y, title=title, color=color, labels=labels or {},
-                         color_discrete_sequence=px.colors.qualitative.Safe)
-            fig.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=320)
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ── Transactions per day (full width) ────────────────────────────────
-        st.markdown("#### POS Transactions")
-        txn_day = dist.get("transactions_by_day", [])
-        if txn_day:
-            df_td = pd.DataFrame(txn_day)
-            df_td["day"] = pd.to_datetime(df_td["day"])
-            fig_td = px.bar(df_td, x="day", y="transaction_count",
-                            title="Transactions per Day",
-                            labels={"day": "Date", "transaction_count": "Transactions"},
-                            color_discrete_sequence=["#4C78A8"])
-            fig_td.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
-            st.plotly_chart(fig_td, use_container_width=True)
+        if not dist:
+            st.warning("No distribution data available. Run the generator first.")
         else:
-            st.info("No transaction data in window.")
+            def _bar(data, x, y, title, color=None, labels=None):
+                if not data:
+                    st.info(f"No data for: {title}")
+                    return
+                df = pd.DataFrame(data)
+                fig = px.bar(df, x=x, y=y, title=title, color=color, labels=labels or {},
+                             color_discrete_sequence=px.colors.qualitative.Safe)
+                fig.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=320)
+                st.plotly_chart(fig, use_container_width=True)
 
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            _bar(dist.get("transactions_by_store"), "store_name", "transaction_count",
-                 "Transactions by Store", labels={"store_name": "Store", "transaction_count": "Transactions"})
-        with dc2:
-            _bar(dist.get("transactions_by_payment"), "payment_method", "transaction_count",
-                 "Transactions by Payment Method",
-                 labels={"payment_method": "Method", "transaction_count": "Transactions"})
-
-        dc3, dc4 = st.columns(2)
-        with dc3:
-            _bar(dist.get("transactions_by_scenario"), "scenario_tag", "transaction_count",
-                 "Transactions by Scenario",
-                 labels={"scenario_tag": "Scenario", "transaction_count": "Transactions"})
-        with dc4:
-            _bar(dist.get("employees_by_department"), "department", "employee_count",
-                 "Active Employees by Department",
-                 labels={"department": "Department", "employee_count": "Employees"})
-
-        # ── Grocery-only charts ───────────────────────────────────────────────
-        if industry == "grocery":
-            st.divider()
-            st.markdown("#### Timeclock Events")
-            tc_day = dist.get("timeclock_by_day", [])
-            if tc_day:
-                df_tc = pd.DataFrame(tc_day)
-                df_tc["day"] = pd.to_datetime(df_tc["day"])
-                fig_tc = px.bar(df_tc, x="day", y="event_count",
-                                title="Timeclock Events per Day",
-                                labels={"day": "Date", "event_count": "Events"},
-                                color_discrete_sequence=["#72B7B2"])
-                fig_tc.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
-                st.plotly_chart(fig_tc, use_container_width=True)
+            st.markdown("#### POS Transactions")
+            txn_day = dist.get("transactions_by_day", [])
+            if txn_day:
+                df_td = pd.DataFrame(txn_day)
+                df_td["day"] = pd.to_datetime(df_td["day"])
+                fig_td = px.bar(df_td, x="day", y="transaction_count",
+                                title="Transactions per Day",
+                                labels={"day": "Date", "transaction_count": "Transactions"},
+                                color_discrete_sequence=["#4C78A8"])
+                fig_td.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
+                st.plotly_chart(fig_td, use_container_width=True)
             else:
-                st.info("No timeclock data in window.")
+                st.info("No transaction data in window.")
 
-            gc1, gc2 = st.columns(2)
-            with gc1:
-                _bar(dist.get("timeclock_by_type"), "event_type", "event_count",
-                     "Events by Type",
-                     labels={"event_type": "Type", "event_count": "Events"})
-            with gc2:
-                _bar(dist.get("products_by_department"), "department_name", "product_count",
-                     "Active Products by Department",
-                     labels={"department_name": "Department", "product_count": "Products"})
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                _bar(dist.get("transactions_by_store"), "store_name", "transaction_count",
+                     "Transactions by Store", labels={"store_name": "Store", "transaction_count": "Transactions"})
+            with dc2:
+                _bar(dist.get("transactions_by_payment"), "payment_method", "transaction_count",
+                     "Transactions by Payment Method",
+                     labels={"payment_method": "Method", "transaction_count": "Transactions"})
 
-            st.divider()
-            st.markdown("#### Supply Chain Orders")
-            ord_day = dist.get("orders_by_day", [])
-            if ord_day:
-                df_od = pd.DataFrame(ord_day)
-                df_od["day"] = pd.to_datetime(df_od["day"])
-                fig_od = px.bar(df_od, x="day", y="order_count",
-                                title="Store Orders per Day",
-                                labels={"day": "Date", "order_count": "Orders"},
-                                color_discrete_sequence=["#F58518"])
-                fig_od.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
-                st.plotly_chart(fig_od, use_container_width=True)
-            else:
-                st.info("No order data in window.")
+            dc3, dc4 = st.columns(2)
+            with dc3:
+                _bar(dist.get("transactions_by_scenario"), "scenario_tag", "transaction_count",
+                     "Transactions by Scenario",
+                     labels={"scenario_tag": "Scenario", "transaction_count": "Transactions"})
+            with dc4:
+                _bar(dist.get("employees_by_department"), "department", "employee_count",
+                     "Active Employees by Department",
+                     labels={"department": "Department", "employee_count": "Employees"})
 
-            _bar(dist.get("orders_by_status"), "status", "order_count",
-                 "Orders by Status",
-                 labels={"status": "Status", "order_count": "Orders"})
+            if industry == "grocery":
+                st.divider()
+                st.markdown("#### Timeclock Events")
+                tc_day = dist.get("timeclock_by_day", [])
+                if tc_day:
+                    df_tc = pd.DataFrame(tc_day)
+                    df_tc["day"] = pd.to_datetime(df_tc["day"])
+                    fig_tc = px.bar(df_tc, x="day", y="event_count",
+                                    title="Timeclock Events per Day",
+                                    labels={"day": "Date", "event_count": "Events"},
+                                    color_discrete_sequence=["#72B7B2"])
+                    fig_tc.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
+                    st.plotly_chart(fig_tc, use_container_width=True)
+                else:
+                    st.info("No timeclock data in window.")
 
-            st.divider()
-            st.markdown("#### Shrinkage / Loss")
-            shr_day = dist.get("shrinkage_by_day", [])
-            if shr_day:
-                df_sh = pd.DataFrame(shr_day)
-                df_sh["day"] = pd.to_datetime(df_sh["day"])
-                fig_sh = px.bar(df_sh, x="day", y="event_count",
-                                title="Shrinkage Events per Day",
-                                labels={"day": "Date", "event_count": "Events"},
-                                color_discrete_sequence=["#E45756"])
-                fig_sh.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
-                st.plotly_chart(fig_sh, use_container_width=True)
-            else:
-                st.info("No shrinkage data in window.")
+                gc1, gc2 = st.columns(2)
+                with gc1:
+                    _bar(dist.get("timeclock_by_type"), "event_type", "event_count",
+                         "Events by Type",
+                         labels={"event_type": "Type", "event_count": "Events"})
+                with gc2:
+                    _bar(dist.get("products_by_department"), "department_name", "product_count",
+                         "Active Products by Department",
+                         labels={"department_name": "Department", "product_count": "Products"})
 
-            _bar(dist.get("shrinkage_by_reason"), "reason", "event_count",
-                 "Shrinkage by Reason",
-                 labels={"reason": "Reason", "event_count": "Events"})
+                st.divider()
+                st.markdown("#### Supply Chain Orders")
+                ord_day = dist.get("orders_by_day", [])
+                if ord_day:
+                    df_od = pd.DataFrame(ord_day)
+                    df_od["day"] = pd.to_datetime(df_od["day"])
+                    fig_od = px.bar(df_od, x="day", y="order_count",
+                                    title="Store Orders per Day",
+                                    labels={"day": "Date", "order_count": "Orders"},
+                                    color_discrete_sequence=["#F58518"])
+                    fig_od.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
+                    st.plotly_chart(fig_od, use_container_width=True)
+                else:
+                    st.info("No order data in window.")
 
-    maybe_rerun()
+                _bar(dist.get("orders_by_status"), "status", "order_count",
+                     "Orders by Status",
+                     labels={"status": "Status", "order_count": "Orders"})
+
+                st.divider()
+                st.markdown("#### Shrinkage / Loss")
+                shr_day = dist.get("shrinkage_by_day", [])
+                if shr_day:
+                    df_sh = pd.DataFrame(shr_day)
+                    df_sh["day"] = pd.to_datetime(df_sh["day"])
+                    fig_sh = px.bar(df_sh, x="day", y="event_count",
+                                    title="Shrinkage Events per Day",
+                                    labels={"day": "Date", "event_count": "Events"},
+                                    color_discrete_sequence=["#E45756"])
+                    fig_sh.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
+                    st.plotly_chart(fig_sh, use_container_width=True)
+                else:
+                    st.info("No shrinkage data in window.")
+
+                _bar(dist.get("shrinkage_by_reason"), "reason", "event_count",
+                     "Shrinkage by Reason",
+                     labels={"reason": "Reason", "event_count": "Events"})
+
+        st.caption(f"Auto-refreshes every 15s · Last refresh: {datetime.now().strftime('%H:%M:%S')}")
+
+    _distributions()
 
 
 # ===========================================================================
 # TAB 6 — Table Explorer
 # ===========================================================================
 with tab6:
-    st.subheader("Table Explorer")
+    @st.fragment
+    def _table_explorer():
+        st.subheader("Table Explorer")
 
 
-    SCHEMA_TABLES = SCHEMA_TABLES_BY_INDUSTRY[industry]
-    TABLE_DOCS = TABLE_DOCS_BY_INDUSTRY[industry]
+        # ── Row 1: schema + table selectors ──────────────────────────────────────
+        # Store an integer index (not a string value) so the selection is always
+        # valid regardless of schema length. on_change resets to 0 on schema switch
+        # (single rerun — avoids the double-rerun that resets the active tab).
+        def _reset_table_idx():
+            st.session_state["te_table_idx"] = 0
 
-    # ── Row 1: schema + table selectors ──────────────────────────────────────
-    # Each schema gets its own widget key so switching schema always produces a
-    # fresh selectbox (no stored value → defaults to first table). Selections
-    # within a schema are remembered independently per schema.
-    col_s, col_t = st.columns([2, 5])
-    with col_s:
-        schema = st.selectbox("Schema", list(SCHEMA_TABLES.keys()), key="ex_schema")
-    pairs = SCHEMA_TABLES[schema]
-    tkeys = [p[0] for p in pairs]
-    tlabels = {p[0]: p[1] for p in pairs}
-    with col_t:
-        table = st.selectbox(
-            "Table", tkeys,
-            format_func=lambda k: f"{k}  —  {tlabels[k]}",
-            key=f"ex_table__{schema}",
-        )
-
-    # ── Row 2: date range (only for tables that need it) ─────────────────────
-    start_date = end_date = None
-    if table in NEEDS_DATES:
-        cd1, cd2, _ = st.columns([2, 2, 3])
-        with cd1:
-            start_date = st.date_input("Start date", value=date.today() - timedelta(days=1), key="ex_sd")
-        with cd2:
-            end_date = st.date_input("End date", value=date.today(), key="ex_ed")
-
-    # ── Row 3: location + table-specific filters + row limit ──────────────────
-    filter_slots: list = []
-    if table in NEEDS_LOCATION:
-        filter_slots.append("location")
-    # Table-specific filters
-    if table == "hr.employees":
-        if industry == "gas-station":
-            filter_slots += ["gs_department", "employee_status"]
-        else:
-            filter_slots += ["gr_department", "employee_status"]
-    elif table == "pos.products":
-        filter_slots.append("category")
-    elif table == "pos.loyalty_members":
-        filter_slots.append("loyalty_tier")
-    elif table == "inv.stock_levels":
-        filter_slots.append("below_reorder")
-    elif table == "control.generation_stats":
-        filter_slots.append("last_n_ticks")
-    elif table in ("ordering.store_orders", "fulfillment.orders", "transport.loads"):
-        filter_slots.append("order_status")
-    filter_slots.append("row_limit")
-
-    fcols = st.columns(min(len(filter_slots), 4))
-    selected_loc_id = None
-    extra: dict = {}
-    limit = 500
-
-    for fi, slot in enumerate(filter_slots):
-        with fcols[fi % 4]:
-            if slot == "location":
-                locs = api_get(f"{pfx}/hr/locations") or []
-                loc_opts = {"All Locations": None}
-                for loc in locs:
-                    loc_opts[loc["name"]] = loc["location_id"]
-                loc_name = st.selectbox("Location", list(loc_opts.keys()), key="ex_loc")
-                selected_loc_id = loc_opts[loc_name]
-
-            elif slot == "gs_department":
-                dept = st.selectbox("Department", ["All", "store", "fuel", "management"], key="ex_dept")
-                if dept != "All":
-                    extra["department"] = dept
-
-            elif slot == "gr_department":
-                gr_depts = ["All", "store", "produce", "deli", "bakery", "meat", "warehouse", "transport", "management"]
-                dept = st.selectbox("Department", gr_depts, key="ex_dept")
-                if dept != "All":
-                    extra["department"] = dept
-
-            elif slot == "employee_status":
-                es = st.selectbox("Status", ["All", "active", "terminated", "on_leave"], key="ex_estatus")
-                if es != "All":
-                    extra["status"] = es
-
-            elif slot == "category":
-                if industry == "gas-station":
-                    cats = ["All", "Beverages", "Snacks", "Tobacco", "Automotive", "Health & Beauty", "Food Service", "General Merchandise"]
-                else:
-                    cats = ["All", "Fresh Produce", "Dairy", "Meat & Poultry", "Bakery", "Deli", "Frozen Foods",
-                            "Grocery", "Beverages", "Snacks", "Health & Beauty", "General Merchandise"]
-                cat = st.selectbox("Category", cats, key="ex_cat")
-                if cat != "All":
-                    extra["category"] = cat
-
-            elif slot == "loyalty_tier":
-                tier = st.selectbox("Tier", ["All", "bronze", "silver", "gold", "platinum"], key="ex_tier")
-                if tier != "All":
-                    extra["tier"] = tier
-
-            elif slot == "below_reorder":
-                if st.checkbox("Below reorder point only", key="ex_brp"):
-                    extra["below_reorder_point"] = True
-
-            elif slot == "last_n_ticks":
-                extra["last_n_ticks"] = st.number_input("Last N ticks", 10, 1000, 100, 10, key="ex_nticks")
-
-            elif slot == "order_status":
-                if table == "ordering.store_orders":
-                    statuses = ["All", "pending", "approved", "shipped", "delivered"]
-                elif table == "fulfillment.orders":
-                    statuses = ["All", "picking", "packed", "dispatched"]
-                else:
-                    statuses = ["All", "dispatched", "delivered"]
-                os_val = st.selectbox("Status", statuses, key="ex_ostatus")
-                if os_val != "All":
-                    extra["status"] = os_val
-
-            elif slot == "row_limit":
-                limit = st.number_input("Row limit", 50, 5000, 500, 50, key="ex_limit")
-
-    # ── Table documentation (always visible, collapsed by default) ────────────
-    doc = TABLE_DOCS.get(table, {})
-    no_data_loaded = "ex_df" not in st.session_state or st.session_state.get("ex_table_loaded") != table
-    with st.expander("📋 Table Documentation", expanded=no_data_loaded):
-        if doc:
-            st.markdown(f"#### {doc['title']}")
-            st.caption(doc["description"])
-            col_info, col_rel = st.columns([3, 2])
-            with col_info:
-                st.markdown("**Columns**")
-                col_df = pd.DataFrame(doc["columns"], columns=["Column", "Type", "Description"])
-                st.dataframe(col_df, use_container_width=True, hide_index=True, height=min(35 * len(doc["columns"]) + 38, 340))
-            with col_rel:
-                if doc.get("relationships"):
-                    st.markdown("**Relationships**")
-                    for r in doc["relationships"]:
-                        st.markdown(f"- `{r}`")
-                if doc.get("notes"):
-                    st.info(doc["notes"])
-
-    # ── Load button ───────────────────────────────────────────────────────────
-    if st.button("⬇ Load Data", type="primary", key="ex_load"):
-        with st.spinner(f"Loading {table}…"):
-            df_result, total_result = _load_table(table, start_date, end_date, selected_loc_id, limit, extra, pfx)
-        st.session_state["ex_df"] = df_result
-        st.session_state["ex_total"] = total_result
-        st.session_state["ex_table_loaded"] = table
-
-    # ── Results grid ──────────────────────────────────────────────────────────
-    if "ex_df" in st.session_state and st.session_state.get("ex_table_loaded") == table:
-        df_show = st.session_state["ex_df"]
-        total_show = st.session_state.get("ex_total", len(df_show))
-
-        if df_show.empty:
-            st.info("No rows returned for the selected filters.")
-        else:
-            st.caption(f"Showing **{len(df_show):,}** of **{total_show:,}** total rows in `{table}`")
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
-            csv = df_show.to_csv(index=False)
-            st.download_button(
-                "⬇️ Download CSV",
-                data=csv,
-                file_name=f"{table.replace('.', '_')}_{date.today()}.csv",
-                mime="text/csv",
-                key="ex_csv",
+        col_s, col_t = st.columns([2, 5])
+        with col_s:
+            schema = st.selectbox(
+                "Schema", list(SCHEMA_TABLES.keys()),
+                key="te_schema",
+                on_change=_reset_table_idx,
             )
 
+        pairs = SCHEMA_TABLES[schema]
+        tkeys = [p[0] for p in pairs]
+        tlabels = {p[0]: p[1] for p in pairs}
+        tdisplay = [f"{k}  —  {tlabels[k]}" for k in tkeys]
+
+        # Clamp stored index to valid range before the widget reads it
+        _tidx = min(st.session_state.get("te_table_idx", 0), len(tkeys) - 1)
+        st.session_state["te_table_idx"] = _tidx
+
+        with col_t:
+            selected_idx = st.selectbox(
+                "Table", list(range(len(tkeys))),
+                format_func=lambda i: tdisplay[i],
+                key="te_table_idx",
+            )
+
+        table = tkeys[selected_idx]
+
+        # ── Row 2: date range (only for tables that need it) ─────────────────────
+        start_date = end_date = None
+        if table in NEEDS_DATES:
+            cd1, cd2, _ = st.columns([2, 2, 3])
+            with cd1:
+                start_date = st.date_input("Start date", value=date.today() - timedelta(days=1), key="ex_sd")
+            with cd2:
+                end_date = st.date_input("End date", value=date.today(), key="ex_ed")
+
+        # ── Row 3: location + table-specific filters + row limit ──────────────────
+        filter_slots: list = []
+        if table in NEEDS_LOCATION:
+            filter_slots.append("location")
+        # Table-specific filters
+        if table == "hr.employees":
+            if industry == "gas-station":
+                filter_slots += ["gs_department", "employee_status"]
+            else:
+                filter_slots += ["gr_department", "employee_status"]
+        elif table == "pos.products":
+            filter_slots.append("category")
+        elif table == "pos.loyalty_members":
+            filter_slots.append("loyalty_tier")
+        elif table == "inv.stock_levels":
+            filter_slots.append("below_reorder")
+        elif table == "control.generation_stats":
+            filter_slots.append("last_n_ticks")
+        elif table in ("ordering.store_orders", "fulfillment.orders", "transport.loads"):
+            filter_slots.append("order_status")
+        filter_slots.append("row_limit")
+
+        fcols = st.columns(min(len(filter_slots), 4))
+        selected_loc_id = None
+        extra: dict = {}
+        limit = 500
+
+        for fi, slot in enumerate(filter_slots):
+            with fcols[fi % 4]:
+                if slot == "location":
+                    locs = api_get(f"{pfx}/hr/locations") or []
+                    loc_opts = {"All Locations": None}
+                    for loc in locs:
+                        loc_opts[loc["name"]] = loc["location_id"]
+                    loc_name = st.selectbox("Location", list(loc_opts.keys()), key="ex_loc")
+                    selected_loc_id = loc_opts[loc_name]
+
+                elif slot == "gs_department":
+                    dept = st.selectbox("Department", ["All", "store", "fuel", "management"], key="ex_dept")
+                    if dept != "All":
+                        extra["department"] = dept
+
+                elif slot == "gr_department":
+                    gr_depts = ["All", "store", "produce", "deli", "bakery", "meat", "warehouse", "transport", "management"]
+                    dept = st.selectbox("Department", gr_depts, key="ex_dept")
+                    if dept != "All":
+                        extra["department"] = dept
+
+                elif slot == "employee_status":
+                    es = st.selectbox("Status", ["All", "active", "terminated", "on_leave"], key="ex_estatus")
+                    if es != "All":
+                        extra["status"] = es
+
+                elif slot == "category":
+                    if industry == "gas-station":
+                        cats = ["All", "Beverages", "Snacks", "Tobacco", "Automotive", "Health & Beauty", "Food Service", "General Merchandise"]
+                    else:
+                        cats = ["All", "Fresh Produce", "Dairy", "Meat & Poultry", "Bakery", "Deli", "Frozen Foods",
+                                "Grocery", "Beverages", "Snacks", "Health & Beauty", "General Merchandise"]
+                    cat = st.selectbox("Category", cats, key="ex_cat")
+                    if cat != "All":
+                        extra["category"] = cat
+
+                elif slot == "loyalty_tier":
+                    tier = st.selectbox("Tier", ["All", "bronze", "silver", "gold", "platinum"], key="ex_tier")
+                    if tier != "All":
+                        extra["tier"] = tier
+
+                elif slot == "below_reorder":
+                    if st.checkbox("Below reorder point only", key="ex_brp"):
+                        extra["below_reorder_point"] = True
+
+                elif slot == "last_n_ticks":
+                    extra["last_n_ticks"] = st.number_input("Last N ticks", 10, 1000, 100, 10, key="ex_nticks")
+
+                elif slot == "order_status":
+                    if table == "ordering.store_orders":
+                        statuses = ["All", "pending", "approved", "shipped", "delivered"]
+                    elif table == "fulfillment.orders":
+                        statuses = ["All", "picking", "packed", "dispatched"]
+                    else:
+                        statuses = ["All", "dispatched", "delivered"]
+                    os_val = st.selectbox("Status", statuses, key="ex_ostatus")
+                    if os_val != "All":
+                        extra["status"] = os_val
+
+                elif slot == "row_limit":
+                    limit = st.number_input("Row limit", 50, 5000, 500, 50, key="ex_limit")
+
+        # ── Table documentation (always visible, collapsed by default) ────────────
+        doc = TABLE_DOCS.get(table, {})
+        no_data_loaded = "ex_df" not in st.session_state or st.session_state.get("ex_table_loaded") != table
+        with st.expander("📋 Table Documentation", expanded=no_data_loaded):
+            if doc:
+                st.markdown(f"#### {doc['title']}")
+                st.caption(doc["description"])
+                col_info, col_rel = st.columns([3, 2])
+                with col_info:
+                    st.markdown("**Columns**")
+                    col_df = pd.DataFrame(doc["columns"], columns=["Column", "Type", "Description"])
+                    st.dataframe(col_df, use_container_width=True, hide_index=True, height=min(35 * len(doc["columns"]) + 38, 340))
+                with col_rel:
+                    if doc.get("relationships"):
+                        st.markdown("**Relationships**")
+                        for r in doc["relationships"]:
+                            st.markdown(f"- `{r}`")
+                    if doc.get("notes"):
+                        st.info(doc["notes"])
+
+        # ── Load button ───────────────────────────────────────────────────────────
+        if st.button("⬇ Load Data", type="primary", key="ex_load"):
+            with st.spinner(f"Loading {table}…"):
+                df_result, total_result = _load_table(table, start_date, end_date, selected_loc_id, limit, extra, pfx)
+            st.session_state["ex_df"] = df_result
+            st.session_state["ex_total"] = total_result
+            st.session_state["ex_table_loaded"] = table
+
+        # ── Results grid ──────────────────────────────────────────────────────────
+        if "ex_df" in st.session_state and st.session_state.get("ex_table_loaded") == table:
+            df_show = st.session_state["ex_df"]
+            total_show = st.session_state.get("ex_total", len(df_show))
+
+            if df_show.empty:
+                st.info("No rows returned for the selected filters.")
+            else:
+                st.caption(f"Showing **{len(df_show):,}** of **{total_show:,}** total rows in `{table}`")
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+                csv = df_show.to_csv(index=False)
+                st.download_button(
+                    "⬇️ Download CSV",
+                    data=csv,
+                    file_name=f"{table.replace('.', '_')}_{date.today()}.csv",
+                    mime="text/csv",
+                    key="ex_csv",
+                )
+
+
+    _table_explorer()
 
 # ===========================================================================
 # TAB 7 — Documentation
@@ -1988,3 +2146,50 @@ The FastAPI service exposes a full Swagger UI at `/docs`.
 - `GET /grocery/stats/generation`
 - `GET /industries` — list all available industries
 """)
+
+
+# ===========================================================================
+# TAB 8 — Data Dictionary
+# ===========================================================================
+with tab8:
+    @st.fragment
+    def _data_dictionary():
+        _schema_docs = SCHEMA_DOCS_BY_INDUSTRY[industry]
+
+        _schema_name = st.selectbox(
+            "Schema", list(SCHEMA_TABLES.keys()), key="dd_schema"
+        )
+
+        _sdoc = _schema_docs.get(_schema_name, {})
+        _tpairs = SCHEMA_TABLES.get(_schema_name, [])
+
+        st.markdown(f"## {_schema_name} Schema")
+        if _sdoc.get("description"):
+            st.markdown(_sdoc["description"])
+        if _sdoc.get("notes"):
+            st.info(_sdoc["notes"])
+
+        for _tkey, _tlabel in _tpairs:
+            _tdoc = TABLE_DOCS.get(_tkey, {})
+            if not _tdoc:
+                continue
+            st.divider()
+            st.markdown(f"### {_tdoc['title']}")
+            st.markdown(_tdoc["description"])
+            _col_info, _col_rel = st.columns([3, 2])
+            with _col_info:
+                st.markdown("**Columns**")
+                _col_df = pd.DataFrame(_tdoc["columns"], columns=["Column", "Type", "Description"])
+                st.dataframe(
+                    _col_df, use_container_width=True, hide_index=True,
+                    height=min(35 * len(_tdoc["columns"]) + 38, 500),
+                )
+            with _col_rel:
+                if _tdoc.get("relationships"):
+                    st.markdown("**Relationships**")
+                    for _r in _tdoc["relationships"]:
+                        st.markdown(f"- `{_r}`")
+                if _tdoc.get("notes"):
+                    st.info(_tdoc["notes"])
+
+    _data_dictionary()
