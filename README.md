@@ -6,6 +6,10 @@ Built for analytics engineers who need a realistic, schema-rich data source to p
 
 ---
 
+**Docker Hub:** [smiti/verisim-grocery](https://hub.docker.com/r/smiti/verisim-grocery)
+
+---
+
 ## Quick Start
 
 ### Option 1 — Docker (simplest)
