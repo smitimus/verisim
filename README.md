@@ -39,7 +39,7 @@ cp grocery/.env.example grocery/.env   # edit YOUR_* values
 
 | Service | URL | Purpose |
 |---------|-----|---------|
-| Streamlit UI | `http://localhost:8501` | Generator control, metrics, SQL explorer |
+| Streamlit UI | `http://localhost:8501` | Dashboard · Generator Control · Scenarios · Promotions · Distributions · Table Explorer · Data Dictionary |
 | FastAPI | `http://localhost:8010/docs` | REST API + interactive docs |
 | PostgreSQL | `localhost:5499` | Source database (user: `verisim` / pass: `verisim` / db: `grocery`) |
 
@@ -66,9 +66,9 @@ daily_volumes:
 
 **Trigger a scenario via API:**
 ```bash
-curl -X POST http://localhost:8010/grocery/generator/scenario \
+curl -X POST http://localhost:8010/grocery/generator/scenarios \
   -H "Content-Type: application/json" \
-  -d '{"scenario": "rush_hour"}'
+  -d '{"scenario_name": "rush_hour"}'
 ```
 
 Available scenarios: `rush_hour`, `weekend`, `holiday_week`, `double_coupons`, `promotion`

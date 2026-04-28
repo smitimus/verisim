@@ -1,9 +1,9 @@
 # verisim-grocery
 
 Grocery store industry generator for the Verisim platform.
-Generates realistic grocery transactions, supply chain movements, timeclock events, loyalty activity, promotions, and shrinkage. Writes directly into the `grocery` database on the shared verisim postgres via `verisim_network`.
+Generates realistic grocery transactions, supply chain movements, timeclock events, loyalty activity, promotions, and shrinkage.
 
-**Requires `verisim-base` to be running first.**
+The dev stack is self-contained — no external dependencies. Use `switch.sh dev` from the repo root.
 
 ## Schemas Written
 
@@ -24,12 +24,11 @@ Generates realistic grocery transactions, supply chain movements, timeclock even
 ## Directory Structure
 
 ```
-stacks/verisim-grocery/
-├── compose.yaml
+verisim/grocery/
+├── compose.yaml            # Dev stack (self-contained: postgres + api + ui + generator)
 ├── .env
 ├── README.md
 ├── config.yaml             # Generator config (tick rate, departments, volumes, etc.)
-├── build-and-push.sh       # Build and push standalone Docker Hub image
 ├── generator/
 │   ├── Dockerfile
 │   ├── main.py             # Main generation loop + DB bootstrap
@@ -52,21 +51,24 @@ stacks/verisim-grocery/
     └── entrypoint.sh
 ```
 
-## Deploy (development — with verisim-base)
+## Development
 
 ```bash
-# verisim-base must be running first
-cd /opt/stacks/verisim-base
-docker compose build && docker compose up -d
-
-# Then start the grocery generator
-cd /opt/stacks/verisim-grocery
-docker compose build && docker compose up -d
+cd /opt/verisim
+./switch.sh dev      # start self-contained dev stack (build from source)
+./switch.sh test     # build standalone image, run as single container
+./switch.sh release  # pull and run Docker Hub image
 ```
 
-On first start, the generator self-bootstraps: it connects to postgres, creates the `grocery` database, and runs `schema.sql` to create all schemas and tables.
+After code changes, rebuild just the affected service:
+```bash
+docker compose -f grocery/compose.yaml build <service>
+docker compose -f grocery/compose.yaml up -d <service>
+```
 
-To reset: stop the stack, drop the `grocery` database, restart.
+On first start, the generator self-bootstraps: connects to postgres, creates the `grocery` database, and runs `schema.sql` to create all schemas and tables.
+
+To reset: stop the stack, delete `conf/verisim-grocery-dev/`, restart.
 
 ## Configuration
 
@@ -82,11 +84,9 @@ Changes to most settings take effect on next container restart. Volume multiplie
 
 ## Credentials
 
-Inherits from `verisim-base`:
-
 | Item | Value |
 |------|-------|
-| DB host | `verisim-base-postgres` (internal) / `${IP}` (external) |
+| DB host | `verisim-grocery-dev-postgres` (internal) / `${IP}` (external) |
 | DB port | `5499` (external) |
 | DB name | `grocery` |
 | DB user | `verisim` |
@@ -105,10 +105,9 @@ This image includes PostgreSQL, the FastAPI, the Streamlit UI, and the generator
 To build and push a new version:
 
 ```bash
-# Must be run from /opt/stacks/ (build context includes both verisim-base and verisim-grocery)
-cd /opt/stacks
-bash verisim-grocery/build-and-push.sh           # latest
-bash verisim-grocery/build-and-push.sh 1.0.0     # versioned
+cd /opt/verisim
+bash build-and-push.sh grocery            # latest
+bash build-and-push.sh grocery 1.2.0      # versioned (also tags latest)
 ```
 
 ## Downstream
