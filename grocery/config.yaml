@@ -25,30 +25,30 @@ volumes:
 
   # 24 hourly weights — grocery peaks at late morning/early afternoon and after work
   hourly_weights:
-    - 0.00   # 0  closed
-    - 0.00   # 1
-    - 0.00   # 2
-    - 0.00   # 3
-    - 0.00   # 4
-    - 0.01   # 5  early stocking/open
-    - 0.02   # 6
-    - 0.04   # 7  morning shoppers
-    - 0.06   # 8
-    - 0.08   # 9  busy morning
-    - 0.09   # 10 peak morning
-    - 0.09   # 11
-    - 0.08   # 12 lunch rush
-    - 0.07   # 13
-    - 0.07   # 14
-    - 0.07   # 15
-    - 0.08   # 16 after-school/work
-    - 0.09   # 17 PM rush peak
-    - 0.08   # 18 dinner prep
-    - 0.06   # 19
-    - 0.04   # 20
-    - 0.03   # 21 late shoppers
-    - 0.01   # 22
-    - 0.00   # 23
+    - 0.0017   # 0  dead hours
+    - 0.0008   # 1  dead hours
+    - 0.0008   # 2  dead hours
+    - 0.0008   # 3  dead hours
+    - 0.0017   # 4  pre-dawn
+    - 0.0050   # 5  early morning (store opens, stocking staff arrive)
+    - 0.0129   # 6  morning ramp
+    - 0.0258   # 7  rush building
+    - 0.0446   # 8  rush peak
+    - 0.0646   # 9  late rush
+    - 0.0817   # 10 morning peak
+    - 0.0896   # 11 midday PEAK
+    - 0.0896   # 12 lunch peak PEAK
+    - 0.0704   # 13 post-lunch lull starts
+    - 0.0558   # 14 afternoon lull
+    - 0.0483   # 15 lull continues
+    - 0.0629   # 16 ramp back up
+    - 0.0817   # 17 after-work rush
+    - 0.0938   # 18 dinner prep PEAK (highest)
+    - 0.0750   # 19 evening decline (requested: traffic lower 7-11pm)
+    - 0.0446   # 20 continued decline
+    - 0.0283   # 21 winding down
+    - 0.0129   # 22 late night
+    - 0.0067   # 23 very low (requested: low 11pm-6am)
 
   day_of_week_multipliers:
     monday:    0.88

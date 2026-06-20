@@ -14,10 +14,10 @@ class VolumeConfig:
     pos_transactions_per_day_min: int = 800
     pos_transactions_per_day_max: int = 3000
     hourly_weights: List[float] = field(default_factory=lambda: [
-        0.00, 0.00, 0.00, 0.00, 0.00, 0.01, 0.02, 0.04,
-        0.06, 0.08, 0.09, 0.09, 0.08, 0.07, 0.07, 0.07,
-        0.08, 0.09, 0.08, 0.06, 0.04, 0.03, 0.01, 0.00
-    ])
+        0.0017, 0.0008, 0.0008, 0.0008, 0.0017, 0.005, 0.0129, 0.0258,
+        0.0446, 0.0646, 0.0817, 0.0896, 0.0896, 0.0704, 0.0558, 0.0483,
+        0.0629, 0.0817, 0.0938, 0.075, 0.0446, 0.0283, 0.0129, 0.0067]
+    )
     day_of_week_multipliers: Dict[str, float] = field(default_factory=lambda: {
         'monday': 0.88, 'tuesday': 0.85, 'wednesday': 0.90,
         'thursday': 0.95, 'friday': 1.10, 'saturday': 1.25, 'sunday': 1.15

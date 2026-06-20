@@ -29,6 +29,10 @@ SHIFTS = [
     (time(12, 0), time(20, 0)),
     (time(14, 0), time(22, 0)),
     (time(16, 0), time(22, 0)),
+    # New 24/7 coverage shifts:
+    (time(0,  0), time(8, 0)),   # midnight-8am overnight stocking
+    (time(22, 0), time(6, 0)),   # 10pm-6am overnight (crosses midnight)
+    (time(5,  0), time(13, 0)),  # early morning pre-opening prep
 ]
 
 # Probability an employee is full-time (works ~5 days) vs part-time (~3 days)

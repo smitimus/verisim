@@ -25,6 +25,10 @@ AFTERNOON_IN_HOURS = [13, 14, 15, 16]
 EVENING_IN_HOURS = [17, 18]
 SHIFT_LENGTH_HOURS = 8
 
+# Early morning shift window (overnight stocking/early opening staff)
+EARLY_MORNING_IN_HOURS = list(range(0, 6))  # hours 0-5
+LATE_NIGHT_OUT_HOURS = list(range(21, 24))   # hours 21-23
+
 
 def generate_events(conn, simulation_dt: datetime, employees: List[Dict],
                     locations: Dict[str, List[Dict]]) -> int:
@@ -98,14 +102,31 @@ def generate_events(conn, simulation_dt: datetime, employees: List[Dict],
             event_dt = simulation_dt.replace(minute=random.randint(0, 59))
             records.append((emp['employee_id'], emp['location_id'], 'break_start', event_dt, None))
 
-    elif 20 <= hour <= 23:
-        # Late evening clock-outs for anyone still clocked in
+    elif hour in LATE_NIGHT_OUT_HOURS:
+        # Late night clock-outs for anyone still clocked in (extended from 20-23 to full late window)
         sample_size = max(1, len(store_employees) // 10)
         can_out = [e for e in store_employees
                    if has(e['employee_id'], 'clock_in') and not has(e['employee_id'], 'clock_out')]
         for emp in random.sample(can_out, min(sample_size, len(can_out))):
             event_dt = simulation_dt.replace(minute=random.randint(0, 59))
             records.append((emp['employee_id'], emp['location_id'], 'clock_out', event_dt, None))
+
+    elif hour in EARLY_MORNING_IN_HOURS:
+        # Early morning: clock_in for overnight arrivals AND clock_out for late finishers
+        on_shift = [e for e in store_employees
+                    if has(e['employee_id'], 'clock_in') and not has(e['employee_id'], 'clock_out')]
+        can_in = [e for e in store_employees
+                  if not has(e['employee_id'], 'clock_in')]
+        # Clock out late finishers
+        sample_out = max(1, len(on_shift) // 4)
+        for emp in random.sample(on_shift, min(sample_out, len(on_shift))):
+            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
+            records.append((emp['employee_id'], emp['location_id'], 'clock_out', event_dt, None))
+        # Clock in early arrivals (stockers/prep staff)
+        sample_in = max(1, len(store_employees) // 6)
+        for emp in random.sample(can_in, min(sample_in, len(can_in))):
+            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
+            records.append((emp['employee_id'], emp['location_id'], 'clock_in', event_dt, None))
 
     if not records:
         return 0
@@ -142,9 +163,11 @@ def generate_day_events(conn, sim_date, employees: List[Dict]) -> int:
         if random.random() > 0.80:
             continue
 
-        # Pick a shift (afternoon capped so shift ends same calendar day)
+        # Pick a shift — now includes early morning and late afternoon options for 24/7 coverage
         if random.random() < 0.55:
             in_hour = random.choice(MORNING_IN_HOURS)
+        elif random.random() < 0.10:  # ~10% of employees get an early morning shift
+            in_hour = random.choice(EARLY_MORNING_IN_HOURS)
         else:
             in_hour = random.choice(safe_afternoon_hours)
 

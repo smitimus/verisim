@@ -196,45 +196,123 @@ def has_data_for_date(conn, check_date):
         return cur.fetchone() is not None
 
 
-def auto_backfill_if_fresh(conn):
+def auto_backfill_if_fresh(conn, cfg):
     """
-    Called once after seed_all(). If the database has no POS transactions,
-    automatically configure a 30-day backfill (today-30 → today) so that
-    the generator produces continuous data from the start without any
-    manual API call.
+    Called once after seed_all(). Handles two scenarios:
 
-    Does nothing if data already exists — idempotent.
+    1. Empty DB: configure a 30-day backfill (today-30 → today)
+    2. DB has data with gaps in the last 30 days: detect gaps, configure
+       a targeted backfill to fill only the missing days, then transition to
+       realtime once complete.
+
+    Does nothing if all 30 days are covered — just stays running (or
+    transitions to realtime if not already configured).
+
+    Idempotent and safe to call on every startup.
     """
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM pos.transactions LIMIT 1")
-        has_data = cur.fetchone() is not None
-
-    state = read_state(conn)
-    already_configured = state['mode'] in ('backfill', 'realtime') and state['is_running']
-
-    if has_data or already_configured:
-        return
-
     today = date.today()
-    backfill_start = today - timedelta(days=30)
-    log.info(
-        "Fresh database — auto-configuring 30-day backfill: %s → %s",
-        backfill_start, today,
-    )
+    lookback = today - timedelta(days=30)
+
     with conn.cursor() as cur:
+        cur.execute(
+            "SELECT min(transaction_dt::date), count(*) FROM pos.transactions"
+        )
+        row = cur.fetchone()
+        if row[1] == 0:
+            # Empty DB — full fresh backfill
+            log.info("Fresh database — configuring 30-day backfill: %s → %s",
+                     lookback, today)
+            with conn.cursor() as cur2:
+                cur2.execute("""
+                    UPDATE control.generator_state SET
+                        mode = 'backfill',
+                        is_running = TRUE,
+                        is_paused = FALSE,
+                        backfill_start_date = %s,
+                        backfill_end_date = %s,
+                        backfill_current_date = %s,
+                        started_at = NOW(), updated_at = NOW()
+                    WHERE state_id = 1
+                """, (lookback, today, lookback))
+            conn.commit()
+            return
+
+        # Data exists — check for gaps in the last 30 days using max timestamps.
+        effective_start = min(row[0] if row[0] else today, lookback)
+        effective_end = max(today, row[1] and (today))
+
+        # Get max transaction timestamp per day in the active range.
+        # A "complete" day has data reaching the end of the last open hour.
+        # The store is now 24/7 — last valid hour is 23.
         cur.execute("""
-            UPDATE control.generator_state SET
-                mode = 'backfill',
-                is_running = TRUE,
-                is_paused = FALSE,
-                backfill_start_date = %s,
-                backfill_end_date = %s,
-                backfill_current_date = %s,
-                started_at = NOW(),
-                updated_at = NOW()
-            WHERE state_id = 1
-        """, (backfill_start, today, backfill_start))
-    conn.commit()
+            SELECT transaction_dt::date AS d, 
+                   max(transaction_dt)::timestamp WITHOUT TIME ZONE AS last_txn
+            FROM pos.transactions
+            WHERE transaction_dt::date BETWEEN %s AND %s
+            GROUP BY 1
+        """, (effective_start, effective_end))
+        by_date = {r[0]: r[1] for r in cur.fetchall() if r}
+
+        # Also get the full date series so we don't miss completely empty days
+        cur.execute("""
+            SELECT generate_series(%s::date, %s::date, '1 day'::interval)::date AS d
+        """, (effective_start, effective_end))
+        all_dates = [r[0] for r in cur.fetchall()]
+
+        # A day is "covered" if its last_txn reaches the last open hour (22).
+        # Any day with last_txn before that is incomplete — needs resumption.
+        missing_dates = []
+        for d in all_dates:
+            if d not in by_date:
+                missing_dates.append(d)
+                continue
+            last_txn = by_date[d]
+            if last_txn.hour >= 23:
+                continue  # complete
+            missing_dates.append(d)
+
+        if not missing_dates:
+            # No gaps — ensure we're in realtime if currently stopped/paused
+            already_configured = _ensure_realtime(conn)
+            if already_configured:
+                return
+            with conn.cursor() as cur2:
+                cur2.execute("UPDATE control.generator_state SET mode = 'realtime', "
+                             "is_running = TRUE, backfill_start_date = NULL, "
+                             "backfill_end_date = NULL, backfill_current_date = NULL "
+                             "WHERE state_id = 1")
+            conn.commit()
+            return
+
+        # Gaps found — configure a targeted backfill to fill only missing days
+        missing_dates = sorted(missing_dates)
+        log.info("Detected %d incomplete/missing day(s) in the last 30 days: %s through %s",
+                 len(missing_dates), missing_dates[0], missing_dates[-1])
+
+        with conn.cursor() as cur2:
+            # Set backfill range to cover all gaps, even if data is non-contiguous
+            cur2.execute("""
+                UPDATE control.generator_state SET
+                    mode = 'backfill',
+                    is_running = TRUE,
+                    is_paused = FALSE,
+                    backfill_start_date = %s,
+                    backfill_end_date = %s,
+                    backfill_current_date = %s,
+                    started_at = NOW(), updated_at = NOW()
+                WHERE state_id = 1
+            """, (min(missing_dates), max(missing_dates), min(missing_dates)))
+        conn.commit()
+
+
+def _ensure_realtime(conn):
+    """Return True if a backfill was already in progress."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT mode, is_running FROM control.generator_state WHERE state_id = 1")
+        row = cur.fetchone()
+        if row and row[0] == 'backfill' and row[1]:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -339,10 +417,36 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
         now_dt = datetime.now()
         today = date.today()
 
-        # Skip dates that already have data — prevents duplicates when
-        # resuming an interrupted backfill or re-running over existing data.
-        if has_data_for_date(conn, cur_date):
-            log.info("Skipping %s — POS data already exists", cur_date)
+        # For past dates, check if this day is fully generated using max txn timestamp.
+        # Resume from the hour AFTER the last recorded transaction instead of hour 0.
+        skip_day = False
+        start_hour = 0  # default: regenerate full day from hour 0
+
+        if cur_date != today:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT max(transaction_dt)::timestamp FROM pos.transactions "
+                    "WHERE transaction_dt::date = %s", (cur_date,)
+                )
+                row = cur.fetchone()
+            last_txn_time = row[0]
+
+            if last_txn_time is None:
+                # No data at all — generate the full day (start_hour stays 0)
+                pass
+            elif last_txn_time.hour >= 23:
+                # Fully generated — last open hour (22) has data
+                log.info("Skipping %s — already complete (last txn %s)",
+                         cur_date, last_txn_time)
+                skip_day = True
+            else:
+                # Partial day — resume from the hour AFTER the last recorded txn
+                resuming_from = last_txn_time.replace(minute=0, second=0) + timedelta(hours=1)
+                start_hour = min(resuming_from.hour, 24)
+                log.info("%s has partial data (last txn %s), regenerating from hour %d",
+                         cur_date, last_txn_time, start_hour)
+
+        if skip_day:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE control.generator_state
@@ -353,15 +457,15 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             cur_date += timedelta(days=1)
             continue
 
-        # Partial day: today gets hours 0 → current_hour only; no end-of-day
+        # Partial day: today gets hours start_hour → current_hour; no end-of-day
         # events (they will run tonight via the realtime midnight handler).
         is_partial = (cur_date == today)
         end_hour = now_dt.hour if is_partial else 23
 
-        log.info("Backfilling %s%s (hours 0–%d)",
-                 cur_date, " [partial — up to current hour]" if is_partial else "", end_hour)
+        log.info("Backfilling %s%s (hours %d–%d)",
+                 cur_date, " [partial — up to current hour]" if is_partial else "", start_hour, end_hour)
 
-        for hour in range(end_hour + 1):
+        for hour in range(start_hour, end_hour + 1):
             # For the last hour of a partial day, use the exact current time so
             # the final backfill tick aligns with where realtime picks up.
             # All previous hours use the hour boundary (e.g. 13:00:00).
@@ -453,7 +557,7 @@ def main():
     locations, employees, departments, products, trucks = seed_all(conn, cfg)
 
     # Auto-start a 30-day backfill on a fresh (empty) database.
-    auto_backfill_if_fresh(conn)
+    auto_backfill_if_fresh(conn, cfg)
 
     log.info("Generator ready. Entering main loop.")
 
