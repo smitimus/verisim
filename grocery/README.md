@@ -113,10 +113,39 @@ bash build-and-push.sh grocery 1.2.0      # versioned (also tags latest)
 ## Downstream
 
 | Tool | Connection |
-|------|-----------|
+|------|------------|
 | Meltano | `tap-postgres-grocery` — `${IP}:5499`, DB `grocery` |
 | Airflow | `grocery_pipeline` DAG — runs Meltano extract + dbt |
 | dbt | `/opt/stacks/airflow/dbt/grocery/` — 27 staging + 14 mart models |
 | Superset | "Grocery Overview" dashboard — mart tables in EDW |
 | CloudBeaver | Pre-configured as "Verisim — Grocery Source" |
 | OpenMetadata | "VerisimGrocery" database service |
+
+## Crash Simulation (testing backfill gap recovery)
+
+```bash
+cd /opt/verisim
+
+# 1. Switch to test mode (builds verisim-grocery:local, starts as verisim-grocery-test)
+./switch.sh test
+
+# 2. Wait for auto-backfill (~60–90s), then hard-kill the container
+sleep 60 && docker kill verisim-grocery-test
+
+# 3. Restart — the backfill should detect incomplete days and fill them
+cd /opt/verisim && ./switch.sh test
+
+# 4. Wait for recovery, then verify zero incomplete days
+sleep 120
+docker exec verisim-grocery-test psql -U postgres -d grocery \
+  -c "SELECT count(*) FROM (SELECT transaction_dt::date, count(*) as c FROM pos.transactions GROUP BY 1 HAVING count(*) < 600) sub;"
+-- Expected: 0
+
+# 5. Verify FK integrity
+docker exec verisim-grocery-test psql -U postgres -d grocery \
+  -c "SELECT 'txn->employee', count(*) FROM pos.transactions t WHERE t.employee_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM hr.employees e WHERE e.employee_id = t.employee_id)
+      UNION ALL SELECT 'total mismatch', count(*) FROM pos.transactions WHERE total != (subtotal + tax - coupon_savings - deal_savings);"
+-- Expected: two rows, both with count 0
+
+# Teardown: ./switch.sh test (runs compose down before switching)
+```
