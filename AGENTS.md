@@ -41,18 +41,73 @@ bash build-and-push.sh gas-station        # builds smiti/verisim-gas-station:lat
 - Platform: `linux/amd64`
 - Build context is `verisim/` (needs access to both `base/` and industry source)
 
+### Build Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| `build-and-push.sh` fails on `docker buildx` | Buildx not configured | Run `docker buildx create --use` first |
+| Image builds but generator crashes on startup | Route stripping removed wrong routes | Check `standalone/strip_*.py` logic |
+| `docker compose` pulls old image instead of local | `switch.sh release` mode active | Run `switch.sh dev` or `switch.sh test` |
+| Standalone image ~2GB | Multi-stage build not using slim base | Check Dockerfile for unnecessary deps in final stage |
+| Generator won't connect to postgres | DB not ready yet | Container waits up to 30 retries (5s apart) — check logs |
+
 ## Route Stripping at Build Time
 
 Base API (`base/api/main.py`) contains routes for all industries. At build time:
 - `grocery/standalone/strip_gas_station.py` removes gas-station routes for the grocery image
 - `gas-station/standalone/strip_grocery.py` removes grocery routes for the gas-station image
 
+## Testing Infrastructure
+
+### compose.test.yaml — Local Standalone Image Test
+
+`grocery/compose.test.yaml` runs the locally-built standalone image (verisim-grocery:local) for end-to-end verification before pushing to Docker Hub.
+
+```bash
+# 1. Build test image
+./switch.sh test
+
+# 2. Start test container (clean data dir)
+docker compose -f grocery/compose.test.yaml up -d
+
+# 3. Monitor backfill (30 days auto-backfill on first start)
+docker logs -f verisim-grocery-test
+
+# 4. Run crash/recovery cycle tests
+#    See grocery/test-cycles-final-report.md for the full test protocol
+docker stop verisim-grocery-test && sleep 120 && docker start verisim-grocery-test
+```
+
+**What compose.test.yaml validates:**
+- Fresh start + 30-day backfill
+- Auto-transition to realtime
+- Data persistence across container restarts
+- Crash recovery (no duplicate IDs, no data loss)
+- Daily/hourly distribution accuracy
+
+**Test VM** (clean install validation):
+- Host: proxmox (192.168.1.40) — SSH as root
+- VM ID 106 at testvm (192.168.1.6)
+- Used to validate `install.sh` from a clean Debian
+
+### Test Coverage Gaps
+- **No unit tests** — generator code has no pytest setup
+- **No API integration tests** — FastAPI endpoints untested
+- **No CI/CD pipeline** — no automated test runs
+
 ## Generator Config (`config.yaml`)
 
 - `tick_interval_seconds` — wall-clock interval (30s = 15min simulated)
-- `locations` — store + warehouse counts
-- `daily_volumes` — transaction counts with hourly + day-of-week weights
+- `locations` — store + warehouse counts and employee ranges per location
+- `volumes` — `pos_transactions_per_day` range, 24 hourly weights, day-of-week multipliers
+- `products` — category tree (10 departments, ~40 categories), initial SKU count
+- `pricing` — price change frequency, tax rate
+- `inventory` — initial stock, restock threshold
+- `loyalty` — signup rate, usage rate
+- `coupons` / `combo_deals` — active counts, duration, usage rates
 - `scenarios` — named event presets (rush_hour, weekend, holiday_week, etc.)
+
+Config is read at each tick — no restart needed for changes. Mounted into the container read-only.
 
 ## Backfill / Realtime Behavior
 
@@ -60,6 +115,40 @@ Base API (`base/api/main.py`) contains routes for all industries. At build time:
 - If `backfill_end_date = today`: backfills current day hour-by-hour up to current hour
 - Re-running backfill over same range is safe — existing days skipped
 - Force re-generate: `POST /grocery/generator/start` with `{"mode":"backfill","force":true}`
+
+## REST API Endpoints (FastAPI, port 8010)
+
+The Verisim grocery standalone image serves a FastAPI API at port 8010 with Swagger docs at `/docs`.
+
+### Generator Control
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/grocery/generator/status` | Current generator state (mode, running, tick stats) |
+| POST | `/grocery/generator/start` | Start/resume generator, accepts `{"mode":"backfill","force":true}` |
+| POST | `/grocery/generator/stop` | Pause generator at next tick boundary |
+
+### Data Access (all with offset pagination)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/grocery/employees` | Employee roster |
+| GET | `/grocery/locations` | Store/warehouse locations |
+| GET | `/grocery/products` | Product catalog |
+| GET | `/grocery/transactions` | POS transaction headers |
+| GET | `/grocery/transaction-items` | Line items |
+| GET | `/grocery/timeclock-events` | Timeclock events |
+| GET | `/grocery/inventory/stock-levels` | Current stock counts |
+| GET | `/grocery/supply-chain/orders` | Store orders |
+| GET | `/grocery/supply-chain/fulfillments` | Warehouse fulfillments |
+| GET | `/grocery/supply-chain/shipments` | Truck shipments |
+
+### Analytics / Dashboards
+
+Used by the Streamlit UI tabs (`_dashboard`, `_distributions`):
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/grocery/distributions/hourly` | Transaction distribution by hour |
+| GET | `/grocery/distributions/daily` | Transaction distribution by day |
+| GET | `/grocery/distributions/department` | Department-level sales mix |
 
 ## PostgreSQL Access (Dev Stack)
 
@@ -75,6 +164,37 @@ Credentials: `verisim` / `verisim` / db: `grocery` / port: `5499`
 - **Line item total**: `line_total = (unit_price - discount) * quantity` — discount is per-unit
 - **Timeclock events**: 4 types — `clock_in`, `clock_out`, `break_start`, `break_end`
 - **`mart_loyalty_cohort.total_spend`**: nullable for members who signed up but never purchased
+
+## Source Tables Consumed by dbt
+
+The data-lab dbt project expects these 27 source tables. If you add/rename a table here, update the matching staging model in `/opt/data-lab/airflow/dbt/grocery/models/staging/`.
+
+| Generator Schema | Tables | dbt Staging Model Prefix |
+|-----------------|--------|--------------------------|
+| hr | locations, employees, schedules | stg_hr_* |
+| pos | departments, products, price_history, coupons, combo_deals, loyalty_members, loyalty_point_transactions, transactions, transaction_items | stg_pos_* |
+| timeclock | events | stg_timeclock_* |
+| ordering | store_orders, store_order_items | stg_ordering_* |
+| fulfillment | orders, order_items | stg_fulfillment_* |
+| transport | trucks, loads, load_items | stg_transport_* |
+| inv | stock_levels, shrinkage_events, receipts, receipt_items, products | stg_inv_* |
+| pricing | weekly_ads, ad_items | stg_pricing_* |
+
+## Code Quality Notes
+
+### Oversized Files (need splitting)
+| File | Pure LOC | Problem |
+|------|----------|---------|
+| `base/ui/app.py` | ~2000 | Monolithic Streamlit UI — one file for all 7 tabs |
+| `grocery/generator/main.py` | ~550 | Entry point mixes DB bootstrap, state management, and the generation loop |
+| `grocery/generator/models/pos.py` | ~520 | All POS logic (seeding, transactions, coupons, deals, loyalty) in one file |
+
+### Tooling Gaps
+- **No pyproject.toml** — no type checker, no linter config
+- **No pytest** — no test runner, no conftest, no test files
+- **No pre-commit hooks** — no automated quality gates
+- **No CI/CD** — no GitHub Actions, no automated builds/tests
+- **Unvalidated config** — `config.py` reads YAML without schema validation (pydantic or similar)
 
 ## Known Bugs (Fixed — Do Not Revert)
 

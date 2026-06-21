@@ -16,6 +16,7 @@ services:
     volumes:
       - ${CONF}/verisim-grocery-dev:/var/lib/postgresql/data
     ports:
+      # Dev port mapping uses VERISIM_POSTGRES_PORT (default 5499)
       - "${VERISIM_POSTGRES_PORT:-5499}:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${VERISIM_POSTGRES_USER}", "-d", "${VERISIM_GROCERY_DB}"]
@@ -40,6 +41,7 @@ services:
       GROCERY_DB: ${VERISIM_GROCERY_DB}
       TZ: ${TZ}
     ports:
+      # Dev port mapping uses VERISIM_API_PORT (default 8010)
       - "${VERISIM_API_PORT:-8010}:8000"
     depends_on:
       verisim-grocery-dev-postgres:
@@ -63,6 +65,7 @@ services:
       API_BASE_URL: http://verisim-grocery-dev-api:8000
       TZ: ${TZ}
     ports:
+      # Dev port mapping uses VERISIM_UI_PORT (default 8501)
       - "${VERISIM_UI_PORT:-8501}:8501"
     depends_on:
       - verisim-grocery-dev-api

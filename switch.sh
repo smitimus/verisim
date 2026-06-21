@@ -26,9 +26,17 @@ _stop_all() {
 }
 
 _urls() {
-  echo "  UI:  http://${IP:-localhost}:${VERISIM_UI_PORT:-8501}"
-  echo "  API: http://${IP:-localhost}:${VERISIM_API_PORT:-8010}/docs"
-  echo "  PG:  ${IP:-localhost}:${VERISIM_POSTGRES_PORT:-5499}"
+  local mode="$1"
+  local pg_port ui_port api_port
+  case "$mode" in
+    dev)    pg_port=5500; api_port=8011; ui_port=8502 ;;
+    test)   pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
+    release) pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
+    *)      pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
+  esac
+  echo "  UI:  http://${IP:-localhost}:${ui_port}"
+  echo "  API: http://${IP:-localhost}:${api_port}/docs"
+  echo "  PG:  ${IP:-localhost}:${pg_port}"
 }
 
 case "$1" in
@@ -43,7 +51,7 @@ case "$1" in
       up -d --build
     echo ""
     echo "Dev stack is up."
-    _urls
+    _urls dev
     echo ""
     ;;
 
@@ -63,7 +71,7 @@ case "$1" in
       up -d
     echo ""
     echo "Test stack is up (local standalone image)."
-    _urls
+    _urls test
     echo ""
     ;;
 
@@ -76,23 +84,27 @@ case "$1" in
       up -d
     echo ""
     echo "Release stack is up (Docker Hub image)."
-    _urls
+    _urls release
     echo ""
     ;;
 
   status)
     echo ""
     echo "=== Verisim mode status ==="
+    RUNNING_MODE=""
     if docker ps --format '{{.Names}}' | grep -q 'verisim-grocery-dev'; then
       echo "  Mode: dev (multi-container from source)"
+      RUNNING_MODE="dev"
     elif docker ps --format '{{.Names}}' | grep -q 'verisim-grocery-test'; then
       echo "  Mode: test (local standalone image)"
+      RUNNING_MODE="test"
     elif docker ps --format '{{.Names}}' | grep -q '^verisim-grocery$'; then
       echo "  Mode: release (Docker Hub image)"
+      RUNNING_MODE="release"
     else
       echo "  Mode: none (no Verisim stack running)"
     fi
-    _urls
+    _urls "$RUNNING_MODE"
     echo ""
     ;;
 

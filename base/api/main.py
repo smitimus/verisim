@@ -21,6 +21,7 @@ import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("api")
@@ -223,15 +224,22 @@ class AdItemCreate(BaseModel):
 
 @app.get("/health", tags=["Platform"])
 def health():
-    results = {}
+    statuses = {}
+    all_healthy = True
     for industry in INDUSTRY_DBS:
         try:
-            rows = query("SELECT 1 AS ok", None, industry)
-            results[industry] = rows[0]["ok"] == 1
-        except Exception:
-            results[industry] = False
-    all_ok = all(results.values())
-    return {"status": "ok" if all_ok else "degraded", "industries": results}
+            pool = pool_for(industry)
+            conn = pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            pool.putconn(conn)
+            statuses[industry] = "healthy"
+        except Exception as e:
+            statuses[industry] = f"unhealthy: {str(e)}"
+            all_healthy = False
+    if not all_healthy:
+        return JSONResponse({"status": "unhealthy", "details": statuses}, status_code=503)
+    return {"status": "healthy", "details": statuses}
 
 
 @app.get("/industries", tags=["Platform"])

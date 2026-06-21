@@ -1,3 +1,4 @@
+# 260620 - added health check
 # Verisim Grocery — local standalone test stack
 # Runs the locally-built standalone image (verisim-grocery:local) before pushing to Docker Hub.
 # Build the image first via: ./switch.sh test  (or manually: docker build -t verisim-grocery:local -f grocery/standalone/Dockerfile .)
@@ -17,6 +18,12 @@ services:
       POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD:-verisim}
       POSTGRES_DB: ${VERISIM_GROCERY_DB:-grocery}
       TZ: ${TZ}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${VERISIM_POSTGRES_USER:-verisim}", "-d", "${VERISIM_GROCERY_DB:-grocery}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     volumes:
       - ${CONF}/verisim-grocery-test:/var/lib/postgresql/data
     restart: unless-stopped
