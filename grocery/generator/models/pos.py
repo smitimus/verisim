@@ -468,6 +468,88 @@ def generate_pos_transactions(
     return depletion_info
 
 
+# ---------------------------------------------------------------------------
+# Loyalty seeding
+# ---------------------------------------------------------------------------
+
+def seed_loyalty_members(conn, cfg: Config) -> None:
+    """
+    Seed initial loyalty members with realistic tier distribution and
+    corresponding bonus point transactions. Idempotent — skips if members
+    already exist.
+
+    The bonus point transactions give each non-bronze member a starting
+    balance_after that matches their initial points_balance, so the dbt
+    test assertions pass from the first day of data.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM pos.loyalty_members")
+        if cur.fetchone()[0] > 0:
+            log.info("Loyalty members already exist — skipping seed.")
+            return
+
+    initial_count = cfg.loyalty.initial_member_count
+    log.info("Seeding %d loyalty members with tier distribution...", initial_count)
+
+    # Tier distribution: bronze 40%, silver 35%, gold 17%, platinum 8%
+    tier_pcts = [
+        ('bronze',   0.40,     0,      0),
+        ('silver',   0.35,   500,   1999),
+        ('gold',     0.17,  2000,   4999),
+        ('platinum', 0.08,  5000,  10000),
+    ]
+
+    members = []
+    bonus_pts = []  # (member_id, points, tier)
+
+    for tier, pct, bal_min, bal_max in tier_pcts:
+        count = max(1, round(initial_count * pct))
+        for _ in range(count):
+            mid = uuid4()
+            first = fake.first_name()
+            last = fake.last_name()
+            email = f"{first.lower()}.{last.lower()}{random.randint(1, 9999)}@email.com"
+            if bal_min == 0:
+                # Bronze — zero balance, no bonus transaction needed
+                members.append((mid, first, last, email,
+                                fake.numerify('(###) ###-####'),
+                                date.today() - timedelta(days=random.randint(1, 365)),
+                                0, tier))
+            else:
+                pts = random.randint(bal_min, bal_max)
+                members.append((mid, first, last, email,
+                                fake.numerify('(###) ###-####'),
+                                date.today() - timedelta(days=random.randint(1, 365)),
+                                pts, tier))
+                bonus_pts.append((mid, pts, tier))
+
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO pos.loyalty_members
+                (member_id, first_name, last_name, email, phone,
+                 signup_date, points_balance, tier)
+            VALUES %s ON CONFLICT (email) DO NOTHING
+        """, members,
+        template="(%s::uuid,%s,%s,%s,%s,%s,%s,%s)")
+
+        if bonus_pts:
+            # Create bonus point transactions so balance_after is consistent
+            bonus_records = [
+                (mid, pts, 0, 'bonus', pts)
+                for mid, pts, tier in bonus_pts
+            ]
+            execute_values(cur, """
+                INSERT INTO pos.loyalty_point_transactions
+                    (member_id, points_earned, points_redeemed, reason, balance_after)
+                VALUES %s
+            """, bonus_records,
+            template="(%s::uuid,%s,%s,%s,%s)")
+
+    conn.commit()
+    log.info("Seeded %d loyalty members (%d with bonus point records).",
+             len(members), len(bonus_pts))
+
+
 # Tier thresholds: minimum points_balance to reach each tier
 TIER_THRESHOLDS = {'bronze': 0, 'silver': 500, 'gold': 2000, 'platinum': 5000}
 TIER_ORDER      = ['bronze', 'silver', 'gold', 'platinum']
@@ -478,6 +560,11 @@ def _record_loyalty_points(conn, txn_records: list) -> None:
     For each transaction that had a loyalty member, earn 1 point per dollar,
     write a pos.loyalty_point_transactions row, update balance, and upgrade
     tier if threshold crossed.
+
+    balance_after is computed from the cumulative sum of POINT TRANSACTIONS
+    (not from loyalty_members.points_balance). This ensures correct sequential
+    ordering even when backfill processes chronologically earlier transactions
+    after realtime has already updated the member's balance.
     """
     # txn_records cols: txn_id[0], location_id[1], employee_id[2], member_id[3],
     #                   ..., total[9], ...
@@ -486,23 +573,38 @@ def _record_loyalty_points(conn, txn_records: list) -> None:
         return
 
     pt_records = []
+    # Running balance per member WITHIN this batch so that multiple transactions
+    # for the same member in the same call produce sequentially correct values.
+    running: Dict[str, int] = {}
+
     with conn.cursor() as cur:
         for txn_id, member_id, total in member_txns:
             points_earned = max(0, int(total))
             if points_earned == 0:
                 continue
 
-            # Lock the row before reading so concurrent batches can't produce
-            # stale reads when the same member appears in multiple transactions.
+            # First time seeing this member in this batch: fetch committed
+            # cumulative total from point_transactions as the starting point.
+            if member_id not in running:
+                cur.execute(
+                    "SELECT COALESCE(SUM(points_earned), 0) - COALESCE(SUM(points_redeemed), 0) "
+                    "FROM pos.loyalty_point_transactions WHERE member_id = %s::uuid",
+                    (member_id,)
+                )
+                running[member_id] = int(cur.fetchone()[0])
+
+            new_balance = running[member_id] + points_earned
+            running[member_id] = new_balance
+
+            # Lock and update the member row so concurrent batches don't race.
             cur.execute(
-                "SELECT points_balance, tier FROM pos.loyalty_members WHERE member_id = %s::uuid FOR UPDATE",
+                "SELECT tier FROM pos.loyalty_members WHERE member_id = %s::uuid FOR UPDATE",
                 (member_id,)
             )
             row = cur.fetchone()
             if not row:
                 continue
-            current_balance, current_tier = row[0], row[1]
-            new_balance = current_balance + points_earned
+            current_tier = row[0]
 
             # Check tier upgrade
             new_tier = current_tier

@@ -167,6 +167,7 @@ def seed_all(conn, cfg):
     employees = hr.seed_employees(conn, cfg, locations)
     departments = pos.seed_departments(conn, cfg)
     products = pos.seed_products(conn, cfg, departments)
+    pos.seed_loyalty_members(conn, cfg)
     inventory.seed_inventory(conn, cfg, products, locations['stores'])
     trucks = transport.seed_trucks(conn, truck_count=4)
     pos.seed_named_coupons(conn, departments)
@@ -528,6 +529,15 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 WHERE state_id = 1
             """, (cur_date + timedelta(days=1),))
         conn.commit()
+
+        # Refresh reference data after each day so new signups, coupon/deal
+        # rotations, and employee changes are visible to subsequent days.
+        members = pos.fetch_loyalty_members(conn)
+        coupons = pos.fetch_active_coupons(conn)
+        deals = pos.fetch_active_deals(conn)
+        employees = hr.fetch_active_employees(conn)
+        locations = hr.fetch_locations(conn)
+
         cur_date += timedelta(days=1)
 
     with conn.cursor() as cur:

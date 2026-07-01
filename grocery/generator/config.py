@@ -38,6 +38,7 @@ class LocationConfig:
 class LoyaltyConfig:
     signup_rate: float = 0.06
     loyalty_usage_rate: float = 0.40
+    initial_member_count: int = 300
 
 
 @dataclass
@@ -182,6 +183,8 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.loyalty.signup_rate = float(loy['signup_rate'])
     if 'loyalty_usage_rate' in loy:
         cfg.loyalty.loyalty_usage_rate = float(loy['loyalty_usage_rate'])
+    if 'initial_member_count' in loy:
+        cfg.loyalty.initial_member_count = int(loy['initial_member_count'])
 
     pri = data.get('pricing', {})
     if 'product_price_change_frequency_days' in pri:
