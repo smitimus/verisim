@@ -62,6 +62,7 @@ volumes:
 loyalty:
   signup_rate: 0.06        # slightly higher than gas station
   loyalty_usage_rate: 0.40 # grocery loyalty cards used more often
+  initial_member_count: 300 # initial members seeded at startup
 
 products:
   initial_count: 500       # more SKUs than gas station

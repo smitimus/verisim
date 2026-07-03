@@ -172,6 +172,7 @@ def seed_all(conn, cfg):
     pos.seed_named_coupons(conn, departments)
     pos.seed_coupons(conn, cfg, departments, products)
     pos.seed_combo_deals(conn, cfg, departments, products)
+    pos.seed_loyalty_members(conn, cfg)
     # One-time: mark perishable products + assign shelf_life_days
     shrinkage.mark_perishable_products(conn)
     # Ensure a current weekly ad exists at startup
