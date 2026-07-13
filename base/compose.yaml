@@ -50,6 +50,12 @@ services:
       verisim-base-postgres:
         condition: service_healthy
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     labels:
       - homepage.group=${HOMEPAGE_GROUP}
       - homepage.name=Verisim API
