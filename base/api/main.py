@@ -1129,7 +1129,7 @@ def inventory_receipts(
         params.append(end_dt)
     where = " AND ".join(filters)
     return query(f"""
-        SELECT r.receipt_id, r.location_id, r.received_dt, r.supplier_name,
+        SELECT r.receipt_id, r.load_id, r.location_id, r.received_dt, r.supplier_name,
                r.po_number, r.total_cost,
                COUNT(ri.receipt_item_id) AS line_items
         FROM inv.receipts r
