@@ -46,7 +46,7 @@ case "$1" in
     echo "=== Verisim: switching to dev mode ==="
     _stop_all
     echo "  Building and starting dev stack..."
-    docker compose --env-file "$GROCERY_DIR/.env" \
+    docker compose --env-file "$VERISIM_DIR/base/.env" --env-file "$GROCERY_DIR/.env" \
       -f "$GROCERY_DIR/compose.yaml" \
       up -d --build
     echo ""
