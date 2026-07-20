@@ -437,10 +437,13 @@ def seed_price_history(conn, cfg: Config, products: List[Dict]) -> None:
             records.append((str(p['product_id']), old_price, prices_seq[i], ts))
 
     if records:
-        execute_values(cur, """
-            INSERT INTO pos.price_history (product_id, old_price, new_price, changed_at)
-            VALUES %s
-        """, records, template="(%s::uuid,%s,%s,%s)")
+        # NOTE: the read cursor from the idempotency check above is closed
+        # once its `with` block exits, so use a fresh cursor for the bulk insert.
+        with conn.cursor() as ins_cur:
+            execute_values(ins_cur, """
+                INSERT INTO pos.price_history (product_id, old_price, new_price, changed_at)
+                VALUES %s
+            """, records, template="(%s::uuid,%s,%s,%s)")
         conn.commit()
         log.info("Seeded %d price_history rows", len(records))
 
