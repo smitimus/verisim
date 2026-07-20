@@ -14,7 +14,7 @@ services:
       POSTGRES_DB: ${VERISIM_GROCERY_DB}
       TZ: ${TZ}
     volumes:
-      - ${CONF}/verisim-grocery-dev:/var/lib/postgresql/data
+      - verisim-grocery-dev-db:/var/lib/postgresql/data
     ports:
       # Dev port mapping uses VERISIM_POSTGRES_PORT (default 5499)
       - "${VERISIM_POSTGRES_PORT:-5499}:5432"
@@ -105,3 +105,10 @@ networks:
   verisim_grocery_dev:
     name: verisim_grocery_dev
     driver: bridge
+
+volumes:
+  verisim-grocery-dev-db:
+    # Named volume (Docker-managed) instead of a host bind mount. Survives
+    # postgres container recreation far more reliably than a bind mount, which
+    # is what caused the 2026-07-20 data-loss incident during a stack rebuild.
+    name: verisim-grocery-dev-db

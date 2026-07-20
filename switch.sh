@@ -5,6 +5,7 @@
 # dev     — Build from source, start self-contained grocery dev stack
 # test    — Build standalone image locally (verisim-grocery:local), run as single container
 # release — Start production stack (pulls from Docker Hub)
+# rebuild — Build the standalone image and restart the test stack (rebuild-and-restart workflow)
 # status  — Show which mode is currently running
 
 set -e
@@ -29,10 +30,8 @@ _urls() {
   local mode="$1"
   local pg_port ui_port api_port
   case "$mode" in
-    dev)    pg_port=5500; api_port=8011; ui_port=8502 ;;
-    test)   pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
-    release) pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
-    *)      pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
+    # All modes share the canonical ports so data-lab needs no repointing.
+    *)  pg_port="${VERISIM_POSTGRES_PORT:-5499}"; api_port="${VERISIM_API_PORT:-8010}"; ui_port="${VERISIM_UI_PORT:-8501}" ;;
   esac
   echo "  UI:  http://${IP:-localhost}:${ui_port}"
   echo "  API: http://${IP:-localhost}:${api_port}/docs"
@@ -45,10 +44,18 @@ case "$1" in
     echo ""
     echo "=== Verisim: switching to dev mode ==="
     _stop_all
-    echo "  Building and starting dev stack..."
-    docker compose --env-file "$VERISIM_DIR/base/.env" --env-file "$GROCERY_DIR/.env" \
-      -f "$GROCERY_DIR/compose.yaml" \
-      up -d --build
+    echo "  Building and starting dev stack (canonical ports 5499/8010/8501)..."
+    VERISIM_POSTGRES_USER="${VERISIM_POSTGRES_USER:-verisim}" \
+    VERISIM_POSTGRES_PASSWORD="${VERISIM_POSTGRES_PASSWORD:-verisim}" \
+    VERISIM_GROCERY_DB="${VERISIM_GROCERY_DB:-grocery}" \
+    VERISIM_POSTGRES_PORT="${VERISIM_POSTGRES_PORT:-5499}" \
+    VERISIM_API_PORT="${VERISIM_API_PORT:-8010}" \
+    VERISIM_UI_PORT="${VERISIM_UI_PORT:-8501}" \
+    TZ="${TZ:-America/New_York}" \
+    CONF="${CONF:-/config}" \
+    IP="${IP:-localhost}" \
+    HOMEPAGE_GROUP="${HOMEPAGE_GROUP:-Verisim}" \
+    docker compose -f "$GROCERY_DIR/compose.yaml" up -d --build
     echo ""
     echo "Dev stack is up."
     _urls dev
@@ -66,9 +73,17 @@ case "$1" in
     echo ""
     echo "=== Verisim: switching to test mode ==="
     _stop_all
-    docker compose --env-file "$GROCERY_DIR/.env" \
-      -f "$GROCERY_DIR/compose.test.yaml" \
-      up -d
+    VERISIM_POSTGRES_USER="${VERISIM_POSTGRES_USER:-verisim}" \
+    VERISIM_POSTGRES_PASSWORD="${VERISIM_POSTGRES_PASSWORD:-verisim}" \
+    VERISIM_GROCERY_DB="${VERISIM_GROCERY_DB:-grocery}" \
+    VERISIM_POSTGRES_PORT="${VERISIM_POSTGRES_PORT:-5499}" \
+    VERISIM_API_PORT="${VERISIM_API_PORT:-8010}" \
+    VERISIM_UI_PORT="${VERISIM_UI_PORT:-8501}" \
+    TZ="${TZ:-America/New_York}" \
+    CONF="${CONF:-/config}" \
+    IP="${IP:-localhost}" \
+    HOMEPAGE_GROUP="${HOMEPAGE_GROUP:-Verisim}" \
+    docker compose -f "$GROCERY_DIR/compose.test.yaml" up -d
     echo ""
     echo "Test stack is up (local standalone image)."
     _urls test
@@ -79,12 +94,47 @@ case "$1" in
     echo ""
     echo "=== Verisim: switching to release mode ==="
     _stop_all
-    docker compose --env-file "$STACKS_DIR/verisim-grocery/.env" \
-      -f "$STACKS_DIR/verisim-grocery/compose.yaml" \
-      up -d
+    VERISIM_POSTGRES_USER="${VERISIM_POSTGRES_USER:-verisim}" \
+    VERISIM_POSTGRES_PASSWORD="${VERISIM_POSTGRES_PASSWORD:-verisim}" \
+    VERISIM_GROCERY_DB="${VERISIM_GROCERY_DB:-grocery}" \
+    VERISIM_POSTGRES_PORT="${VERISIM_POSTGRES_PORT:-5499}" \
+    VERISIM_API_PORT="${VERISIM_API_PORT:-8010}" \
+    VERISIM_UI_PORT="${VERISIM_UI_PORT:-8501}" \
+    TZ="${TZ:-America/New_York}" \
+    CONF="${CONF:-/config}" \
+    IP="${IP:-localhost}" \
+    HOMEPAGE_GROUP="${HOMEPAGE_GROUP:-Verisim}" \
+    docker compose -f "$STACKS_DIR/verisim-grocery/compose.yaml" up -d
     echo ""
     echo "Release stack is up (Docker Hub image)."
     _urls release
+    echo ""
+    ;;
+
+  rebuild)
+    echo ""
+    echo "=== Verisim: rebuild standalone image + restart test stack ==="
+    _stop_all
+    echo "  Building standalone image (verisim-grocery:local)..."
+    docker build --platform linux/amd64 \
+      -t verisim-grocery:local \
+      -f "$GROCERY_DIR/standalone/Dockerfile" \
+      "$VERISIM_DIR"
+    echo "  Starting test stack (canonical ports 5499/8010/8501)..."
+    VERISIM_POSTGRES_USER="${VERISIM_POSTGRES_USER:-verisim}" \
+    VERISIM_POSTGRES_PASSWORD="${VERISIM_POSTGRES_PASSWORD:-verisim}" \
+    VERISIM_GROCERY_DB="${VERISIM_GROCERY_DB:-grocery}" \
+    VERISIM_POSTGRES_PORT="${VERISIM_POSTGRES_PORT:-5499}" \
+    VERISIM_API_PORT="${VERISIM_API_PORT:-8010}" \
+    VERISIM_UI_PORT="${VERISIM_UI_PORT:-8501}" \
+    TZ="${TZ:-America/New_York}" \
+    CONF="${CONF:-/config}" \
+    IP="${IP:-localhost}" \
+    HOMEPAGE_GROUP="${HOMEPAGE_GROUP:-Verisim}" \
+    docker compose -f "$GROCERY_DIR/compose.test.yaml" up -d
+    echo ""
+    echo "Test stack is up (local standalone image)."
+    _urls test
     echo ""
     ;;
 
@@ -115,6 +165,7 @@ case "$1" in
     echo "  dev     Build from source, start self-contained grocery dev stack"
     echo "  test    Build standalone image locally, run as single container"
     echo "  release Start production stack (pulls from Docker Hub)"
+    echo "  rebuild Rebuild standalone image + restart test stack (rebuild-and-restart)"
     echo "  status  Show which mode is currently running"
     echo ""
     ;;
