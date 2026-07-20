@@ -156,6 +156,7 @@ products:
 pricing:
   product_price_change_frequency_days: 14   # grocery prices change more often than gas station
   tax_rate: 0.07                            # most groceries taxed lower / exempt
+  price_history_backfill_days: 90           # seed this many days of price_history at startup (price-elasticity)
 
 inventory:
   initial_stock_per_product: 200

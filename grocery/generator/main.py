@@ -167,6 +167,7 @@ def seed_all(conn, cfg):
     employees = hr.seed_employees(conn, cfg, locations)
     departments = pos.seed_departments(conn, cfg)
     products = pos.seed_products(conn, cfg, departments)
+    pos.seed_price_history(conn, cfg, products)
     inventory.seed_inventory(conn, cfg, products, locations['stores'])
     trucks = transport.seed_trucks(conn, truck_count=4)
     pos.seed_named_coupons(conn, departments)

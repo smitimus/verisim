@@ -625,11 +625,13 @@ def pos_transaction_items(
         SELECT COUNT(*) AS n FROM pos.transaction_items ti
         JOIN pos.transactions t ON t.transaction_id = ti.transaction_id WHERE {where}
     """, params, industry)[0]["n"]
+    # coupon_id / deal_id only exist on the grocery schema's transaction_items.
+    extra_cols = ", ti.coupon_id, ti.deal_id" if industry == "grocery" else ""
     rows = query(f"""
         SELECT ti.item_id, ti.transaction_id, ti.product_id,
                p.name AS product_name, p.category,
                ti.quantity, ti.unit_price, ti.discount, ti.line_total,
-               t.transaction_dt, t.location_id
+               t.transaction_dt, t.location_id{extra_cols}
         FROM pos.transaction_items ti
         JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
         JOIN pos.products p ON p.product_id = ti.product_id

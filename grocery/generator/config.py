@@ -45,6 +45,7 @@ class LoyaltyConfig:
 class PricingConfig:
     product_price_change_frequency_days: float = 14.0
     tax_rate: float = 0.07
+    price_history_backfill_days: int = 90
 
 
 @dataclass
@@ -191,6 +192,8 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.pricing.product_price_change_frequency_days = float(pri['product_price_change_frequency_days'])
     if 'tax_rate' in pri:
         cfg.pricing.tax_rate = float(pri['tax_rate'])
+    if 'price_history_backfill_days' in pri:
+        cfg.pricing.price_history_backfill_days = int(pri['price_history_backfill_days'])
 
     inv = data.get('inventory', {})
     if 'initial_stock_per_product' in inv:

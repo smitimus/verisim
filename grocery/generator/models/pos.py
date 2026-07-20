@@ -119,7 +119,7 @@ def _pick_uom(dept_name: str) -> str:
 def _fetch_active_products(cur) -> List[Dict]:
     cur.execute("""
         SELECT p.product_id, p.sku, p.name, p.category, p.current_price,
-               p.unit_of_measure, d.name as dept_name
+               p.unit_of_measure, d.department_id, d.name as dept_name
         FROM pos.products p
         JOIN pos.departments d ON d.department_id = p.department_id
         WHERE p.is_active = TRUE
@@ -133,8 +133,9 @@ def _fetch_active_products(cur) -> List[Dict]:
             'price':         float(r[4]),
             'current_price': float(r[4]),   # alias used by promotions module
             'uom':           r[5],
-            'department':    r[6],
-            'department_name': r[6],        # alias used by promotions module
+            'department_id': str(r[6]),
+            'department':    r[7],
+            'department_name': r[7],        # alias used by promotions module
         }
         for r in cur.fetchall()
     ]
@@ -380,6 +381,71 @@ def fetch_loyalty_members(conn) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Price history seeding (for price-elasticity analysis)
+# ---------------------------------------------------------------------------
+
+def seed_price_history(conn, cfg: Config, products: List[Dict]) -> None:
+    """Seed N days of historical price_history so fresh databases have full
+    coverage for elasticity analysis (no enforced retention cap exists; the
+    generator simply appends, so this is about dataset age, not pruning).
+
+    Idempotent: skips if any price_history row is older than the configured
+    window, so re-seeding a fresh DB is safe and an already-aged DB is left
+    untouched. Rows are stamped with explicit historical `changed_at` values
+    (the column defaults to NOW(), which would erase the signal). The walk
+    ends at each product's current `current_price` so realtime continues
+    smoothly from the seeded history.
+    """
+    if not products:
+        return
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pos.price_history "
+            "WHERE changed_at < NOW() - (%s * INTERVAL '1 day') LIMIT 1",
+            (cfg.pricing.price_history_backfill_days,),
+        )
+        if cur.fetchone():
+            log.info("price_history already has historical coverage; skipping seed.")
+            return
+
+    log.info("Seeding %d days of price_history for %d products...",
+             cfg.pricing.price_history_backfill_days, len(products))
+    today = date.today()
+    n_days = cfg.pricing.price_history_backfill_days
+    step_days = max(1, n_days // 12)  # ~12 price points spread across the window
+
+    records = []
+    for p in products:
+        price = float(p['price'])
+        days = list(range(n_days, 0, -step_days))
+        if days[-1] != 0:
+            days.append(0)
+        num_pts = len(days)
+
+        # Walk backward from a plausible start price to today's current price.
+        start = round(price * random.uniform(0.80, 1.20), 2)
+        prices_seq = [start]
+        for _ in range(num_pts - 2):
+            prev = prices_seq[-1]
+            prices_seq.append(round(max(0.10, prev * random.uniform(0.97, 1.05)), 2))
+        prices_seq.append(price)  # final point == live current_price (continuity)
+
+        for i, d in enumerate(days):
+            ts = datetime(today.year, today.month, today.day) - timedelta(days=d)
+            old_price = prices_seq[i - 1] if i > 0 else prices_seq[i]
+            records.append((str(p['product_id']), old_price, prices_seq[i], ts))
+
+    if records:
+        execute_values(cur, """
+            INSERT INTO pos.price_history (product_id, old_price, new_price, changed_at)
+            VALUES %s
+        """, records, template="(%s::uuid,%s,%s,%s)")
+        conn.commit()
+        log.info("Seeded %d price_history rows", len(records))
+
+
+# ---------------------------------------------------------------------------
 # Transaction generation
 # ---------------------------------------------------------------------------
 
@@ -462,6 +528,7 @@ def generate_pos_transactions(
 
         # Apply a coupon to the whole transaction (loyalty members only)
         coupon_savings = 0.0
+        coupon = None
         if member_id and coupons and random.random() < cfg.coupons.coupon_use_rate * scenario.coupon_multiplier:
             coupon = random.choice(coupons)
             if coupon['coupon_type'] == 'percent_off':
@@ -471,6 +538,7 @@ def generate_pos_transactions(
 
         # Apply a combo deal
         deal_savings = 0.0
+        deal = None
         if deals and random.random() < cfg.combo_deals.combo_use_rate:
             deal = random.choice(deals)
             deal_dept_products = [p for p in cart
@@ -481,6 +549,25 @@ def generate_pos_transactions(
                 trigger_items = sorted(deal_dept_products, key=lambda p: p['price'], reverse=True)[:deal['trigger_qty']]
                 original = sum(p['price'] for p in trigger_items)
                 deal_savings = max(0.0, round(original - deal['deal_price'], 2))
+
+        # Tag the applicable line items with the applied coupon/deal IDs so
+        # data-lab can attribute redemptions per promotion. transaction_items
+        # already has coupon_id/deal_id columns (no schema change); we just
+        # populate them on the items the promo actually applied to.
+        if coupon is not None:
+            coupon_products = _applicable_promo_products(cart, coupon, 'coupon')
+            for i, p in enumerate(cart):
+                if p['product_id'] in coupon_products:
+                    rec = list(item_recs[i])
+                    rec[5] = coupon['coupon_id']
+                    item_recs[i] = tuple(rec)
+        if deal is not None:
+            deal_products = _applicable_promo_products(cart, deal, 'deal')
+            for i, p in enumerate(cart):
+                if p['product_id'] in deal_products:
+                    rec = list(item_recs[i])
+                    rec[6] = deal['deal_id']
+                    item_recs[i] = tuple(rec)
 
         subtotal = round(subtotal, 2)
         total_before_tax = max(0.01, round(subtotal - coupon_savings - deal_savings, 2))
@@ -626,9 +713,31 @@ def _record_loyalty_points(conn, txn_records: list) -> None:
     conn.commit()
 
 
+def _applicable_promo_products(cart: List[Dict], promo: Dict, kind: str) -> set:
+    """Return the set of product_ids in this cart that the promo applies to.
+
+    Used to tag the correct transaction_items rows with the applied
+    coupon_id / deal_id. Mirrors the scope rules used when computing the
+    savings: a product-scoped promo tags only that product; a department-
+    scoped promo tags every cart item in that department; a promo with no
+    scope tags the whole basket.
+    """
+    if kind == 'coupon':
+        pid = promo.get('product_id')
+        did = promo.get('department_id')
+    else:
+        pid = promo.get('trigger_product_id')
+        did = promo.get('trigger_department_id')
+    if pid:
+        return {pid}
+    if did:
+        return {p['product_id'] for p in cart if p.get('department_id') == did}
+    return {p['product_id'] for p in cart}
+
+
 def _dept_id_for_product(product: Dict) -> Optional[str]:
-    """Products carry dept name, not dept_id — used for deal matching."""
-    return None  # deal matching in generator uses dept name, not UUID
+    """Products carry department_id once seed_products enriches them."""
+    return product.get('department_id')
 
 
 # ---------------------------------------------------------------------------
