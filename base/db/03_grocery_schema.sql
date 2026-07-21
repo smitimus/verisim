@@ -36,6 +36,8 @@ CREATE TABLE hr.locations (
     store_sqft      INTEGER,
     num_aisles      INTEGER,
     is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    latitude        NUMERIC(9,6),  -- added for transport distance computation (verisim#13)
+    longitude       NUMERIC(9,6),  -- added for transport distance computation (verisim#13)
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
@@ -273,6 +275,7 @@ CREATE TABLE transport.loads (
     arrived_at              TIMESTAMPTZ,
     status                  VARCHAR(20) NOT NULL DEFAULT 'loading'
                                 CHECK (status IN ('loading','in_transit','delivered','cancelled')),
+    distance_miles          NUMERIC(8,2),  -- haversine distance at dispatch time (verisim#13)
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

@@ -6,12 +6,37 @@ HR is the source of truth: all other schemas reference these IDs.
 import random
 import logging
 from datetime import date
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from faker import Faker
 from psycopg2.extras import execute_values
 
 from config import Config
+
+# Approximate lat/long centroids for states used in STORE_STATES.\# Used to seed hr.locations with plausible coordinates for transport distance (verisim#13).
+STATE_COORDS = {
+    'TX': (31.0, -97.0), 'FL': (28.0, -82.0), 'GA': (33.0, -84.0),
+    'TN': (35.8, -86.4), 'OH': (40.4, -82.9), 'IN': (39.8, -86.1),
+    'IL': (40.0, -89.0), 'PA': (41.0, -77.5), 'NY': (42.2, -75.5),
+    'NC': (35.5, -79.4),
+}
+
+
+def _random_lat_long(state: str, location_type: str) -> Tuple[float, float]:
+    """Return a plausible (latitude, longitude) for a location in `state`.
+
+    Stores get a small jitter so they don't all sit on the centroid.
+    Warehouses are placed at the centroid (single DC per state).
+    """
+    base_lat, base_lng = STATE_COORDS.get(state, (39.8, -98.6))  # fallback: geographic center of US
+    if location_type == 'store':
+        lat = base_lat + random.uniform(-0.35, 0.35)
+        lng = base_lng + random.uniform(-0.35, 0.35)
+    else:
+        # warehouse/DC: closer to centroid, small jitter
+        lat = base_lat + random.uniform(-0.05, 0.05)
+        lng = base_lng + random.uniform(-0.05, 0.05)
+    return (round(lat, 6), round(lng, 6))
 
 log = logging.getLogger(__name__)
 fake = Faker('en_US')
@@ -59,6 +84,7 @@ def seed_locations(conn, cfg: Config) -> Dict[str, List[Dict]]:
         for i in range(cfg.locations.store_count):
             state = random.choice(STORE_STATES)
             opened = fake.date_between(start_date=date(2005, 1, 1), end_date=date(2022, 12, 31))
+            lat, lng = _random_lat_long(state, 'store')
             records.append((
                 f"Mega Lo Mart #{i + 1}",
                 fake.street_address(), fake.city(), state,
@@ -66,24 +92,25 @@ def seed_locations(conn, cfg: Config) -> Dict[str, List[Dict]]:
                 opened, 'store',
                 random.randint(25000, 65000),   # store_sqft
                 random.randint(12, 24),          # num_aisles
-                True,
+                True, lat, lng,
             ))
 
         for i in range(cfg.locations.warehouse_count):
             state = random.choice(STORE_STATES)
             opened = fake.date_between(start_date=date(2000, 1, 1), end_date=date(2018, 12, 31))
+            lat, lng = _random_lat_long(state, 'warehouse')
             records.append((
                 f"Mega Lo Mart Distribution Center #{i + 1}",
                 fake.street_address(), fake.city(), state,
                 fake.zipcode_in_state(state), fake.numerify('(###) ###-####'),
                 opened, 'warehouse',
-                None, None, True,
+                None, None, True, lat, lng,
             ))
 
         execute_values(cur, """
             INSERT INTO hr.locations
                 (name, address, city, state, zip, phone, opened_date, location_type,
-                 store_sqft, num_aisles, is_active)
+                 store_sqft, num_aisles, is_active, latitude, longitude)
             VALUES %s
         """, records)
         conn.commit()

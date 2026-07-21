@@ -69,6 +69,11 @@ class CouponConfig:
 
 
 @dataclass
+class TransportConfig:
+    cost_per_mile: float = 1.85   # operational cost per mile (fuel + maintenance)
+
+
+@dataclass
 class ComboDealConfig:
     active_at_any_time: int = 4
     valid_duration_days: int = 7
@@ -103,6 +108,7 @@ class Config:
     inventory: InventoryConfig = field(default_factory=InventoryConfig)
     coupons: CouponConfig = field(default_factory=CouponConfig)
     combo_deals: ComboDealConfig = field(default_factory=ComboDealConfig)
+    transport: TransportConfig = field(default_factory=TransportConfig)
     scenarios: ScenarioConfig = field(default_factory=ScenarioConfig)
 
     # Department/product catalog (populated from YAML)
@@ -216,6 +222,10 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.combo_deals.valid_duration_days = int(cdl['valid_duration_days'])
     if 'combo_use_rate' in cdl:
         cfg.combo_deals.combo_use_rate = float(cdl['combo_use_rate'])
+
+    trp = data.get('transport', {})
+    if 'cost_per_mile' in trp:
+        cfg.transport.cost_per_mile = float(trp['cost_per_mile'])
 
     sc = data.get('scenarios', {})
     rh = sc.get('rush_hour', {})

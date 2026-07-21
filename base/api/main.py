@@ -13,6 +13,7 @@ Route pattern: /{industry}/...
 import json
 import logging
 import os
+import yaml
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Any, Dict
@@ -26,6 +27,17 @@ from pydantic import BaseModel
 
 log = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
+
+# ---------------------------------------------------------------------------
+# Read grocery transport cost_per_mile from config (used in route_cost computation)
+# ---------------------------------------------------------------------------
+_GROCERY_CONFIG_PATH = os.environ.get("GROCERY_CONFIG_PATH", "/config/config.yaml")
+try:
+    with open(_GROCERY_CONFIG_PATH) as _gf:
+        _GROCERY_CFG = yaml.safe_load(_gf) or {}
+    GROCERY_COST_PER_MILE = float(_GROCERY_CFG.get("transport", {}).get("cost_per_mile", 1.85))
+except FileNotFoundError:
+    GROCERY_COST_PER_MILE = 1.85
 
 # ---------------------------------------------------------------------------
 # Industry → DB name mapping
@@ -1060,7 +1072,9 @@ def transport_loads(
                l.status, l.departed_at, l.arrived_at, l.created_at,
                t.license_plate,
                emp.first_name || ' ' || emp.last_name AS driver,
-               wl.name AS from_warehouse, dl.name AS to_store
+               wl.name AS from_warehouse, dl.name AS to_store,
+               l.distance_miles,
+               ROUND(l.distance_miles * {GROCERY_COST_PER_MILE}::NUMERIC, 2) AS route_cost
         FROM transport.loads l
         JOIN transport.trucks t ON t.truck_id = l.truck_id
         LEFT JOIN hr.employees emp ON emp.employee_id = l.driver_id

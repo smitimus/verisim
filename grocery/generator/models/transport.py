@@ -4,11 +4,13 @@ Transport model — seeds trucks and manages load dispatch and delivery.
 Flow:
   1. seed_trucks() — creates a small fleet on startup.
   2. dispatch_loads() — after fulfillment, assigns packed orders to trucks.
+     Computes haversine distance_miles from warehouse/store coordinates.
   3. receive_delivered_loads() — marks in-transit loads as delivered,
      creates inv.receipts + receipt_items, restocks inventory.
 """
 import random
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 from uuid import uuid4
@@ -21,6 +23,19 @@ fake = Faker('en_US')
 
 TRUCK_MAKES = ['Freightliner', 'Peterbilt', 'Kenworth', 'Mack', 'Volvo']
 TRUCK_MODELS = ['Cascadia', '579', 'T680', 'Anthem', 'VNL']
+
+
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in miles between two (lat, lon) points.
+
+    Uses the mean Earth radius of 3,958.8 miles.
+    """
+    R = 3958.8
+    lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def seed_trucks(conn, truck_count: int = 4) -> List[Dict]:
@@ -85,18 +100,38 @@ def dispatch_loads(
     truck_cycle = list(trucks) * (len(by_dest) // max(len(trucks), 1) + 1)
 
     with conn.cursor() as cur:
+        # Fetch coordinates for warehouse and all destination locations so we
+        # can compute haversine distance_miles at dispatch time (verisim#13).
+        all_loc_ids = [str(warehouse_location_id)] + list(by_dest.keys())
+        cur.execute(
+            "SELECT location_id, latitude, longitude FROM hr.locations "
+            "WHERE location_id = ANY(%s::uuid[])",
+            (all_loc_ids,)
+        )
+        loc_coords = {str(r[0]): (float(r[1]), float(r[2])) for r in cur.fetchall() if r[1] is not None}
+
+        wh_coords = loc_coords.get(str(warehouse_location_id))
+
         for i, (dest_loc_id, items) in enumerate(by_dest.items()):
             truck = truck_cycle[i % len(truck_cycle)]
             driver = random.choice(drivers)['employee_id'] if drivers else None
             load_id = str(uuid4())
 
+            # Compute haversine distance (miles); NULL if coords missing.
+            dest_coords = loc_coords.get(dest_loc_id)
+            if wh_coords and dest_coords:
+                dist = round(haversine(wh_coords[0], wh_coords[1],
+                                       dest_coords[0], dest_coords[1]), 2)
+            else:
+                dist = None
+
             cur.execute("""
                 INSERT INTO transport.loads
                     (load_id, truck_id, driver_id, warehouse_location_id,
-                     destination_location_id, departed_at, status)
-                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, 'in_transit')
+                     destination_location_id, departed_at, status, distance_miles)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, 'in_transit', %s)
             """, (load_id, truck['truck_id'], driver,
-                   warehouse_location_id, dest_loc_id, sim_dt))
+                   warehouse_location_id, dest_loc_id, sim_dt, dist))
 
             load_item_records = [(load_id, f_id, o_id) for f_id, o_id in items]
             execute_values(cur, """

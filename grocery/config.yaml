@@ -173,6 +173,9 @@ combo_deals:
   valid_duration_days: 7
   combo_use_rate: 0.15             # probability a transaction triggers a deal
 
+transport:
+  cost_per_mile: 1.85              # operational cost per mile (fuel + maintenance)
+
 scenarios:
   rush_hour:
     volume_multiplier: 2.0
