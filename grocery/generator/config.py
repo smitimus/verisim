@@ -85,10 +85,21 @@ class ScenarioConfig:
     rush_hour_multiplier: float = 2.0
     rush_hour_hours: List[int] = field(default_factory=lambda: [9, 10, 11, 17, 18, 19])
     weekend_multiplier: float = 1.3
+    weekend_labor_multiplier: float = 1.1
     promotion_discount_pct: float = 0.15
     promotion_departments: List[str] = field(default_factory=lambda: ['Produce', 'Dairy & Eggs', 'Snacks & Candy'])
+    promotion_labor_multiplier: float = 1.15
     holiday_week_multiplier: float = 1.6
+    holiday_labor_multiplier: float = 1.2
     double_coupon_multiplier: float = 2.0
+    # New scenario defaults (verisim#12)
+    inflation_price_modifier: float = 1.15
+    inflation_loyalty_modifier: float = 0.85
+    weather_volume_multiplier: float = 0.7
+    weather_attendance_modifier: float = 0.75
+    supply_disruption_shrinkage_modifier: float = 1.3
+    regional_peak_stores: Dict[str, float] = field(default_factory=dict)
+    deep_discount_price_modifier: float = 0.8
 
 
 @dataclass
@@ -233,6 +244,52 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.scenarios.rush_hour_multiplier = float(rh['volume_multiplier'])
     if 'hours' in rh:
         cfg.scenarios.rush_hour_hours = list(rh['hours'])
+
+    # Existing scenarios
+    we = sc.get('weekend', {})
+    if 'volume_multiplier' in we:
+        cfg.scenarios.weekend_multiplier = float(we['volume_multiplier'])
+    if 'labor_multiplier' in we:
+        cfg.scenarios.weekend_labor_multiplier = float(we['labor_multiplier'])
+
+    hw = sc.get('holiday_week', {})
+    if 'volume_multiplier' in hw:
+        cfg.scenarios.holiday_week_multiplier = float(hw['volume_multiplier'])
+    if 'labor_multiplier' in hw:
+        cfg.scenarios.holiday_labor_multiplier = float(hw['labor_multiplier'])
+
+    pro = sc.get('promotion', {})
+    if 'labor_multiplier' in pro:
+        cfg.scenarios.promotion_labor_multiplier = float(pro['labor_multiplier'])
+
+    dc = sc.get('double_coupons', {})
+    if 'coupon_multiplier' in dc:
+        cfg.scenarios.double_coupon_multiplier = float(dc['coupon_multiplier'])
+
+    # New scenarios (verisim#12)
+    inf = sc.get('inflation_pressure', {})
+    if 'price_modifier' in inf:
+        cfg.scenarios.inflation_price_modifier = float(inf['price_modifier'])
+    if 'loyalty_modifier' in inf:
+        cfg.scenarios.inflation_loyalty_modifier = float(inf['loyalty_modifier'])
+
+    sw = sc.get('severe_weather', {})
+    if 'volume_multiplier' in sw:
+        cfg.scenarios.weather_volume_multiplier = float(sw['volume_multiplier'])
+    if 'attendance_modifier' in sw:
+        cfg.scenarios.weather_attendance_modifier = float(sw['attendance_modifier'])
+
+    sd = sc.get('supplier_disruption', {})
+    if 'shrinkage_modifier' in sd:
+        cfg.scenarios.supply_disruption_shrinkage_modifier = float(sd['shrinkage_modifier'])
+
+    rp = sc.get('regional_peak', {})
+    if 'stores' in rp:
+        cfg.scenarios.regional_peak_stores = {str(k): float(v) for k, v in rp['stores'].items()}
+
+    dd = sc.get('deep_discount', {})
+    if 'price_modifier' in dd:
+        cfg.scenarios.deep_discount_price_modifier = float(dd['price_modifier'])
 
     prods = data.get('products', {})
     if 'initial_count' in prods:

@@ -352,7 +352,7 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     tc_count = timeclock.generate_events(conn, sim_dt, employees, locations)
 
     # Probabilistic events
-    pos.maybe_update_product_prices(conn, cfg, products)
+    pos.maybe_update_product_prices(conn, cfg, products, scenario)
     hr.maybe_hire_employee(conn, cfg, locations)
     hr.maybe_terminate_employee(conn)
 
@@ -364,28 +364,28 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         managers = [e for e in employees if e['department'] == 'management']
 
         order_ids = ordering.check_and_create_orders(
-            conn, locations['stores'], locations['warehouses'], managers, sim_dt)
+            conn, locations['stores'], locations['warehouses'], managers, sim_dt, scenario)
         orders_count = len(order_ids)
 
         fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees, sim_dt)
 
         if fulfilled and locations['warehouses'] and trucks:
             wh_loc_id = locations['warehouses'][0]['location_id']
-            transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id, sim_dt)
+            transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id, sim_dt, scenario)
 
-        transport.receive_delivered_loads(conn, sim_dt)
+        transport.receive_delivered_loads(conn, sim_dt, scenario)
 
         # Phase 2: perishable expiry dates + shrinkage
         shrinkage.set_expiry_dates(conn, sim_dt)
-        shrinkage.generate_shrinkage_events(conn, sim_dt, locations['stores'])
+        shrinkage.generate_shrinkage_events(conn, sim_dt, locations['stores'], scenario)
 
         # Phase 3: weekly ad lifecycle
         promotions.expire_old_ads(conn, sim_dt.date())
         promotions.ensure_current_ad(conn, sim_dt.date(), products)
 
         # Phase 4: labor scheduling (generate next week) + resolve yesterday's actuals
-        scheduling.resolve_schedule_actuals(conn, sim_dt.date())
-        scheduling.generate_weekly_schedule(conn, sim_dt.date(), locations, employees)
+        scheduling.resolve_schedule_actuals(conn, sim_dt.date(), scenario)
+        scheduling.generate_weekly_schedule(conn, sim_dt.date(), locations, employees, scenario)
 
     elapsed_ms = round((time.monotonic() - tick_start) * 1000)
     record_stats(conn, pos_count, tc_count, orders_count,
@@ -501,27 +501,40 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # Full day: run all end-of-day events in one pass.
             timeclock.generate_day_events(conn, cur_date, employees)
 
+            # Compute scenario context for end-of-day models using a
+            # representative time (11pm of the current backfill day).
+            eod_dt = datetime(cur_date.year, cur_date.month, cur_date.day, 23, 0)
+            eod_scenario_names = get_active_scenario_names(conn, eod_dt)
+            eod_scenario = get_scenario_context(
+                eod_scenario_names,
+                1.0,
+                eod_dt, cfg,
+            )
+
             order_ids = ordering.check_and_create_orders(
                 conn, locations['stores'], locations['warehouses'], managers,
-                datetime(cur_date.year, cur_date.month, cur_date.day, 22, 0))
+                datetime(cur_date.year, cur_date.month, cur_date.day, 22, 0),
+                eod_scenario)
             fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 23, 0))
             if fulfilled and locations['warehouses'] and trucks:
                 wh_loc_id = locations['warehouses'][0]['location_id']
                 transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id,
-                    datetime(cur_date.year, cur_date.month, cur_date.day, 23, 30))
+                    datetime(cur_date.year, cur_date.month, cur_date.day, 23, 30),
+                    eod_scenario)
             transport.receive_delivered_loads(conn,
-                datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59))
+                datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59),
+                eod_scenario)
 
-            pos.maybe_update_product_prices(conn, cfg, products)
+            pos.maybe_update_product_prices(conn, cfg, products, eod_scenario)
 
             sim_day_end = datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59)
             shrinkage.set_expiry_dates(conn, sim_day_end)
-            shrinkage.generate_shrinkage_events(conn, sim_day_end, locations['stores'])
+            shrinkage.generate_shrinkage_events(conn, sim_day_end, locations['stores'], eod_scenario)
             promotions.expire_old_ads(conn, cur_date)
             promotions.ensure_current_ad(conn, cur_date, products)
-            scheduling.resolve_schedule_actuals(conn, cur_date)
-            scheduling.generate_weekly_schedule(conn, cur_date, locations, employees)
+            scheduling.resolve_schedule_actuals(conn, cur_date, eod_scenario)
+            scheduling.generate_weekly_schedule(conn, cur_date, locations, employees, eod_scenario)
 
         with conn.cursor() as cur:
             cur.execute("""

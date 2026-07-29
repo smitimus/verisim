@@ -50,11 +50,15 @@ def _week_start(d: date) -> date:
 
 def generate_weekly_schedule(conn, sim_date: date,
                               locations: List[Dict],
-                              employees: List[Dict]) -> int:
+                              employees: List[Dict],
+                              scenario=None) -> int:
     """
     Creates hr.schedules for the week starting on the Monday on or after sim_date.
     Idempotent: skips if that week already has > 50 scheduled rows.
     Returns number of shifts created.
+
+    When scenario.labor_multiplier > 1.0, more shifts are created per employee
+    (e.g. holiday demand requires extra coverage).
     """
     target_week = _week_start(sim_date + timedelta(days=7))  # next week's Monday
     week_end    = target_week + timedelta(days=6)
@@ -76,7 +80,11 @@ def generate_weekly_schedule(conn, sim_date: date,
 
     for emp in store_employees:
         is_fulltime = random.random() < FULLTIME_PROB
-        days_count  = 5 if is_fulltime else random.randint(2, 4)
+        labor_mult = 1.0
+        if scenario is not None:
+            labor_mult = getattr(scenario, 'labor_multiplier', 1.0)
+        days_count  = max(1, round((5 if is_fulltime else random.randint(2, 4)) * labor_mult))
+        days_count = min(days_count, 7)
         work_days   = random.sample(days_in_week, min(days_count, len(days_in_week)))
 
         for work_date in work_days:
@@ -106,11 +114,14 @@ def generate_weekly_schedule(conn, sim_date: date,
     return len(records)
 
 
-def resolve_schedule_actuals(conn, sim_date: date) -> None:
+def resolve_schedule_actuals(conn, sim_date: date, scenario=None) -> None:
     """
     Resolves all 'scheduled' shifts for sim_date (yesterday's shifts):
       91% → completed, 5% → called_out, 4% → no_show
     Call this at the start of each simulated day for the previous day.
+
+    When scenario.attendance_modifier < 1.0, completion rate drops
+    (e.g. severe weather → more call-outs and no-shows).
     """
     yesterday = sim_date - timedelta(days=1)
     with conn.cursor() as cur:
@@ -126,9 +137,19 @@ def resolve_schedule_actuals(conn, sim_date: date) -> None:
     with conn.cursor() as cur:
         for sched_id in ids:
             roll = random.random()
-            if roll < P_COMPLETED:
+            # Adjust completion probability by attendance_modifier
+            p_completed = P_COMPLETED
+            p_called_out = P_CALLED_OUT
+            if scenario is not None:
+                att_mod = getattr(scenario, 'attendance_modifier', 1.0)
+                p_completed = min(0.95, max(0.5, P_COMPLETED * att_mod))
+                # redistribute remaining probability to called_out + no_show
+                slack = 1.0 - p_completed
+                p_called_out = slack * 0.55
+                # remainder → no_show
+            if roll < p_completed:
                 status = 'completed'
-            elif roll < P_COMPLETED + P_CALLED_OUT:
+            elif roll < p_completed + p_called_out:
                 status = 'called_out'
             else:
                 status = 'no_show'

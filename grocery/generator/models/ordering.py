@@ -29,10 +29,14 @@ def check_and_create_orders(
     warehouse_locations: List[Dict],
     managers: List[Dict],
     sim_dt: datetime,
+    scenario=None,
 ) -> List[str]:
     """
     Find low-stock items at each store and create store orders.
     Returns list of new order_ids.
+
+    When scenario.supply_disruption is True, ~40% of low-stock items
+    are randomly skipped (supplier can't fulfill).
     """
     if not warehouse_locations:
         return []
@@ -48,6 +52,13 @@ def check_and_create_orders(
               AND sl.quantity_on_hand < ip.reorder_point
         """)
         low_stock = cur.fetchall()
+
+    if not low_stock:
+        return []
+
+    # Supplier disruption: randomly skip ~40% of low-stock items
+    if scenario is not None and getattr(scenario, 'supply_disruption', False):
+        low_stock = [r for r in low_stock if random.random() > 0.4]
 
     if not low_stock:
         return []

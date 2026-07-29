@@ -82,12 +82,15 @@ def set_expiry_dates(conn, sim_dt: datetime) -> None:
 
 
 def generate_shrinkage_events(conn, sim_dt: datetime,
-                               locations: List[Dict]) -> int:
+                               locations: List[Dict], scenario=None) -> int:
     """
     Generates shrinkage events for perishable products at store locations.
       - Expired stock: all remaining quantity is written off as 'expired'
       - Random daily shrink: spoilage / damaged / theft at configured rates
     Returns the number of shrinkage events recorded.
+
+    When scenario.shrinkage_modifier > 1.0, random shrink probabilities are
+    multiplied (e.g. supplier_disruption → more spoilage/damage).
     """
     store_ids = [loc['location_id'] for loc in locations]
     today = sim_dt.date()
@@ -126,8 +129,12 @@ def generate_shrinkage_events(conn, sim_dt: datetime,
             continue  # no further shrink on already-expired stock
 
         # --- Random daily shrink for perishables ---
+        shrink_mult = 1.0
+        if scenario is not None:
+            shrink_mult = getattr(scenario, 'shrinkage_modifier', 1.0)
         for reason, (daily_prob, rate) in DAILY_SHRINK.items():
-            if random.random() < daily_prob and remaining > 0:
+            adj_prob = min(1.0, daily_prob * shrink_mult)
+            if random.random() < adj_prob and remaining > 0:
                 shrink_qty = max(1, round(remaining * rate * random.uniform(0.5, 2.0)))
                 shrink_qty = min(shrink_qty, remaining)
                 shrinkage_records.append((

@@ -532,7 +532,8 @@ def generate_pos_transactions(
         # Apply a coupon to the whole transaction (loyalty members only)
         coupon_savings = 0.0
         coupon = None
-        if member_id and coupons and random.random() < cfg.coupons.coupon_use_rate * scenario.coupon_multiplier:
+        loyalty_eng = getattr(scenario, 'loyalty_engagement_modifier', 1.0)
+        if member_id and coupons and random.random() < cfg.coupons.coupon_use_rate * scenario.coupon_multiplier * loyalty_eng:
             coupon = random.choice(coupons)
             if coupon['coupon_type'] == 'percent_off':
                 coupon_savings = round(subtotal * coupon['discount_value'] * scenario.coupon_multiplier, 2)
@@ -747,17 +748,25 @@ def _dept_id_for_product(product: Dict) -> Optional[str]:
 # Price changes
 # ---------------------------------------------------------------------------
 
-def maybe_update_product_prices(conn, cfg: Config, products: List[Dict]) -> None:
-    """Randomly change a small number of product prices."""
+def maybe_update_product_prices(conn, cfg: Config, products: List[Dict], scenario=None) -> None:
+    """Randomly change a small number of product prices.
+
+    When scenario.price_modifier != 1.0, price change magnitudes are scaled
+    (e.g. inflation_pressure=1.15 → 15% larger price swings upward).
+    """
     ticks_per_day = (24 * 60) / 15
     prob = 1.0 / (cfg.pricing.product_price_change_frequency_days * ticks_per_day)
     if random.random() > prob * len(products):
         return
 
+    price_mod = 1.0
+    if scenario is not None:
+        price_mod = getattr(scenario, 'price_modifier', 1.0)
+
     to_change = random.sample(products, min(5, len(products)))
     with conn.cursor() as cur:
         for p in to_change:
-            change_pct = random.uniform(-0.06, 0.08)
+            change_pct = random.uniform(-0.06, 0.08) * price_mod
             new_price = round(p['price'] * (1 + change_pct), 2)
             new_price = max(0.10, new_price)
             cur.execute("""

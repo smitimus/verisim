@@ -14,7 +14,7 @@ Multiple scenarios can be active simultaneously. Their effects are merged:
   - scenario_tag      : joined with '+' (e.g. 'promotion+holiday_week')
 """
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 from datetime import datetime, date
 
 import psycopg2.extras
@@ -164,6 +164,15 @@ class ScenarioContext:
     coupon_multiplier: float = 1.0
     scenario_tag: str = 'normal'
 
+    # Cross-domain effect modifiers (verisim#12)
+    price_modifier: float = 1.0              # scale price change magnitude (inflation=1.15)
+    attendance_modifier: float = 1.0          # scale timeclock attendance rate (weather=0.75)
+    supply_disruption: bool = False           # trigger ordering shortfalls + transport delays
+    labor_multiplier: float = 1.0             # scale scheduled headcount (holiday=1.2)
+    shrinkage_modifier: float = 1.0           # scale shrinkage event rate (supplier_disruption=1.3)
+    loyalty_engagement_modifier: float = 1.0  # scale coupon/deal usage probability
+    per_store_multipliers: Dict[str, float] = field(default_factory=dict)  # per-store volume overrides
+
 
 def _apply_single_scenario(
     scenario_name: str,
@@ -174,19 +183,44 @@ def _apply_single_scenario(
     """Merge a single scenario's effects into ctx in-place."""
     if scenario_name == 'promotion':
         ctx.volume_multiplier *= volume_multiplier_override
+        ctx.labor_multiplier = max(ctx.labor_multiplier, cfg.scenarios.promotion_labor_multiplier)
         for dept in cfg.scenarios.promotion_departments:
             if not any(p[0] == dept for p in ctx.active_promotions):
                 ctx.active_promotions.append((dept, cfg.scenarios.promotion_discount_pct))
 
     elif scenario_name == 'holiday_week':
         ctx.volume_multiplier *= volume_multiplier_override * cfg.scenarios.holiday_week_multiplier
+        ctx.labor_multiplier = max(ctx.labor_multiplier, cfg.scenarios.holiday_labor_multiplier)
+        ctx.coupon_multiplier = max(ctx.coupon_multiplier, 1.5)
 
     elif scenario_name == 'double_coupons':
         ctx.volume_multiplier *= volume_multiplier_override
         ctx.coupon_multiplier = max(ctx.coupon_multiplier, cfg.scenarios.double_coupon_multiplier)
+        ctx.loyalty_engagement_modifier = max(ctx.loyalty_engagement_modifier, 1.5)
 
     elif scenario_name == 'weekend':
         ctx.volume_multiplier *= volume_multiplier_override * cfg.scenarios.weekend_multiplier
+        ctx.labor_multiplier = max(ctx.labor_multiplier, cfg.scenarios.weekend_labor_multiplier)
+
+    elif scenario_name == 'inflation_pressure':
+        ctx.price_modifier = max(ctx.price_modifier, cfg.scenarios.inflation_price_modifier)
+        ctx.loyalty_engagement_modifier = min(ctx.loyalty_engagement_modifier, cfg.scenarios.inflation_loyalty_modifier)
+
+    elif scenario_name == 'severe_weather':
+        ctx.volume_multiplier *= cfg.scenarios.weather_volume_multiplier
+        ctx.attendance_modifier = min(ctx.attendance_modifier, cfg.scenarios.weather_attendance_modifier)
+        ctx.supply_disruption = True
+
+    elif scenario_name == 'supplier_disruption':
+        ctx.supply_disruption = True
+        ctx.shrinkage_modifier = max(ctx.shrinkage_modifier, cfg.scenarios.supply_disruption_shrinkage_modifier)
+
+    elif scenario_name == 'regional_peak':
+        ctx.per_store_multipliers = {**ctx.per_store_multipliers, **cfg.scenarios.regional_peak_stores}
+
+    elif scenario_name == 'deep_discount':
+        ctx.price_modifier = min(ctx.price_modifier, cfg.scenarios.deep_discount_price_modifier)
+        ctx.loyalty_engagement_modifier = max(ctx.loyalty_engagement_modifier, 1.3)
 
     else:
         # 'normal', 'rush_hour', or unknown — apply override only

@@ -82,6 +82,7 @@ def dispatch_loads(
     drivers: List[Dict],
     warehouse_location_id: str,
     sim_dt: datetime,
+    scenario=None,
 ) -> List[str]:
     """
     Create transport loads for fulfilled orders.
@@ -146,14 +147,18 @@ def dispatch_loads(
     return load_ids
 
 
-def receive_delivered_loads(conn, sim_dt: datetime) -> int:
+def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
     """
     Mark in-transit loads as delivered (simulated arrival = dispatch + 1 day).
     For each delivered load, create inv.receipts + receipt_items and restock.
     Returns number of loads received.
+
+    When scenario.supply_disruption is True, delivery cutoff is extended
+    from 18h to 36h (deliveries take longer to arrive).
     """
-    # Loads dispatched more than 18 simulated hours ago are considered delivered
-    cutoff = sim_dt - timedelta(hours=18)
+    # Loads dispatched more than N simulated hours ago are considered delivered
+    delay_hours = 36 if (scenario is not None and getattr(scenario, 'supply_disruption', False)) else 18
+    cutoff = sim_dt - timedelta(hours=delay_hours)
 
     with conn.cursor() as cur:
         cur.execute("""
