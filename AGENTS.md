@@ -167,7 +167,7 @@ Credentials: `verisim` / `verisim` / db: `grocery` / port: `5499`
 
 ## Source Tables Consumed by dbt
 
-The data-lab dbt project expects these 27 source tables. If you add/rename a table here, update the matching staging model in `/opt/data-lab/airflow/dbt/grocery/models/staging/`.
+The data-lab dbt project expects these 27 source tables from the generator. If you add/rename a table here, update the matching staging model in the data-lab repo's `airflow/dbt/grocery/models/staging/` and `sources.yml`.
 
 | Generator Schema | Tables | dbt Staging Model Prefix |
 |-----------------|--------|--------------------------|
@@ -179,6 +179,17 @@ The data-lab dbt project expects these 27 source tables. If you add/rename a tab
 | transport | trucks, loads, load_items | stg_transport_* |
 | inv | stock_levels, shrinkage_events, receipts, receipt_items, products | stg_inv_* |
 | pricing | weekly_ads, ad_items | stg_pricing_* |
+
+## Architecture Decisions (ADRs)
+
+| Decision | Rationale | Date |
+|----------|-----------|------|
+| Raw psycopg2 over SQLAlchemy in generator | Generator is write-heavy with bulk inserts; raw SQL + execute_values is 5-10x faster than ORM for batch operations. No ORM overhead, no session management. | v1.0 |
+| Streamlit over React for UI | Single-developer project; Streamlit's Python-native widget model eliminates frontend build pipeline, allows tight coupling to generator state. Trade-off: no component reuse, tab-reset bugs. | v1.0 |
+| Airflow over Dagster/Prefect | Community maturity, widest dbt integration support. Trade-off: DAG-as-code boilerplate, paused-by-default DAGs. | v1.0 |
+| Multi-industry via route stripping | Base API contains all routes; build-time stripping avoids runtime config branches. Trade-off: build-time coupling, can't switch industry without rebuild. | v1.0 |
+| compose.test.yaml over pytest | End-to-end image-level validation catches containerization issues pytest would miss. Trade-off: no unit-level testing; slow feedback loop. | v1.0 |
+| Supervisord standalone vs multi-container | Single-image deploy simplifies orchestration at the cost of process isolation. Trade-off: harder to debug individual process failures. | v1.0 |
 
 ## Code Quality Notes
 
