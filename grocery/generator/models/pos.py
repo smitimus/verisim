@@ -181,19 +181,33 @@ def seed_named_coupons(conn, departments: List[Dict]) -> None:
 
 
 def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict]) -> List[Dict]:
-    """Seed initial batch of active coupons. Idempotent."""
+    """Seed active coupons. Idempotent; deactivates expired coupons and tops
+    the active set back up to `active_at_any_time`."""
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM pos.coupons WHERE is_active = TRUE")
-        if cur.fetchone()[0] >= cfg.coupons.active_at_any_time:
+        # Deactivate coupons whose validity window has passed so the guard
+        # below counts only currently-valid coupons (expired-but-active rows
+        # used to block re-seeding forever — see combo_deals incident 2026-08).
+        cur.execute(
+            "UPDATE pos.coupons SET is_active = FALSE "
+            "WHERE is_active = TRUE AND valid_until < CURRENT_DATE"
+        )
+        conn.commit()
+        cur.execute(
+            "SELECT COUNT(*) FROM pos.coupons "
+            "WHERE is_active = TRUE AND valid_until >= CURRENT_DATE"
+        )
+        active = cur.fetchone()[0]
+        if active >= cfg.coupons.active_at_any_time:
             return _fetch_active_coupons(cur)
 
-    log.info("Seeding coupons...")
+    log.info("Seeding coupons (%d short of %d)...",
+             cfg.coupons.active_at_any_time - active, cfg.coupons.active_at_any_time)
     dept_ids = [d['department_id'] for d in departments]
     prod_ids = [p['product_id'] for p in products]
     today = date.today()
     records = []
 
-    for i in range(cfg.coupons.active_at_any_time):
+    for i in range(cfg.coupons.active_at_any_time - active):
         coupon_type = random.choice(['percent_off', 'percent_off', 'dollar_off', 'bogo'])
         discount = round(random.uniform(0.10, 0.30), 2) if coupon_type == 'percent_off' \
             else round(random.uniform(0.50, 2.00), 2)
@@ -240,13 +254,27 @@ def fetch_active_coupons(conn) -> List[Dict]:
 
 
 def seed_combo_deals(conn, cfg: Config, departments: List[Dict], products: List[Dict]) -> List[Dict]:
-    """Seed initial combo deals. Idempotent."""
+    """Seed combo deals. Idempotent; deactivates expired deals and tops the
+    active set back up to `active_at_any_time`."""
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM pos.combo_deals WHERE is_active = TRUE")
-        if cur.fetchone()[0] >= cfg.combo_deals.active_at_any_time:
+        # Deactivate expired deals (keeps the API + seed guard aligned with
+        # CURRENT_DATE — previously expired-but-active rows stayed is_active
+        # forever and blocked re-seeding: freshness STALE on combo_deals).
+        cur.execute(
+            "UPDATE pos.combo_deals SET is_active = FALSE "
+            "WHERE is_active = TRUE AND valid_until < CURRENT_DATE"
+        )
+        conn.commit()
+        cur.execute(
+            "SELECT COUNT(*) FROM pos.combo_deals "
+            "WHERE is_active = TRUE AND valid_until >= CURRENT_DATE"
+        )
+        active = cur.fetchone()[0]
+        if active >= cfg.combo_deals.active_at_any_time:
             return _fetch_active_deals(cur)
 
-    log.info("Seeding combo deals...")
+    log.info("Seeding combo deals (%d short of %d)...",
+             cfg.combo_deals.active_at_any_time - active, cfg.combo_deals.active_at_any_time)
     dept_ids = [d['department_id'] for d in departments]
     today = date.today()
     records = []
@@ -258,7 +286,7 @@ def seed_combo_deals(conn, cfg: Config, departments: List[Dict], products: List[
         ('2 for $3', 'x_for_price', 2, 3.00),
     ]
 
-    for i in range(cfg.combo_deals.active_at_any_time):
+    for i in range(cfg.combo_deals.active_at_any_time - active):
         template = DEAL_TEMPLATES[i % len(DEAL_TEMPLATES)]
         name, deal_type, trigger_qty, deal_price = template
         dept_id = random.choice(dept_ids)

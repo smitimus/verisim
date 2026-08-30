@@ -50,6 +50,25 @@ bash build-and-push.sh gas-station        # builds smiti/verisim-gas-station:lat
 | `docker compose` pulls old image instead of local | `switch.sh release` mode active | Run `switch.sh dev` or `switch.sh test` |
 | Standalone image ~2GB | Multi-stage build not using slim base | Check Dockerfile for unnecessary deps in final stage |
 | Generator won't connect to postgres | DB not ready yet | Container waits up to 30 retries (5s apart) — check logs |
+| Container crash-loops after image upgrade (`postgres exited 1`, `api exited 3`) | Postgres data dir is an older major version than the new image | The standalone image is now **PostgreSQL 18**; a PG16-era data dir will not start. See "Postgres data dir upgrades" below. |
+
+## Postgres data dir upgrades (PG16 → PG18)
+
+The standalone image was rebuilt on **PostgreSQL 18** (2026-08). A data dir created by an older image (`PG_VERSION` = 16) **cannot** be reused — postgres exits 1 and the container crash-loops. The data dir is 100% generator-produced mock data, so the supported path is:
+
+```bash
+# 1. Back up the old data dir (reversible)
+mv /opt/data-lab/_conf/verisim-grocery /opt/data-lab/_conf/verisim-grocery.pg16.bak
+
+# 2. Start fresh — entrypoint initdb's PG18, applies schema.sql, generator
+#    seeds + auto-backfills the last 30 days, then switches to realtime.
+cd /opt/data-lab && CONF=$PWD/_conf TZ=America/New_York IP=192.168.1.7 \
+  docker compose -f verisim-grocery/compose.yaml up -d
+```
+
+After this, ALWAYS re-run the data-lab ingest + dbt (they hold the old raw copy): trigger `grocery_ingest_api` via the Airflow API, then `grocery_dbt` — or just let the scheduled `grocery_complete_pipeline` run.
+
+If the old data must be preserved (it's mock data — usually not), pull a PG16-era image tag (`smiti/verisim-grocery:1.2.2`, 2026-07-03) and dump/restore — pg_upgrade is not set up for the standalone layout.
 
 ## Route Stripping at Build Time
 

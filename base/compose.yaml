@@ -10,14 +10,14 @@ services:
 
   verisim-base-postgres:
     container_name: verisim-base-postgres
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_USER: ${VERISIM_POSTGRES_USER}
       POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
       POSTGRES_DB: ${VERISIM_POSTGRES_DB}
       TZ: ${TZ}
     volumes:
-      - ${CONF}/verisim-base/postgres/data:/var/lib/postgresql/data
+      - ${CONF}/verisim-base/postgres/data:/var/lib/postgresql
       - ./db:/docker-entrypoint-initdb.d:ro
     ports:
       - "${VERISIM_POSTGRES_PORT:-5499}:5432"

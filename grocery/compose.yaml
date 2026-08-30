@@ -7,7 +7,7 @@ services:
 
   verisim-grocery-dev-postgres:
     container_name: verisim-grocery-dev-postgres
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_USER: ${VERISIM_POSTGRES_USER}
       POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD}
@@ -16,7 +16,7 @@ services:
     volumes:
       # Bind mount (not named volume) — Chris's requirement so data survives
       # container lifecycle changes and is directly accessible on the host.
-      - ${CONF}/verisim-grocery-dev:/var/lib/postgresql/data
+      - ${CONF}/verisim-grocery-dev:/var/lib/postgresql
     ports:
       # Dev port mapping uses VERISIM_POSTGRES_PORT (default 5499)
       - "${VERISIM_POSTGRES_PORT:-5499}:5432"

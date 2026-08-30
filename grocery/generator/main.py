@@ -387,6 +387,13 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         scheduling.resolve_schedule_actuals(conn, sim_dt.date(), scenario)
         scheduling.generate_weekly_schedule(conn, sim_dt.date(), locations, employees, scenario)
 
+        # Phase 5: coupon + combo deal lifecycle — deactivate expired, top up
+        # active set so the API always serves a current batch (freshness
+        # contract with data-lab: raw_pos.combo_deals went STALE when deals
+        # expired 2026-08-09 and nothing re-seeded them).
+        pos.seed_coupons(conn, cfg, departments, products)
+        pos.seed_combo_deals(conn, cfg, departments, products)
+
     elapsed_ms = round((time.monotonic() - tick_start) * 1000)
     record_stats(conn, pos_count, tc_count, orders_count,
                  scenario.scenario_tag, sim_dt, elapsed_ms)
@@ -535,6 +542,11 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             promotions.ensure_current_ad(conn, cur_date, products)
             scheduling.resolve_schedule_actuals(conn, cur_date, eod_scenario)
             scheduling.generate_weekly_schedule(conn, cur_date, locations, employees, eod_scenario)
+
+            # Coupon + combo deal lifecycle (same as realtime Phase 5) —
+            # a 30-day backfill must not leave deals expired at the end.
+            pos.seed_coupons(conn, cfg, departments, products)
+            pos.seed_combo_deals(conn, cfg, departments, products)
 
         with conn.cursor() as cur:
             cur.execute("""

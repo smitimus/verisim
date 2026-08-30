@@ -1,7 +1,7 @@
 # =============================================================================
 # Verisim Grocery — Standalone Image
 # =============================================================================
-# All-in-one container: PostgreSQL 16 + FastAPI + Streamlit + Generator.
+# All-in-one container: PostgreSQL 18 + FastAPI + Streamlit + Generator.
 # Managed by supervisord. Build context: /opt/verisim/
 #
 # Build (from /opt/verisim/):
@@ -40,7 +40,7 @@ LABEL org.opencontainers.image.title="Verisim Grocery" \
       org.opencontainers.image.description="Grocery retail mock data generator — PostgreSQL + API + UI + Generator" \
       org.opencontainers.image.source="https://github.com/smiti/verisim-grocery"
 
-# Install PostgreSQL 16 from the official PGDG apt repository + supervisor
+# Install PostgreSQL 18 from the official PGDG apt repository + supervisor
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     gnupg curl ca-certificates lsb-release supervisor locales \
@@ -52,7 +52,7 @@ RUN apt-get update \
     https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
     > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends postgresql-16 \
+ && apt-get install -y --no-install-recommends postgresql-18 \
  && rm -rf /var/lib/apt/lists/*
 
 # Python venv from stage 1

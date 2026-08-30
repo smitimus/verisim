@@ -2,7 +2,7 @@
 set -e
 
 PG_DATA=/var/lib/postgresql/data
-PG_BIN=/usr/lib/postgresql/16/bin
+PG_BIN=/usr/lib/postgresql/18/bin
 PG_CTL="$PG_BIN/pg_ctl"
 PSQL="$PG_BIN/psql"
 INITDB="$PG_BIN/initdb"
