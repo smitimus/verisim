@@ -582,6 +582,22 @@ def generate_pos_transactions(
                 original = sum(p['price'] for p in trigger_items)
                 deal_savings = max(0.0, round(original - deal['deal_price'], 2))
 
+        subtotal = round(subtotal, 2)
+        # Coupons and combo deals are computed independently and can STACK
+        # past the subtotal (seen 2026-08-24/25 in prod: 2 rush_hour txns with
+        # coupon+deal > subtotal). Floor the combined discounts so the pre-tax
+        # total is never negative: coupons take precedence, deal savings are
+        # reduced to whatever room remains. Previously the max(0.01, ...)
+        # clamp below silently absorbed this, which broke dbt's
+        # assert_e2e_revenue_consistency formula check.
+        if coupon_savings > subtotal - 0.01:
+            coupon_savings = max(0.0, round(subtotal - 0.01, 2))
+        max_deal_savings = round(subtotal - coupon_savings - 0.01, 2)
+        if deal_savings > max_deal_savings:
+            deal_savings = max(0.0, max_deal_savings)
+            if deal_savings == 0.0:
+                deal = None  # deal fully crowded out; don't tag line items
+
         # Tag the applicable line items with the applied coupon/deal IDs so
         # data-lab can attribute redemptions per promotion. transaction_items
         # already has coupon_id/deal_id columns (no schema change); we just
@@ -601,7 +617,6 @@ def generate_pos_transactions(
                     rec[6] = deal['deal_id']
                     item_recs[i] = tuple(rec)
 
-        subtotal = round(subtotal, 2)
         total_before_tax = max(0.01, round(subtotal - coupon_savings - deal_savings, 2))
         tax = round(total_before_tax * cfg.pricing.tax_rate, 2)
         total = round(total_before_tax + tax, 2)
