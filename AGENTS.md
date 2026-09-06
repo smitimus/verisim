@@ -109,10 +109,19 @@ docker stop verisim-grocery-test && sleep 120 && docker start verisim-grocery-te
 - VM ID 106 at testvm (192.168.1.6)
 - Used to validate `install.sh` from a clean Debian
 
-### Test Coverage Gaps
-- **No unit tests** — generator code has no pytest setup
-- **No API integration tests** — FastAPI endpoints untested
-- **No CI/CD pipeline** — no automated test runs
+### Test Coverage (CI gating)
+
+`.github/workflows/verisim-grocery.yml` has two blocking jobs before `publish`:
+- `test`: generator pytest (`grocery/generator/tests/`) with `--cov` and a
+  coverage floor (`fail_under` in `pyproject.toml`). Any failure blocks the build.
+- `integration`: builds the standalone image, runs the smoke test, then runs the
+  API contract tests (`grocery/api/tests/`) against the live container. API
+  regressions block. `publish` runs `needs: [test, integration]`.
+
+The API suite's `ensure_api_reachable` fixture auto-skips when no API is up
+(useful locally); in CI the container is already verified reachable, so a
+network failure there is a real error. Docker Hub push requires
+`DOCKER_USERNAME`/`DOCKER_PASSWORD` repo secrets.
 
 ## Generator Config (`config.yaml`)
 

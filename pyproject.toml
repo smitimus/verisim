@@ -45,5 +45,14 @@ ui = [
 [tool.pytest.ini_options]
 testpaths = ["grocery/generator/tests", "grocery/api/tests"]
 
+[tool.coverage.run]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = false
+# Coverage floor — CI (pytest-cov) fails the build below this. Measured 35%
+# on 2026-09-06; raise as generator tests grow, never lower without a reason.
+fail_under = 30
+
 [tool.ruff]
 line-length = 120
