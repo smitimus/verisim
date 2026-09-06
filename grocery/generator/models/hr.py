@@ -159,8 +159,12 @@ def seed_employees(conn, cfg: Config, locations: Dict[str, List[Dict]]) -> List[
     for loc in locations['warehouses']:
         count = random.randint(cfg.locations.warehouse_employees_per_location_min,
                                cfg.locations.warehouse_employees_per_location_max)
-        for _ in range(count):
-            dept = random.choice(WAREHOUSE_DEPARTMENTS)
+        # Deterministically guarantee at least one transport driver per
+        # warehouse: pure weighted-random drew ZERO 'transport' employees on
+        # the 2026-09-06 fresh reseed -> every transport.loads row got
+        # driver_id NULL -> dbt not_null (error tier) failed the pipeline.
+        for idx in range(count):
+            dept = 'transport' if idx == 0 else random.choice(WAREHOUSE_DEPARTMENTS)
             records.append(_build_employee_record(loc['location_id'], dept, 'warehouse'))
 
     with conn.cursor() as cur:
@@ -234,14 +238,22 @@ def maybe_terminate_employee(conn) -> None:
     if random.random() > 0.0002:
         return
     with conn.cursor() as cur:
+        # Never terminate the last active transport driver at a warehouse —
+        # dispatch_loads inserts driver_id NULL when no transport employees
+        # exist, which fails the dbt not_null gate (2026-09-06 e2e). Fallback
+        # picks any other active employee so the terminate lottery still runs.
         cur.execute("""
             UPDATE hr.employees
             SET status = 'terminated',
                 termination_date = NOW()::date,
                 updated_at = NOW()
             WHERE employee_id = (
-                SELECT employee_id FROM hr.employees
-                WHERE status = 'active'
+                SELECT e.employee_id FROM hr.employees e
+                LEFT JOIN hr.locations l ON l.location_id = e.location_id
+                WHERE e.status = 'active'
+                  -- protect warehouse transport drivers (the dispatch pool)
+                  AND NOT (e.department = 'transport'
+                           AND l.location_type = 'warehouse' AND l.is_active)
                 ORDER BY RANDOM() LIMIT 1
             )
         """)
