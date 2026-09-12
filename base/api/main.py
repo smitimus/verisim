@@ -52,6 +52,8 @@ def _load_industry_dbs() -> Dict[str, str]:
         dbs["gas-station"] = os.environ["GAS_STATION_DB"]
     if os.environ.get("GROCERY_DB"):
         dbs["grocery"] = os.environ["GROCERY_DB"]
+    if os.environ.get("SUPPORT_DB"):
+        dbs["support"] = os.environ["SUPPORT_DB"]
     # Fallback: single-DB legacy mode (POSTGRES_DB)
     if not dbs and os.environ.get("POSTGRES_DB"):
         dbs["gas-station"] = os.environ["POSTGRES_DB"]
@@ -280,6 +282,17 @@ def status(industry: str):
             FROM control.generation_stats
             WHERE recorded_at >= CURRENT_DATE
         """, None, industry)
+    elif industry == "support":
+        today_stats = query("""
+            SELECT
+                COALESCE(SUM(tickets_generated), 0)         AS tickets_today,
+                COALESCE(SUM(calls_generated), 0)           AS calls_today,
+                COALESCE(SUM(chat_sessions_generated), 0)   AS chats_today,
+                COALESCE(SUM(surveys_generated), 0)         AS surveys_today,
+                COUNT(*) AS ticks_today
+            FROM control.generation_stats
+            WHERE recorded_at >= CURRENT_DATE
+        """, None, industry)
     else:
         today_stats = query("""
             SELECT
@@ -300,7 +313,62 @@ def status(industry: str):
 VALID_SCENARIOS = {
     "gas-station": {"normal", "rush_hour", "weekend", "promotion", "fuel_spike"},
     "grocery":     {"normal", "rush_hour", "weekend", "promotion", "holiday_week", "double_coupons"},
+    "support":     {"normal", "rush_hour", "weekend", "service_outage", "weather_outage",
+                    "product_launch", "marketing_blast", "holiday_week"},
 }
+
+
+def _clear_support_range(start_ts, end_ts) -> None:
+    """Force-backfill clear for the support industry (children before parents)."""
+    pool = pool_for("support")
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # Chat messages → sessions
+            cur.execute(
+                "DELETE FROM chat.messages WHERE session_id IN ("
+                "  SELECT session_id FROM chat.sessions"
+                "  WHERE started_dt BETWEEN %s AND %s)", (start_ts, end_ts))
+            cur.execute(
+                "DELETE FROM chat.sessions WHERE started_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+            # Voice calls
+            cur.execute(
+                "DELETE FROM voice.calls WHERE offered_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+            # Surveys attached to cleared interactions (interaction_id has no FK)
+            cur.execute("""
+                DELETE FROM survey.surveys s
+                WHERE s.sent_dt BETWEEN %s - interval '3 days' AND %s + interval '3 days'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM voice.calls v WHERE v.call_id = s.interaction_id)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chat.sessions c WHERE c.session_id = s.interaction_id)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM support.tickets t WHERE t.ticket_id = s.interaction_id)
+            """, (start_ts, end_ts))
+            # Ticket actions + comments → tickets
+            cur.execute(
+                "DELETE FROM support.ticket_actions WHERE ticket_id IN ("
+                "  SELECT ticket_id FROM support.tickets"
+                "  WHERE created_dt BETWEEN %s AND %s)", (start_ts, end_ts))
+            cur.execute(
+                "DELETE FROM support.ticket_comments WHERE ticket_id IN ("
+                "  SELECT ticket_id FROM support.tickets"
+                "  WHERE created_dt BETWEEN %s AND %s)", (start_ts, end_ts))
+            cur.execute(
+                "DELETE FROM support.tickets WHERE created_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+            # Generation stats for the window
+            cur.execute(
+                "DELETE FROM control.generation_stats "
+                "WHERE simulation_dt BETWEEN %s AND %s", (start_ts, end_ts))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
 
 
 def _clear_date_range(industry: str, start: date, end: date) -> None:
@@ -314,6 +382,11 @@ def _clear_date_range(industry: str, start: date, end: date) -> None:
     from datetime import datetime as _dt
     start_ts = _dt(start.year, start.month, start.day, 0, 0, 0)
     end_ts   = _dt(end.year,   end.month,   end.day,   23, 59, 59)
+
+    if industry == "support":
+        _clear_support_range(start_ts, end_ts)
+        log.info("Cleared support data for %s → %s", start, end)
+        return
 
     pool = pool_for(industry)
     conn = pool.getconn()
@@ -495,6 +568,12 @@ def generator_config(industry: str, req: GeneratorConfigPatch):
 @app.get("/{industry}/hr/locations", tags=["HR"])
 def hr_locations(industry: str):
     pool_for(industry)
+    if industry == "support":
+        return query("""
+            SELECT location_id, name, address, city, state, zip, phone,
+                   opened_date, location_type, seat_capacity, timezone, is_active
+            FROM hr.locations ORDER BY location_type, name
+        """, None, industry)
     if industry == "grocery":
         return query("""
             SELECT location_id, name, address, city, state, zip, phone,
@@ -1221,6 +1300,14 @@ def inventory_receipt_items(
 @app.get("/{industry}/stats/generation", tags=["Stats"])
 def stats_generation(industry: str, last_n_ticks: int = Query(100, le=1000)):
     pool_for(industry)
+    if industry == "support":
+        return query("""
+            SELECT stat_id, recorded_at, tickets_generated,
+                   calls_generated, chat_sessions_generated, surveys_generated,
+                   scenario_tag, simulation_dt, wall_clock_ms
+            FROM control.generation_stats
+            ORDER BY recorded_at DESC LIMIT %s
+        """, [last_n_ticks], industry)
     if industry == "grocery":
         return query("""
             SELECT stat_id, recorded_at, pos_transactions_generated,
@@ -1241,6 +1328,19 @@ def stats_generation(industry: str, last_n_ticks: int = Query(100, le=1000)):
 @app.get("/{industry}/stats/today", tags=["Stats"])
 def stats_today(industry: str):
     pool_for(industry)
+    if industry == "support":
+        return query("""
+            SELECT
+                COALESCE(SUM(tickets_generated), 0)         AS tickets,
+                COALESCE(SUM(calls_generated), 0)           AS calls,
+                COALESCE(SUM(chat_sessions_generated), 0)   AS chats,
+                COALESCE(SUM(surveys_generated), 0)         AS surveys,
+                COUNT(*) AS ticks,
+                MIN(recorded_at) AS first_tick,
+                MAX(recorded_at) AS last_tick
+            FROM control.generation_stats
+            WHERE recorded_at >= CURRENT_DATE
+        """, None, industry)[0]
     if industry == "grocery":
         return query("""
             SELECT
@@ -1517,6 +1617,31 @@ def stats_backfill_progress(industry: str):
 @app.get("/{industry}/stats/recent", tags=["Stats"])
 def stats_recent(industry: str, minutes: int = Query(60, ge=1, le=1440)):
     pool_for(industry)
+    if industry == "support":
+        rows = query("""
+            SELECT
+                COALESCE(SUM(tickets_generated), 0)         AS tickets,
+                COALESCE(SUM(calls_generated), 0)           AS calls,
+                COALESCE(SUM(chat_sessions_generated), 0)   AS chats,
+                COALESCE(SUM(surveys_generated), 0)         AS surveys,
+                COUNT(*)                                    AS ticks,
+                MIN(recorded_at)                            AS first_tick_at,
+                MAX(recorded_at)                            AS last_tick_at,
+                ARRAY_AGG(DISTINCT scenario_tag) FILTER (WHERE scenario_tag IS NOT NULL) AS scenario_tags
+            FROM control.generation_stats
+            WHERE recorded_at >= NOW() - (%s * INTERVAL '1 minute')
+        """, [minutes], industry)
+        result = rows[0]
+        result["window_minutes"] = minutes
+        result["recent_tickets"] = query("""
+            SELECT t.ticket_id, t.ticket_number, t.subject, t.status, t.priority,
+                   t.channel, q.name AS queue, t.created_dt
+            FROM support.tickets t
+            JOIN support.queues q ON q.queue_id = t.queue_id
+            WHERE t.created_dt >= NOW() - (%s * INTERVAL '1 minute')
+            ORDER BY t.created_dt DESC LIMIT 20
+        """, [minutes], industry)
+        return result
     rows = query("""
         SELECT
             COALESCE(SUM(pos_transactions_generated), 0)  AS pos_transactions,
@@ -1556,6 +1681,9 @@ def stats_distributions(industry: str, days: int = Query(30, ge=1, le=365)):
     columns for the given look-back window (default 30 days).
     """
     pool_for(industry)
+
+    if industry == "support":
+        return _support_distributions(days)
 
     result: Dict[str, Any] = {}
 
@@ -1669,6 +1797,638 @@ def stats_distributions(industry: str, days: int = Query(30, ge=1, le=365)):
         """, [days], industry)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Support — distributions helper
+# ---------------------------------------------------------------------------
+
+def _support_distributions(days: int) -> Dict[str, Any]:
+    ind = "support"
+    win = "INTERVAL '1 day' * %s"
+    result: Dict[str, Any] = {}
+    result["tickets_by_day"] = query(f"""
+        SELECT DATE_TRUNC('day', created_dt)::date AS day,
+               COUNT(*) AS ticket_count,
+               COUNT(*) FILTER (WHERE status IN ('resolved','closed')) AS resolved_count
+        FROM support.tickets
+        WHERE created_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 1
+    """, [days], ind)
+    result["tickets_by_queue"] = query(f"""
+        SELECT q.name AS queue_name, COUNT(*) AS ticket_count
+        FROM support.tickets t JOIN support.queues q ON q.queue_id = t.queue_id
+        WHERE t.created_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["tickets_by_status"] = query(f"""
+        SELECT status, COUNT(*) AS ticket_count
+        FROM support.tickets
+        WHERE created_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["tickets_by_priority"] = query(f"""
+        SELECT priority, COUNT(*) AS ticket_count
+        FROM support.tickets
+        WHERE created_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["tickets_by_channel"] = query(f"""
+        SELECT channel, COUNT(*) AS ticket_count
+        FROM support.tickets
+        WHERE created_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["tickets_by_sentiment"] = query(f"""
+        SELECT COALESCE(sentiment, 'unknown') AS sentiment, COUNT(*) AS ticket_count
+        FROM support.tickets
+        WHERE created_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["calls_by_day"] = query(f"""
+        SELECT DATE_TRUNC('day', offered_dt)::date AS day,
+               COUNT(*) AS call_count,
+               ROUND(AVG(wait_seconds)::numeric, 1)  AS avg_wait_seconds,
+               ROUND(AVG(talk_seconds)::numeric, 1)  AS avg_talk_seconds,
+               COUNT(*) FILTER (WHERE abandoned)     AS abandoned_count
+        FROM voice.calls
+        WHERE offered_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 1
+    """, [days], ind)
+    result["calls_by_disposition"] = query(f"""
+        SELECT disposition, COUNT(*) AS call_count
+        FROM voice.calls
+        WHERE offered_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["chats_by_day"] = query(f"""
+        SELECT DATE_TRUNC('day', started_dt)::date AS day,
+               COUNT(*) AS session_count,
+               ROUND(AVG(wait_seconds)::numeric, 1) AS avg_wait_seconds
+        FROM chat.sessions
+        WHERE started_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 1
+    """, [days], ind)
+    result["chats_by_platform"] = query(f"""
+        SELECT platform, COUNT(*) AS session_count
+        FROM chat.sessions
+        WHERE started_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["surveys_by_bucket"] = query(f"""
+        SELECT CASE WHEN nps_score >= 9 THEN 'promoter'
+                    WHEN nps_score >= 7 THEN 'passive'
+                    ELSE 'detractor' END AS bucket,
+               COUNT(*) AS survey_count
+        FROM survey.surveys
+        WHERE is_complete AND sent_dt >= CURRENT_TIMESTAMP - {win}
+        GROUP BY 1 ORDER BY 2 DESC
+    """, [days], ind)
+    result["training_by_status"] = query(f"""
+        SELECT a.status, COUNT(*) AS assignment_count
+        FROM training.assignments a
+        JOIN training.courses c ON c.course_id = a.course_id
+        GROUP BY 1 ORDER BY 2 DESC
+    """, None, ind)
+    result["employees_by_department"] = query("""
+        SELECT department, COUNT(*) AS employee_count
+        FROM hr.employees WHERE status = 'active'
+        GROUP BY 1 ORDER BY 2 DESC
+    """, None, ind)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Support only: Queues & categories
+# ---------------------------------------------------------------------------
+
+@app.get("/support/queues", tags=["Support — Queues"])
+def support_queues(active_only: bool = True):
+    where = "WHERE is_active = TRUE" if active_only else ""
+    return query(f"""
+        SELECT queue_id, code, name, description, sla_hours,
+               avg_resolve_hours, is_active FROM support.queues {where}
+        ORDER BY code
+    """, None, "support")
+
+
+@app.get("/support/categories", tags=["Support — Queues"])
+def support_categories(queue_id: Optional[str] = None):
+    filters, params = ["TRUE"], []
+    if queue_id:
+        filters.append("c.queue_id = %s::uuid")
+        params.append(queue_id)
+    return query(f"""
+        SELECT c.category_id, c.queue_id, q.code AS queue_code, c.name,
+               c.severity, c.is_active
+        FROM support.categories c
+        JOIN support.queues q ON q.queue_id = c.queue_id
+        WHERE {" AND ".join(filters)} ORDER BY q.code, c.name
+    """, params, "support")
+
+
+# ---------------------------------------------------------------------------
+# Support only: Customers
+# ---------------------------------------------------------------------------
+
+@app.get("/support/customers", tags=["Support — Customers"])
+def support_customers(
+    tier: Optional[str] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if tier:
+        filters.append("tier = %s")
+        params.append(tier)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM support.customers WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT customer_id, first_name, last_name, email, phone, tier,
+               signup_date, lifetime_value
+        FROM support.customers WHERE {where}
+        ORDER BY customer_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# Support only: Tickets + comments + actions
+# ---------------------------------------------------------------------------
+
+@app.get("/support/tickets", tags=["Support — Tickets"])
+def support_tickets(
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    queue_id: Optional[str] = None,
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    channel: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("t.created_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("t.created_dt <= %s"); params.append(end_dt)
+    if queue_id:
+        filters.append("t.queue_id = %s::uuid"); params.append(queue_id)
+    if status:
+        filters.append("t.status = %s"); params.append(status)
+    if priority:
+        filters.append("t.priority = %s"); params.append(priority)
+    if channel:
+        filters.append("t.channel = %s"); params.append(channel)
+    if agent_id:
+        filters.append("t.assigned_agent_id = %s::uuid"); params.append(agent_id)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM support.tickets t WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT t.ticket_id, t.ticket_number, t.customer_id, t.queue_id, q.code AS queue_code,
+               t.assigned_agent_id, t.subject, t.channel, t.priority, t.status,
+               t.sentiment, t.created_dt, t.first_response_dt, t.resolved_dt, t.closed_dt,
+               t.reopen_count, t.touch_count, t.scenario_tag
+        FROM support.tickets t
+        JOIN support.queues q ON q.queue_id = t.queue_id
+        WHERE {where}
+        ORDER BY t.created_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/support/tickets/{ticket_id}", tags=["Support — Tickets"])
+def support_ticket_detail(ticket_id: str):
+    rows = query("""
+        SELECT t.*, q.code AS queue_code, q.name AS queue_name,
+               c.first_name || ' ' || c.last_name AS customer_name, c.tier AS customer_tier
+        FROM support.tickets t
+        JOIN support.queues q ON q.queue_id = t.queue_id
+        JOIN support.customers c ON c.customer_id = t.customer_id
+        WHERE t.ticket_id = %s::uuid
+    """, [ticket_id], "support")
+    if not rows:
+        raise HTTPException(404, "Ticket not found")
+    comments = query("""
+        SELECT comment_id, author_type, author_id, body, is_internal, created_dt
+        FROM support.ticket_comments WHERE ticket_id = %s::uuid
+        ORDER BY created_dt
+    """, [ticket_id], "support")
+    actions = query("""
+        SELECT action_id, action_type, from_value, to_value, performed_by, created_dt
+        FROM support.ticket_actions WHERE ticket_id = %s::uuid
+        ORDER BY created_dt
+    """, [ticket_id], "support")
+    ticket = rows[0]
+    ticket["comments"] = comments
+    ticket["actions"] = actions
+    return ticket
+
+
+@app.get("/support/ticket-comments", tags=["Support — Tickets"])
+def support_ticket_comments(
+    ticket_id: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if ticket_id:
+        filters.append("ticket_id = %s::uuid"); params.append(ticket_id)
+    if start_dt:
+        filters.append("created_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("created_dt <= %s"); params.append(end_dt)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM support.ticket_comments WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT comment_id, ticket_id, author_type, author_id, body, is_internal, created_dt
+        FROM support.ticket_comments WHERE {where}
+        ORDER BY created_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/support/ticket-actions", tags=["Support — Tickets"])
+def support_ticket_actions(
+    ticket_id: Optional[str] = None,
+    action_type: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if ticket_id:
+        filters.append("ticket_id = %s::uuid"); params.append(ticket_id)
+    if action_type:
+        filters.append("action_type = %s"); params.append(action_type)
+    if start_dt:
+        filters.append("created_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("created_dt <= %s"); params.append(end_dt)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM support.ticket_actions WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT action_id, ticket_id, action_type, from_value, to_value,
+               performed_by, created_dt
+        FROM support.ticket_actions WHERE {where}
+        ORDER BY created_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# Support only: Voice ACD calls
+# ---------------------------------------------------------------------------
+
+@app.get("/support/voice/calls", tags=["Support — Voice ACD"])
+def support_calls(
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    queue_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    abandoned: Optional[bool] = None,
+    disposition: Optional[str] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("c.offered_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("c.offered_dt <= %s"); params.append(end_dt)
+    if queue_id:
+        filters.append("c.queue_id = %s::uuid"); params.append(queue_id)
+    if agent_id:
+        filters.append("c.agent_id = %s::uuid"); params.append(agent_id)
+    if abandoned is not None:
+        filters.append("c.abandoned = %s"); params.append(abandoned)
+    if disposition:
+        filters.append("c.disposition = %s"); params.append(disposition)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM voice.calls c WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT c.call_id, c.queue_id, q.code AS queue_code, c.customer_id,
+               c.agent_id, c.transferred_to_queue_id, c.direction,
+               c.offered_dt, c.queued_dt, c.ring_dt, c.connect_dt, c.end_dt,
+               c.wait_seconds, c.talk_seconds, c.hold_seconds, c.hold_count,
+               c.after_call_work_seconds, c.abandoned, c.disposition,
+               c.has_ticket, c.recording_url, c.scenario_tag
+        FROM voice.calls c JOIN support.queues q ON q.queue_id = c.queue_id
+        WHERE {where}
+        ORDER BY c.offered_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/support/voice/summary", tags=["Support — Voice ACD"])
+def support_voice_summary(start_dt: Optional[datetime] = None,
+                          end_dt: Optional[datetime] = None):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("offered_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("offered_dt <= %s"); params.append(end_dt)
+    where = " AND ".join(filters)
+    return query(f"""
+        SELECT COUNT(*) AS offered,
+               COUNT(*) FILTER (WHERE NOT abandoned) AS answered,
+               COUNT(*) FILTER (WHERE abandoned) AS abandoned,
+               ROUND(AVG(wait_seconds) FILTER (WHERE NOT abandoned)::numeric, 1) AS avg_wait_seconds,
+               ROUND(AVG(talk_seconds) FILTER (WHERE NOT abandoned)::numeric, 1) AS avg_talk_seconds,
+               ROUND(AVG(after_call_work_seconds)::numeric, 1) AS avg_acw_seconds,
+               ROUND(100.0 * COUNT(*) FILTER (WHERE abandoned) / NULLIF(COUNT(*),0), 2) AS abandonment_pct,
+               ROUND(100.0 * COUNT(*) FILTER (WHERE disposition = 'resolved') / NULLIF(COUNT(*) FILTER (WHERE NOT abandoned),0), 2) AS resolution_pct
+        FROM voice.calls WHERE {where}
+    """, params, "support")[0]
+
+
+# ---------------------------------------------------------------------------
+# Support only: Chat sessions + messages
+# ---------------------------------------------------------------------------
+
+@app.get("/support/chat/sessions", tags=["Support — Chat"])
+def support_chat_sessions(
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    queue_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("s.started_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("s.started_dt <= %s"); params.append(end_dt)
+    if queue_id:
+        filters.append("s.queue_id = %s::uuid"); params.append(queue_id)
+    if agent_id:
+        filters.append("s.agent_id = %s::uuid"); params.append(agent_id)
+    if status:
+        filters.append("s.status = %s"); params.append(status)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM chat.sessions s WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT s.session_id, s.queue_id, q.code AS queue_code, s.customer_id,
+               s.agent_id, s.started_dt, s.first_response_dt, s.ended_dt,
+               s.status, s.platform, s.transferred_to_ticket, s.message_count,
+               s.wait_seconds, s.duration_seconds, s.scenario_tag
+        FROM chat.sessions s JOIN support.queues q ON q.queue_id = s.queue_id
+        WHERE {where}
+        ORDER BY s.started_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/support/chat/messages", tags=["Support — Chat"])
+def support_chat_messages(
+    session_id: Optional[str] = None,
+    sender_type: Optional[str] = None,
+    limit: int = Query(1000, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if session_id:
+        filters.append("session_id = %s::uuid"); params.append(session_id)
+    if sender_type:
+        filters.append("sender_type = %s"); params.append(sender_type)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM chat.messages WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT message_id, session_id, sender_type, sender_id, body, sent_dt
+        FROM chat.messages WHERE {where}
+        ORDER BY sent_dt LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# Support only: sNPS surveys
+# ---------------------------------------------------------------------------
+
+@app.get("/support/surveys", tags=["Support — Surveys"])
+def support_surveys(
+    channel: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    bucket: Optional[str] = Query(None, pattern="^(promoter|passive|detractor)$"),
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    filters, params = ["is_complete = TRUE"], []
+    if channel:
+        filters.append("channel = %s"); params.append(channel)
+    if agent_id:
+        filters.append("agent_id = %s::uuid"); params.append(agent_id)
+    if bucket == 'promoter':
+        filters.append("nps_score >= 9")
+    elif bucket == 'passive':
+        filters.append("nps_score BETWEEN 7 AND 8")
+    elif bucket == 'detractor':
+        filters.append("nps_score <= 6")
+    if start_dt:
+        filters.append("sent_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("sent_dt <= %s"); params.append(end_dt)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM survey.surveys WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT survey_id, channel, interaction_id, customer_id, agent_id,
+               sent_dt, responded_dt, nps_score, csat_score, reason_tag, verbatim
+        FROM survey.surveys WHERE {where}
+        ORDER BY sent_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/support/surveys/scorecard", tags=["Support — Surveys"])
+def support_survey_scorecard(days: int = Query(30, ge=1, le=365),
+                             agent_id: Optional[str] = None):
+    filters = ["is_complete = TRUE", "sent_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s"]
+    params: list = [days]
+    if agent_id:
+        filters.append("agent_id = %s::uuid"); params.append(agent_id)
+    where = " AND ".join(filters)
+    return query(f"""
+        SELECT COUNT(*) AS responses,
+               ROUND(100.0 * COUNT(*) FILTER (WHERE nps_score >= 9) / NULLIF(COUNT(*),0), 1) AS promoter_pct,
+               ROUND(100.0 * COUNT(*) FILTER (WHERE nps_score <= 6) / NULLIF(COUNT(*),0), 1) AS detractor_pct,
+               ROUND(100.0 * (COUNT(*) FILTER (WHERE nps_score >= 9) -
+                              COUNT(*) FILTER (WHERE nps_score <= 6)) / NULLIF(COUNT(*),0), 1) AS snps,
+               ROUND(AVG(csat_score)::numeric, 2) AS avg_csat
+        FROM survey.surveys WHERE {where}
+    """, params, "support")[0]
+
+
+# ---------------------------------------------------------------------------
+# Support only: Training
+# ---------------------------------------------------------------------------
+
+@app.get("/support/training/courses", tags=["Support — Training"])
+def support_courses(category: Optional[str] = None):
+    filters, params = ["is_active = TRUE"], []
+    if category:
+        filters.append("category = %s"); params.append(category)
+    return query(f"""
+        SELECT course_id, code, name, category, duration_minutes, pass_score,
+               is_mandatory, target_departments
+        FROM training.courses WHERE {" AND ".join(filters)} ORDER BY code
+    """, params, "support")
+
+
+@app.get("/support/training/assignments", tags=["Support — Training"])
+def support_assignments(
+    agent_id: Optional[str] = None,
+    course_id: Optional[str] = None,
+    status: Optional[str] = None,
+    trigger_reason: Optional[str] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if agent_id:
+        filters.append("a.agent_id = %s::uuid"); params.append(agent_id)
+    if course_id:
+        filters.append("a.course_id = %s::uuid"); params.append(course_id)
+    if status:
+        filters.append("a.status = %s"); params.append(status)
+    if trigger_reason:
+        filters.append("a.trigger_reason = %s"); params.append(trigger_reason)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM training.assignments a WHERE {where}",
+                  params, "support")[0]["n"]
+    rows = query(f"""
+        SELECT a.assignment_id, a.agent_id, a.course_id, c.code AS course_code,
+               c.name AS course_name, a.assigned_dt, a.due_dt, a.started_dt,
+               a.completed_dt, a.status, a.score_pct, a.attempts, a.trigger_reason
+        FROM training.assignments a
+        JOIN training.courses c ON c.course_id = a.course_id
+        WHERE {where}
+        ORDER BY a.assigned_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "support")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# Support only: Agent performance
+# ---------------------------------------------------------------------------
+
+@app.get("/support/agents/performance", tags=["Support — Agents"])
+def support_agent_performance(days: int = Query(30, ge=1, le=365)):
+    """Per-agent rollup: tickets handled, calls, chats, sNPS."""
+    return query("""
+        SELECT e.employee_id, e.first_name, e.last_name, e.department,
+            (SELECT COUNT(*) FROM support.tickets t
+             WHERE t.assigned_agent_id = e.employee_id
+               AND t.created_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s) AS tickets_assigned,
+            (SELECT COUNT(*) FROM support.tickets t
+             WHERE t.assigned_agent_id = e.employee_id AND t.status IN ('resolved','closed')
+               AND t.created_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s) AS tickets_resolved,
+            (SELECT COUNT(*) FROM voice.calls c
+             WHERE c.agent_id = e.employee_id
+               AND c.offered_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s) AS calls_handled,
+            (SELECT COALESCE(ROUND(AVG(c.talk_seconds)::numeric),0) FROM voice.calls c
+             WHERE c.agent_id = e.employee_id AND NOT c.abandoned
+               AND c.offered_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s) AS avg_talk_seconds,
+            (SELECT COUNT(*) FROM chat.sessions s
+             WHERE s.agent_id = e.employee_id
+               AND s.started_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s) AS chats_handled,
+            (SELECT COUNT(*) FROM survey.surveys sv
+             WHERE sv.agent_id = e.employee_id AND sv.is_complete) AS survey_responses,
+            (SELECT ROUND(100.0 * (COUNT(*) FILTER (WHERE sv2.nps_score >= 9) -
+                                   COUNT(*) FILTER (WHERE sv2.nps_score <= 6))
+                          / NULLIF(COUNT(*),0), 1)
+             FROM survey.surveys sv2
+             WHERE sv2.agent_id = e.employee_id AND sv2.is_complete
+               AND sv2.sent_dt >= CURRENT_TIMESTAMP - INTERVAL '1 day' * %s) AS agent_snps
+        FROM hr.employees e
+        WHERE e.status = 'active' AND e.department IN ('agent','team_lead')
+        ORDER BY tickets_assigned DESC
+    """, [days] * 6, "support")
+
+
+# ---------------------------------------------------------------------------
+# Support — Multi-scenario management (activate/deactivate/schedules)
+# ---------------------------------------------------------------------------
+
+@app.get("/support/generator/scenarios", tags=["Support — Scenarios"])
+def support_list_active_scenarios():
+    return query(
+        "SELECT scenario_id, scenario_name, activated_at FROM control.active_scenarios "
+        "ORDER BY activated_at", None, "support")
+
+
+@app.post("/support/generator/scenarios", tags=["Support — Scenarios"])
+def support_activate_scenario(req: ScenarioActivateRequest):
+    valid = VALID_SCENARIOS.get("support", set())
+    if req.scenario_name not in valid:
+        raise HTTPException(400, f"scenario_name must be one of {sorted(valid)}")
+    execute("""
+        INSERT INTO control.active_scenarios (scenario_name) VALUES (%s)
+        ON CONFLICT (scenario_name) DO NOTHING
+    """, [req.scenario_name], "support")
+    return query(
+        "SELECT scenario_id, scenario_name, activated_at FROM control.active_scenarios "
+        "ORDER BY activated_at", None, "support")
+
+
+@app.delete("/support/generator/scenarios/{scenario_name}", tags=["Support — Scenarios"])
+def support_deactivate_scenario(scenario_name: str):
+    execute("DELETE FROM control.active_scenarios WHERE scenario_name = %s",
+            [scenario_name], "support")
+    return query(
+        "SELECT scenario_id, scenario_name, activated_at FROM control.active_scenarios "
+        "ORDER BY activated_at", None, "support")
+
+
+@app.get("/support/generator/scenario-schedules", tags=["Support — Scenarios"])
+def support_list_scenario_schedules():
+    return query("""
+        SELECT schedule_id, scenario_name, start_date, end_date, label, created_at
+        FROM control.scenario_schedules ORDER BY start_date, scenario_name
+    """, None, "support")
+
+
+@app.post("/support/generator/scenario-schedules", tags=["Support — Scenarios"])
+def support_create_scenario_schedule(req: ScenarioScheduleRequest):
+    valid = VALID_SCENARIOS.get("support", set())
+    if req.scenario_name not in valid:
+        raise HTTPException(400, f"scenario_name must be one of {sorted(valid)}")
+    if req.end_date < req.start_date:
+        raise HTTPException(400, "end_date must be >= start_date")
+    execute("""
+        INSERT INTO control.scenario_schedules (scenario_name, start_date, end_date, label)
+        VALUES (%s, %s, %s, %s)
+    """, [req.scenario_name, req.start_date, req.end_date, req.label], "support")
+    return query("""
+        SELECT schedule_id, scenario_name, start_date, end_date, label, created_at
+        FROM control.scenario_schedules ORDER BY start_date, scenario_name
+    """, None, "support")
+
+
+@app.delete("/support/generator/scenario-schedules/{schedule_id}", tags=["Support — Scenarios"])
+def support_delete_scenario_schedule(schedule_id: str):
+    rows = execute(
+        "DELETE FROM control.scenario_schedules WHERE schedule_id = %s::uuid",
+        [schedule_id], "support")
+    if rows == 0:
+        raise HTTPException(404, "Schedule not found")
+    return {"deleted": schedule_id}
+
 
 
 # ---------------------------------------------------------------------------

@@ -11,18 +11,18 @@ import sys
 
 src = open(sys.argv[1]).read()
 
-# Remove the gas-station-only fuel section.
+# Remove the gas-station-only fuel section and the support-industry sections.
 # The section begins with its standard comment header and ends just before
-# the next section header (another line of dashes).
+# the next section header (another line of dashes) — or at EOF.
 # Regex: matches from the "Gas-station only" header through to (but not
 # including) the next top-level section separator.
 pattern = (
     r'\n'
     r'# -{75}\n'
-    r'# Gas-station only:.*?\n'
+    r'# (?:Gas-station only|Support(?: only| —)).*?\n'
     r'# -{75}\n'
     r'.*?'
-    r'(?=\n# -{75})'
+    r'(?=\n# -{75}|\Z)'
 )
 cleaned = re.sub(pattern, '', src, flags=re.DOTALL)
 

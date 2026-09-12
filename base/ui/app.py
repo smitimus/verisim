@@ -27,10 +27,11 @@ st.set_page_config(
 INDUSTRY_META = {
     "gas-station": ("⛽", "Gas Station"),
     "grocery":     ("🛒", "Grocery"),
+    "support":     ("🎧", "Customer Support"),
 }
 
 
-INDUSTRY_ORDER = ["grocery", "gas-station"]  # preferred display order
+INDUSTRY_ORDER = ["grocery", "support", "gas-station"]  # preferred display order
 
 
 @st.cache_data(ttl=30)
@@ -826,9 +827,12 @@ GROCERY_TABLE_DOCS = {
 }
 
 # Combined lookup
+SUPPORT_TABLE_DOCS: dict = {}
+
 TABLE_DOCS_BY_INDUSTRY = {
     "gas-station": GAS_STATION_TABLE_DOCS,
     "grocery": GROCERY_TABLE_DOCS,
+    "support": SUPPORT_TABLE_DOCS,
 }
 
 
@@ -908,9 +912,47 @@ GROCERY_SCHEMA_TABLES = {
     ],
 }
 
+SUPPORT_SCHEMA_TABLES = {
+    "HR": [
+        ("hr.locations", "Contact Centers"),
+        ("hr.employees", "Agents & Staff"),
+    ],
+    "Queues": [
+        ("support.queues", "Ticket Queues"),
+        ("support.categories", "Categories"),
+    ],
+    "Customers": [
+        ("support.customers", "Customers"),
+    ],
+    "Tickets": [
+        ("support.tickets", "Tickets"),
+        ("support.ticket_comments", "Comments"),
+        ("support.ticket_actions", "Action Audit Trail"),
+    ],
+    "Voice ACD": [
+        ("voice.calls", "Call Detail Records"),
+    ],
+    "Chat": [
+        ("chat.sessions", "Chat Sessions"),
+        ("chat.messages", "Transcripts"),
+    ],
+    "Surveys": [
+        ("survey.surveys", "sNPS Surveys"),
+    ],
+    "Training": [
+        ("training.courses", "Courses"),
+        ("training.assignments", "Assignments"),
+    ],
+    "Control": [
+        ("control.generator_state", "Generator State"),
+        ("control.generation_stats", "Generation Stats"),
+    ],
+}
+
 SCHEMA_TABLES_BY_INDUSTRY = {
     "gas-station": GAS_STATION_SCHEMA_TABLES,
     "grocery": GROCERY_SCHEMA_TABLES,
+    "support": SUPPORT_SCHEMA_TABLES,
 }
 
 # ---------------------------------------------------------------------------
@@ -1041,9 +1083,77 @@ GROCERY_SCHEMA_DOCS = {
     },
 }
 
+SUPPORT_SCHEMA_DOCS = {
+    "HR": {
+        "description": "Contact-center sites and all staff. Agents carry skill_groups (queue codes) and an aht_factor that personalizes handle times.",
+        "tables_summary": [
+            ("hr.locations", "Contact centers and remote hubs."),
+            ("hr.employees", "Agents, team leads, QA, trainers, managers."),
+        ],
+        "notes": "Every ticket, call, chat, survey, and training assignment references these people.",
+    },
+    "Queues": {
+        "description": "Ticket destination queues (billing, technical, account, shipping, returns, escalations) with per-queue SLA and average handle profiles.",
+        "tables_summary": [
+            ("support.queues", "Queue definitions + SLA targets."),
+            ("support.categories", "Classifications within each queue."),
+        ],
+        "notes": "Queue movement is audited in support.ticket_actions.",
+    },
+    "Customers": {
+        "description": "The customer base behind every contact: tier, lifetime value, signup date.",
+        "tables_summary": [("support.customers", "Customer master.")],
+        "notes": "VIP tier skews tickets to escalations.",
+    },
+    "Tickets": {
+        "description": "The ticketing system: lifecycle (new→open→pending→resolved→closed), assignments, queue movements, agent + customer comments, and a complete action audit trail.",
+        "tables_summary": [
+            ("support.tickets", "One row per case, with timestamps for each lifecycle stage."),
+            ("support.ticket_comments", "Internal + customer-visible comments by agents, customers, system."),
+            ("support.ticket_actions", "Immutable audit: assigned, moved, escalated, status_change, sla_breached..."),
+        ],
+        "notes": "reopen_count and touch_count make first-contact-resolution and effort analysis possible.",
+    },
+    "Voice ACD": {
+        "description": "Phone ACD call detail records: offered→queued→ring→connect→end with wait, talk, hold and after-call-work seconds, abandonment and disposition.",
+        "tables_summary": [("voice.calls", "CDR — one row per offered call.")],
+        "notes": "has_ticket links calls that produced a follow-up ticket.",
+    },
+    "Chat": {
+        "description": "Live chat sessions with full message transcripts (customer / agent / system senders).",
+        "tables_summary": [
+            ("chat.sessions", "Session lifecycle + waits + duration."),
+            ("chat.messages", "Transcript lines."),
+        ],
+        "notes": "transferred_to_ticket marks chats converted into cases.",
+    },
+    "Surveys": {
+        "description": "sNPS survey system attached to closed voice/chat/ticket interactions, with 0-10 NPS, 1-5 CSAT, reason tags, and free-text verbatims.",
+        "tables_summary": [("survey.surveys", "One row per survey sent; response columns fill later.")],
+        "notes": "Detractor clusters per agent drive qa_finding training assignments.",
+    },
+    "Training": {
+        "description": "Training system: course catalog, per-agent assignments (onboarding, QA remedial, launch/recall triggers) with due dates, scores and attempts.",
+        "tables_summary": [
+            ("training.courses", "Catalog with duration/pass score/mandatory flags."),
+            ("training.assignments", "Assignment lifecycle incl. overdue detection."),
+        ],
+        "notes": "trigger_reason explains WHY each assignment exists.",
+    },
+    "Control": {
+        "description": "Generator bookkeeping — state machine and per-tick stats. Not analytics data.",
+        "tables_summary": [
+            ("control.generator_state", "Single-row state."),
+            ("control.generation_stats", "Per-tick counts of everything generated."),
+        ],
+        "notes": "These tables exist to support the simulation engine. Rarely used in analytics models.",
+    },
+}
+
 SCHEMA_DOCS_BY_INDUSTRY = {
     "gas-station": GAS_STATION_SCHEMA_DOCS,
     "grocery": GROCERY_SCHEMA_DOCS,
+    "support": SUPPORT_SCHEMA_DOCS,
 }
 
 # Tables that require date filters
@@ -1051,6 +1161,8 @@ NEEDS_DATES = {
     "pos.transactions", "pos.transaction_items", "fuel.transactions",
     "inv.receipts", "inv.receipt_items",
     "timeclock.events", "ordering.store_orders", "transport.loads",
+    "support.tickets", "support.ticket_comments", "support.ticket_actions",
+    "voice.calls", "chat.sessions", "survey.surveys",
 }
 
 # Tables that support location filter
@@ -1174,6 +1286,56 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
             p["status"] = extra["status"]
         return paged(f"{pfx}/transport/loads", p)
 
+    # --- Support-only tables ---
+    if table == "support.queues":
+        return flat(f"{pfx}/queues", {})
+    if table == "support.categories":
+        return flat(f"{pfx}/categories", {})
+    if table == "support.customers":
+        if extra.get("tier"):
+            p["tier"] = extra["tier"]
+        return paged(f"{pfx}/customers", p)
+    if table == "support.tickets":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("status"):
+            p["status"] = extra["status"]
+        if extra.get("priority"):
+            p["priority"] = extra["priority"]
+        if extra.get("channel"):
+            p["channel"] = extra["channel"]
+        return paged(f"{pfx}/tickets", p)
+    if table == "support.ticket_comments":
+        p.update({"start_dt": sd, "end_dt": ed})
+        return paged(f"{pfx}/ticket-comments", p)
+    if table == "support.ticket_actions":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("action_type"):
+            p["action_type"] = extra["action_type"]
+        return paged(f"{pfx}/ticket-actions", p)
+    if table == "voice.calls":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("disposition"):
+            p["disposition"] = extra["disposition"]
+        return paged(f"{pfx}/voice/calls", p)
+    if table == "chat.sessions":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("status"):
+            p["status"] = extra["status"]
+        return paged(f"{pfx}/chat/sessions", p)
+    if table == "chat.messages":
+        return paged(f"{pfx}/chat/messages", {"limit": limit})
+    if table == "survey.surveys":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("bucket"):
+            p["bucket"] = extra["bucket"]
+        return paged(f"{pfx}/surveys", p)
+    if table == "training.courses":
+        return flat(f"{pfx}/training/courses", {})
+    if table == "training.assignments":
+        if extra.get("status"):
+            p["status"] = extra["status"]
+        return paged(f"{pfx}/training/assignments", p)
+
     return pd.DataFrame(), 0
 
 
@@ -1242,9 +1404,53 @@ GROCERY_SCENARIOS = {
     },
 }
 
+SUPPORT_SCENARIOS = {
+    "normal": {
+        "label": "Normal",
+        "icon": "🎧",
+        "description": "Baseline contact volume — business-hours curve, Monday peak, weekend dip.",
+    },
+    "rush_hour": {
+        "label": "Rush Hour",
+        "icon": "📞",
+        "description": "1.6× contacts during business peak hours (9–11am, 2–4pm).",
+    },
+    "weekend": {
+        "label": "Weekend",
+        "icon": "🏖️",
+        "description": "0.65× baseline volume. Reduced staffing contact flow.",
+    },
+    "service_outage": {
+        "label": "Service Outage",
+        "icon": "🔥",
+        "description": "4× contact surge, negative sentiment, longer calls, higher abandonment.",
+    },
+    "weather_outage": {
+        "label": "Weather Outage",
+        "icon": "🌀",
+        "description": "2.5× surge with elevated queue stress from regional disruption.",
+    },
+    "product_launch": {
+        "label": "Product Launch",
+        "icon": "🚀",
+        "description": "1.8× contacts, how-to questions, longer handle times, training triggers.",
+    },
+    "marketing_blast": {
+        "label": "Marketing Blast",
+        "icon": "📣",
+        "description": "2.2× contacts from a promo email — billing and account questions spike.",
+    },
+    "holiday_week": {
+        "label": "Holiday Week",
+        "icon": "🎄",
+        "description": "1.4× volume with shipping/returns pressure and longer queues.",
+    },
+}
+
 SCENARIOS_BY_INDUSTRY = {
     "gas-station": GAS_STATION_SCENARIOS,
     "grocery": GROCERY_SCENARIOS,
+    "support": SUPPORT_SCENARIOS,
 }
 
 
@@ -1293,6 +1499,13 @@ with tab1:
                 c2.metric("Fuel Transactions Today", f"{today_data.get('fuel_transactions', 0):,}")
                 c3.metric("Ticks Today", f"{today_data.get('ticks', 0):,}")
                 c4.metric("Volume Multiplier", f"{state.get('volume_multiplier', 1.0):.1f}×" if status_data else "—")
+            elif industry == "support":
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Tickets Today", f"{today_data.get('tickets', 0):,}")
+                c2.metric("Calls Today", f"{today_data.get('calls', 0):,}")
+                c3.metric("Chats Today", f"{today_data.get('chats', 0):,}")
+                c4.metric("Survey Responses", f"{today_data.get('surveys', 0):,}")
+                c5.metric("Volume Multiplier", f"{state.get('volume_multiplier', 1.0):.1f}×" if status_data else "—")
             else:
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("POS Transactions Today", f"{today_data.get('pos_transactions', 0):,}")
@@ -1310,12 +1523,20 @@ with tab1:
 
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    st.subheader("POS Transactions per Tick")
-                    fig = px.line(df, x="recorded_at", y="pos_transactions_generated",
-                                  color="scenario_tag",
-                                  labels={"recorded_at": "Time", "pos_transactions_generated": "Count"})
-                    fig.update_layout(height=300, margin=dict(t=20, b=20))
-                    st.plotly_chart(fig, use_container_width=True)
+                    if industry == "support" and "tickets_generated" in df.columns:
+                        st.subheader("Tickets Created per Tick")
+                        fig = px.line(df, x="recorded_at", y="tickets_generated",
+                                      color="scenario_tag",
+                                      labels={"recorded_at": "Time", "tickets_generated": "Count"})
+                        fig.update_layout(height=300, margin=dict(t=20, b=20))
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif "pos_transactions_generated" in df.columns:
+                        st.subheader("POS Transactions per Tick")
+                        fig = px.line(df, x="recorded_at", y="pos_transactions_generated",
+                                      color="scenario_tag",
+                                      labels={"recorded_at": "Time", "pos_transactions_generated": "Count"})
+                        fig.update_layout(height=300, margin=dict(t=20, b=20))
+                        st.plotly_chart(fig, use_container_width=True)
 
                 with col_b:
                     if industry == "gas-station" and "fuel_transactions_generated" in df.columns:
@@ -1328,6 +1549,12 @@ with tab1:
                         st.subheader("Timeclock Events per Tick")
                         fig2 = px.line(df, x="recorded_at", y="timeclock_events_generated",
                                        labels={"recorded_at": "Time", "timeclock_events_generated": "Count"})
+                        fig2.update_layout(height=300, margin=dict(t=20, b=20))
+                        st.plotly_chart(fig2, use_container_width=True)
+                    elif industry == "support" and "calls_generated" in df.columns:
+                        st.subheader("ACD Calls per Tick")
+                        fig2 = px.line(df, x="recorded_at", y="calls_generated",
+                                       labels={"recorded_at": "Time", "calls_generated": "Count"})
                         fig2.update_layout(height=300, margin=dict(t=20, b=20))
                         st.plotly_chart(fig2, use_container_width=True)
 
@@ -1348,8 +1575,27 @@ with tab1:
 
         st.divider()
 
-        recent = api_get(f"{pfx}/stats/recent", {"minutes": 60}) if industry == "grocery" else None
-        if recent:
+        recent = api_get(f"{pfx}/stats/recent", {"minutes": 60}) if industry in ("grocery", "support") else None
+        if recent and industry == "support":
+            st.subheader("Last Hour")
+            r1, r2, r3, r4, r5 = st.columns(5)
+            r1.metric("Tickets", f"{recent.get('tickets', 0):,}")
+            r2.metric("Calls", f"{recent.get('calls', 0):,}")
+            r3.metric("Chats", f"{recent.get('chats', 0):,}")
+            r4.metric("Survey Responses", f"{recent.get('surveys', 0):,}")
+            r5.metric("Ticks", f"{recent.get('ticks', 0):,}")
+
+            tkts = recent.get("recent_tickets", [])
+            if tkts:
+                df_recent = pd.DataFrame(tkts)
+                if "created_dt" in df_recent.columns:
+                    df_recent["created_dt"] = pd.to_datetime(df_recent["created_dt"]).dt.strftime("%H:%M:%S")
+                show = [c for c in ["created_dt", "ticket_number", "subject", "queue", "status", "priority", "channel"] if c in df_recent.columns]
+                st.dataframe(df_recent[show].rename(columns={
+                    "created_dt": "Time", "ticket_number": "Ticket #", "subject": "Subject",
+                    "queue": "Queue", "status": "Status", "priority": "Priority", "channel": "Channel"
+                }), use_container_width=True, hide_index=True)
+        elif recent:
             st.subheader("Last Hour")
             r1, r2, r3, r4 = st.columns(4)
             r1.metric("Transactions", f"{recent.get('pos_transactions', 0):,}")
@@ -1472,8 +1718,8 @@ with tab3:
 
         SCENARIOS = SCENARIOS_BY_INDUSTRY[industry]
 
-        if industry == "grocery":
-            active_scenarios_list = api_get("/grocery/generator/scenarios") or []
+        if industry in ("grocery", "support"):
+            active_scenarios_list = api_get(f"{pfx}/generator/scenarios") or []
             active_scenario_names = {s["scenario_name"] for s in active_scenarios_list}
         else:
             status_data3 = api_get(f"{pfx}/status")
@@ -1487,14 +1733,14 @@ with tab3:
                 with st.container(border=True):
                     st.markdown(f"### {info['icon']} {info['label']}{badge}")
                     st.caption(info["description"])
-                    if industry == "grocery":
+                    if industry in ("grocery", "support"):
                         if is_active:
                             if st.button(f"Deactivate", key=f"sc_off_{key}"):
-                                api_delete(f"/grocery/generator/scenarios/{key}")
+                                api_delete(f"{pfx}/generator/scenarios/{key}")
                                 st.rerun(scope="fragment")
                         else:
                             if st.button(f"Activate", key=f"sc_on_{key}"):
-                                api_post(f"/grocery/generator/scenarios", {"scenario_name": key})
+                                api_post(f"{pfx}/generator/scenarios", {"scenario_name": key})
                                 st.rerun(scope="fragment")
                     else:
                         if not is_active:
@@ -1502,12 +1748,12 @@ with tab3:
                                 api_patch(f"{pfx}/generator/config", {"active_scenario": key})
                                 st.rerun(scope="fragment")
 
-        if industry == "grocery":
+        if industry in ("grocery", "support"):
             st.divider()
             st.subheader("Scenario Schedules")
             st.caption("Scheduled scenarios automatically activate during backfill and realtime generation on their date range.")
 
-            schedules = api_get("/grocery/generator/scenario-schedules") or []
+            schedules = api_get(f"{pfx}/generator/scenario-schedules") or []
             if schedules:
                 df_sched = pd.DataFrame(schedules)
                 for _, row in df_sched.iterrows():
@@ -1517,7 +1763,7 @@ with tab3:
                     c3.write(str(row["end_date"]))
                     c4.write(row.get("label") or "")
                     if c5.button("✕", key=f"del_sched_{row['schedule_id']}"):
-                        api_delete(f"/grocery/generator/scenario-schedules/{row['schedule_id']}")
+                        api_delete(f"{pfx}/generator/scenario-schedules/{row['schedule_id']}")
                         st.rerun(scope="fragment")
             else:
                 st.info("No scenario schedules. Add one below.")
@@ -1532,7 +1778,7 @@ with tab3:
                     if sched_end < sched_start:
                         st.error("End date must be after start date.")
                     else:
-                        api_post("/grocery/generator/scenario-schedules", {
+                        api_post(f"{pfx}/generator/scenario-schedules", {
                             "scenario_name": sched_scenario,
                             "start_date": str(sched_start),
                             "end_date": str(sched_end),
@@ -1719,6 +1965,110 @@ with tab4:
 # ===========================================================================
 # TAB 5 — Distributions
 # ===========================================================================
+
+def _support_distributions(dist, _bar):
+    """Chart set for the support industry's distributions payload."""
+    t_day = dist.get("tickets_by_day", [])
+    if t_day:
+        df_t = pd.DataFrame(t_day)
+        df_t["day"] = pd.to_datetime(df_t["day"])
+        fig = px.bar(df_t.melt(id_vars="day", value_vars=["ticket_count", "resolved_count"],
+                               var_name="kind", value_name="count"),
+                     x="day", y="count", color="kind",
+                     title="Tickets per Day (created vs resolved)",
+                     labels={"day": "Date", "count": "Tickets"})
+        fig.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=320)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No ticket data in window.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        _bar(dist.get("tickets_by_queue"), "queue_name", "ticket_count",
+             "Tickets by Queue", labels={"queue_name": "Queue", "ticket_count": "Tickets"})
+    with c2:
+        _bar(dist.get("tickets_by_status"), "status", "ticket_count",
+             "Tickets by Status", labels={"status": "Status", "ticket_count": "Tickets"})
+
+    c3, c4 = st.columns(2)
+    with c3:
+        _bar(dist.get("tickets_by_priority"), "priority", "ticket_count",
+             "Tickets by Priority", labels={"priority": "Priority", "ticket_count": "Tickets"})
+    with c4:
+        _bar(dist.get("tickets_by_channel"), "channel", "ticket_count",
+             "Tickets by Channel", labels={"channel": "Channel", "ticket_count": "Tickets"})
+
+    c5, c6 = st.columns(2)
+    with c5:
+        _bar(dist.get("tickets_by_sentiment"), "sentiment", "ticket_count",
+             "Tickets by Sentiment", labels={"sentiment": "Sentiment", "ticket_count": "Tickets"})
+    with c6:
+        _bar(dist.get("employees_by_department"), "department", "employee_count",
+             "Active Staff by Department", labels={"department": "Department", "employee_count": "Staff"})
+
+    st.divider()
+    st.markdown("#### Voice ACD")
+    call_day = dist.get("calls_by_day", [])
+    if call_day:
+        df_c = pd.DataFrame(call_day)
+        df_c["day"] = pd.to_datetime(df_c["day"])
+        fig_c = px.bar(df_c, x="day", y="call_count",
+                       title="Calls Offered per Day",
+                       labels={"day": "Date", "call_count": "Calls"},
+                       color_discrete_sequence=["#4C78A8"])
+        fig_c2 = px.line(df_c, x="day", y="avg_wait_seconds",
+                         title="Avg Queue Wait (s)",
+                         labels={"day": "Date", "avg_wait_seconds": "Seconds"},
+                         color_discrete_sequence=["#E45756"])
+        fig_c.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=280)
+        fig_c2.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=280)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.plotly_chart(fig_c, use_container_width=True)
+        with cc2:
+            st.plotly_chart(fig_c2, use_container_width=True)
+    else:
+        st.info("No call data in window.")
+    _bar(dist.get("calls_by_disposition"), "disposition", "call_count",
+         "Calls by Disposition", labels={"disposition": "Disposition", "call_count": "Calls"})
+
+    st.divider()
+    st.markdown("#### Live Chat")
+    chat_day = dist.get("chats_by_day", [])
+    if chat_day:
+        df_ch = pd.DataFrame(chat_day)
+        df_ch["day"] = pd.to_datetime(df_ch["day"])
+        fig_ch = px.bar(df_ch, x="day", y="session_count",
+                        title="Chat Sessions per Day",
+                        labels={"day": "Date", "session_count": "Sessions"},
+                        color_discrete_sequence=["#72B7B2"])
+        fig_ch.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=300)
+        st.plotly_chart(fig_ch, use_container_width=True)
+    else:
+        st.info("No chat data in window.")
+    _bar(dist.get("chats_by_platform"), "platform", "session_count",
+         "Chats by Platform", labels={"platform": "Platform", "session_count": "Sessions"})
+
+    st.divider()
+    st.markdown("#### sNPS Surveys")
+    _bar(dist.get("surveys_by_bucket"), "bucket", "survey_count",
+         "Survey Responses by sNPS Bucket",
+         labels={"bucket": "Bucket", "survey_count": "Responses"})
+    score = api_get("/support/surveys/scorecard", {"days": 30})
+    if score:
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("sNPS (30d)", f"{score.get('snps') or 0:.1f}")
+        s2.metric("Promoters", f"{score.get('promoter_pct') or 0:.1f}%")
+        s3.metric("Detractors", f"{score.get('detractor_pct') or 0:.1f}%")
+        s4.metric("Avg CSAT", f"{score.get('avg_csat') or 0:.2f}")
+
+    st.divider()
+    st.markdown("#### Training")
+    _bar(dist.get("training_by_status"), "status", "assignment_count",
+         "Training Assignments by Status",
+         labels={"status": "Status", "assignment_count": "Assignments"})
+
+
 with tab5:
     @st.fragment(run_every=15)
     def _distributions():
@@ -1746,6 +2096,11 @@ with tab5:
                              color_discrete_sequence=px.colors.qualitative.Safe)
                 fig.update_layout(margin=dict(t=36, b=0, l=0, r=0), height=320)
                 st.plotly_chart(fig, use_container_width=True)
+
+            if industry == "support":
+                _support_distributions(dist, _bar)
+                st.caption(f"Auto-refreshes every 15s · Last refresh: {datetime.now().strftime('%H:%M:%S')}")
+                return
 
             st.markdown("#### POS Transactions")
             txn_day = dist.get("transactions_by_day", [])
@@ -1908,6 +2263,8 @@ with tab6:
         if table == "hr.employees":
             if industry == "gas-station":
                 filter_slots += ["gs_department", "employee_status"]
+            elif industry == "support":
+                filter_slots += ["sp_department", "employee_status"]
             else:
                 filter_slots += ["gr_department", "employee_status"]
         elif table == "pos.products":
@@ -1920,6 +2277,14 @@ with tab6:
             filter_slots.append("last_n_ticks")
         elif table in ("ordering.store_orders", "fulfillment.orders", "transport.loads"):
             filter_slots.append("order_status")
+        elif table == "support.tickets":
+            filter_slots += ["ticket_status", "ticket_priority", "ticket_channel"]
+        elif table == "voice.calls":
+            filter_slots.append("call_disposition")
+        elif table == "survey.surveys":
+            filter_slots.append("survey_bucket")
+        elif table == "training.assignments":
+            filter_slots.append("training_status")
         filter_slots.append("row_limit")
 
         fcols = st.columns(min(len(filter_slots), 4))
@@ -1947,6 +2312,42 @@ with tab6:
                     dept = st.selectbox("Department", gr_depts, key="ex_dept")
                     if dept != "All":
                         extra["department"] = dept
+
+                elif slot == "sp_department":
+                    sp_depts = ["All", "agent", "team_lead", "qa", "training", "management"]
+                    dept = st.selectbox("Department", sp_depts, key="ex_dept")
+                    if dept != "All":
+                        extra["department"] = dept
+
+                elif slot == "ticket_status":
+                    ts = st.selectbox("Status", ["All", "new", "open", "pending", "resolved", "closed", "cancelled"], key="ex_tstatus")
+                    if ts != "All":
+                        extra["status"] = ts
+
+                elif slot == "ticket_priority":
+                    tp = st.selectbox("Priority", ["All", "low", "medium", "high", "urgent"], key="ex_tprio")
+                    if tp != "All":
+                        extra["priority"] = tp
+
+                elif slot == "ticket_channel":
+                    tc = st.selectbox("Channel", ["All", "email", "web", "phone", "chat", "social"], key="ex_tchan")
+                    if tc != "All":
+                        extra["channel"] = tc
+
+                elif slot == "call_disposition":
+                    cd = st.selectbox("Disposition", ["All", "resolved", "follow_up_ticket", "transferred", "voicemail", "abandoned_customer", "abandoned_timeout"], key="ex_cdisp")
+                    if cd != "All":
+                        extra["disposition"] = cd
+
+                elif slot == "survey_bucket":
+                    sb = st.selectbox("sNPS Bucket", ["All", "promoter", "passive", "detractor"], key="ex_sbucket")
+                    if sb != "All":
+                        extra["bucket"] = sb
+
+                elif slot == "training_status":
+                    tst = st.selectbox("Status", ["All", "assigned", "in_progress", "completed", "overdue", "expired"], key="ex_trstatus")
+                    if tst != "All":
+                        extra["status"] = tst
 
                 elif slot == "employee_status":
                     es = st.selectbox("Status", ["All", "active", "terminated", "on_leave"], key="ex_estatus")
@@ -2085,6 +2486,73 @@ The FastAPI service exposes a full Swagger UI at `/docs`.
 - `GET /gas-station/hr/employees` / `GET /gas-station/hr/locations`
 - `GET /gas-station/inventory/stock-levels`
 - `GET /gas-station/stats/generation` — per-tick stats
+- `GET /industries` — list all available industries
+""")
+    elif industry == "support":
+        st.markdown("""
+## Customer Support (Contact Center)
+
+Continuous mock data platform for a **customer-support contact center**.
+Simulates the ticketing system, voice phone ACD, live chat, sNPS survey
+system, and agent training system backed by the `support` PostgreSQL database.
+
+---
+
+### Source Systems
+
+| System | Schema | Description |
+|--------|--------|-------------|
+| **HR** | `hr` | Contact-center sites, agents with skill groups + handle-time profiles |
+| **Queues** | `support.queues` | Ticket queues (billing, technical, account, shipping, returns, escalations) with SLA targets |
+| **Customers** | `support.customers` | Customer master with tier + lifetime value |
+| **Ticketing** | `support.tickets` | Full lifecycle: create → assign → move/escalate → resolve → close, with reopen |
+| **Comments** | `support.ticket_comments` | Agent + customer + system comments (internal notes supported) |
+| **Audit** | `support.ticket_actions` | Immutable action trail: assigned, moved, escalated, status_change, sla_breached |
+| **Voice ACD** | `voice.calls` | Call detail records: wait, ring, talk, hold, ACW, abandonment, disposition |
+| **Live Chat** | `chat.sessions` / `chat.messages` | Chat sessions with full transcripts |
+| **Surveys** | `survey.surveys` | sNPS attached to closed interactions: 0–10 NPS, CSAT, reason, verbatim |
+| **Training** | `training.courses` / `training.assignments` | Courses + assignments triggered by onboarding, QA findings, launches |
+
+### Contact Flow
+
+```
+Customer contact (phone / chat / email / web / social)
+    → voice.calls or chat.sessions (ACD handling)
+    → support.tickets (follow-up / direct creation)
+    → assignment by skill group → queue movement / escalation
+    → comments + actions accumulate → resolved → closed (or reopened)
+    → survey.surveys (sNPS 1–2 days later)
+    → detractor clusters → training.assignments (qa_finding)
+```
+
+### Scenarios
+
+| Scenario | Effect |
+|----------|--------|
+| `normal` | Baseline contact volume (business-hours curve) |
+| `rush_hour` | 1.6× during 9–11am / 2–4pm peaks |
+| `weekend` | 0.65× baseline |
+| `service_outage` | 4× surge, negative sentiment, longer calls, abandonment ↑ |
+| `weather_outage` | 2.5× surge, queue stress ↑ |
+| `product_launch` | 1.8× how-to contacts, training triggers |
+| `marketing_blast` | 2.2× billing/account contacts |
+| `holiday_week` | 1.4× shipping/returns pressure |
+
+### API Reference
+
+The FastAPI service exposes a full Swagger UI at `/docs`.
+
+**Key endpoints (prefix: `/support/`):**
+- `GET /support/status` — generator state
+- `POST /support/generator/start` — start realtime or backfill
+- `POST /support/generator/scenarios` — activate a scenario
+- `GET /support/queues` / `GET /support/categories`
+- `GET /support/tickets?status=...&queue_id=...` — plus `/support/tickets/{id}` with comments + actions
+- `GET /support/voice/calls` / `GET /support/voice/summary`
+- `GET /support/chat/sessions` / `GET /support/chat/messages`
+- `GET /support/surveys` / `GET /support/surveys/scorecard`
+- `GET /support/training/courses` / `GET /support/training/assignments`
+- `GET /support/agents/performance` — per-agent tickets/calls/chats/sNPS
 - `GET /industries` — list all available industries
 """)
     else:

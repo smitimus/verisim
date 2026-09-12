@@ -1,0 +1,92 @@
+# Verisim Customer Support — self-contained dev stack
+# Services: postgres, api (support-only routes), ui, generator
+# Env comes from verisim/.env (VERISIM_* vars shared with the grocery stack;
+# support-specific ports default to 5501/8012/8502 to avoid grocery clashes).
+
+services:
+
+  verisim-support-dev-postgres:
+    container_name: verisim-support-dev-postgres
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER:-verisim}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD:-verisim}
+      POSTGRES_DB: ${VERISIM_SUPPORT_DB:-support}
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - ${CONF:-./_conf}/verisim-support-dev:/var/lib/postgresql
+    ports:
+      - "${VERISIM_SUPPORT_POSTGRES_PORT:-5501}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${VERISIM_POSTGRES_USER:-verisim}", "-d", "${VERISIM_SUPPORT_DB:-support}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - verisim_support_dev
+
+  verisim-support-dev-api:
+    container_name: verisim-support-dev-api
+    build:
+      context: ../
+      dockerfile: support/api/Dockerfile
+    environment:
+      POSTGRES_HOST: verisim-support-dev-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER:-verisim}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD:-verisim}
+      SUPPORT_DB: ${VERISIM_SUPPORT_DB:-support}
+      TZ: ${TZ:-America/New_York}
+    ports:
+      - "${VERISIM_SUPPORT_API_PORT:-8012}:8000"
+    depends_on:
+      verisim-support-dev-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - verisim_support_dev
+
+  verisim-support-dev-ui:
+    container_name: verisim-support-dev-ui
+    build:
+      context: ../base/ui
+      dockerfile: Dockerfile
+    environment:
+      API_BASE_URL: http://verisim-support-dev-api:8000
+      TZ: ${TZ:-America/New_York}
+    ports:
+      - "${VERISIM_SUPPORT_UI_PORT:-8502}:8501"
+    depends_on:
+      - verisim-support-dev-api
+    restart: unless-stopped
+    networks:
+      - verisim_support_dev
+
+  verisim-support-dev-generator:
+    container_name: verisim-support-dev-generator
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: verisim-support-dev-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER:-verisim}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD:-verisim}
+      POSTGRES_DB: ${VERISIM_SUPPORT_DB:-support}
+      CONF_PATH: /config/config.yaml
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    depends_on:
+      verisim-support-dev-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - verisim_support_dev
+
+networks:
+  verisim_support_dev:
+    name: verisim_support_dev
+    driver: bridge

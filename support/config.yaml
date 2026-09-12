@@ -1,0 +1,93 @@
+# =============================================================================
+# Customer-Support Industry — runtime configuration
+# Mounted read-only into the generator container; hot-reloaded every tick.
+# =============================================================================
+
+generator:
+  tick_interval_seconds: 30
+  simulation_minutes_per_tick: 15
+
+locations:
+  contact_center_count: 2
+  satellite_count: 2
+  agents_per_location:
+    min: 12
+    max: 25
+
+volumes:
+  tickets_per_day:
+    min: 180
+    max: 320
+  calls_per_day:
+    min: 400
+    max: 750
+  chats_per_day:
+    min: 120
+    max: 260
+  # Contact volume follows business hours — morning ramp, midday peak,
+  # evening taper (sums to 1.0)
+  hourly_weights: [0.0113, 0.0057, 0.0038, 0.0028, 0.0038, 0.0085,
+                   0.0236, 0.0491, 0.0736, 0.0868, 0.0913, 0.0849,
+                   0.0717, 0.0679, 0.0736, 0.0717, 0.0642, 0.0547,
+                   0.0425, 0.0330, 0.0264, 0.0208, 0.0160, 0.0123]
+  # Mondays are the support peak (weekend backlog); weekends drop hard
+  day_of_week_multipliers:
+    monday: 1.30
+    tuesday: 1.05
+    wednesday: 0.98
+    thursday: 0.97
+    friday: 1.02
+    saturday: 0.62
+    sunday: 0.55
+
+queues:
+  ticket_weight:
+    billing: 0.28
+    technical: 0.24
+    account: 0.16
+    shipping: 0.14
+    returns: 0.12
+    escalations: 0.06
+  phone_share: 0.52
+  chat_share: 0.20
+  email_share: 0.18
+  web_share: 0.07
+  social_share: 0.05
+  abandonment_rate: 0.065
+  transfer_rate: 0.14
+  first_contact_resolution_rate: 0.62
+  reopen_rate: 0.08
+
+customers:
+  initial_customer_count: 2500
+  new_customer_daily:
+    min: 4
+    max: 12
+  repeat_contact_rate: 0.45
+
+surveys:
+  response_rate_voice: 0.30
+  response_rate_chat: 0.45
+  response_rate_ticket: 0.22
+
+training:
+  qa_assignment_rate: 0.05
+  onboarding_within_days: 7
+
+scenarios:
+  service_outage:
+    volume_multiplier: 4.0
+    sentiment_shift: 0.45
+  product_launch:
+    volume_multiplier: 1.8
+  holiday_week:
+    volume_multiplier: 1.4
+  weather_outage:
+    volume_multiplier: 2.5
+  marketing_blast:
+    volume_multiplier: 2.2
+  rush_hour:
+    volume_multiplier: 1.6
+    hours: [9, 10, 11, 14, 15, 16]
+  weekend:
+    volume_multiplier: 0.65

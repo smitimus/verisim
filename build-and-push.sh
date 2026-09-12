@@ -23,9 +23,13 @@ case "$INDUSTRY" in
     IMAGE=smiti/verisim-gas-station
     DOCKERFILE=gas-station/standalone/Dockerfile
     ;;
+  support)
+    IMAGE=smiti/verisim-support
+    DOCKERFILE=support/standalone/Dockerfile
+    ;;
   *)
     echo "Unknown industry: $INDUSTRY"
-    echo "Usage: bash build-and-push.sh [grocery|gas-station] [version]"
+    echo "Usage: bash build-and-push.sh [grocery|gas-station|support] [version]"
     exit 1
     ;;
 esac
