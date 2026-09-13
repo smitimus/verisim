@@ -1,12 +1,24 @@
 """
 Scenario-engine tests for the support generator — pure logic, no DB.
 """
-import os
-import sys
 import unittest
 from datetime import datetime
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import os
+import sys
+
+# Both industries ship same-named packages (config, scenarios, models); when
+# the full suite runs in one pytest process the earlier import wins the
+# sys.modules cache. Purge + force our own path first.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_GEN = os.path.abspath(os.path.join(_HERE, '..'))
+for _m in [k for k in sys.modules
+           if k == 'config' or k == 'models' or k == 'scenarios'
+           or k.startswith('models.') or k.startswith('scenarios.')]:
+    sys.modules.pop(_m, None)
+while _GEN in sys.path:
+    sys.path.remove(_GEN)
+sys.path.insert(0, _GEN)
 
 from config import Config  # noqa: E402
 from scenarios.scenario_engine import (  # noqa: E402

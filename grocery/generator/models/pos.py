@@ -394,7 +394,7 @@ def seed_loyalty_members(conn, cfg: Config) -> List[Dict]:
 
     log.info("Seeded %d loyalty members with %d bonus point transactions",
              len(member_records), len(pt_records))
-    return _fetch_loyalty_members(cur)
+    return fetch_loyalty_members(conn)
 
 
 def _fetch_loyalty_members(cur) -> List[Dict]:

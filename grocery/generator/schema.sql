@@ -500,5 +500,44 @@ CREATE INDEX idx_loyalty_pts_member ON pos.loyalty_point_transactions (member_id
 CREATE INDEX idx_loyalty_pts_txn    ON pos.loyalty_point_transactions (transaction_id);
 CREATE INDEX idx_loyalty_pts_date   ON pos.loyalty_point_transactions (created_at);
 
+-- ---------------------------------------------------------------------------
+-- Phase 6: Customer returns & refunds (t_2382c671)
+-- A return references the original transaction; refund amounts are prorated
+-- from the transaction total so SUM(refunds) <= transactions.total always
+-- holds (dbt reconcilable). is_restocked drives stock reintegration.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE pos.returns (
+    return_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    transaction_id  UUID         NOT NULL REFERENCES pos.transactions(transaction_id),
+    location_id     UUID         NOT NULL REFERENCES hr.locations(location_id),
+    member_id       UUID         REFERENCES pos.loyalty_members(member_id),
+    return_dt       TIMESTAMPTZ  NOT NULL,
+    reason          VARCHAR(30)  NOT NULL
+                        CHECK (reason IN ('defective','wrong_item','changed_mind',
+                                          'damaged_in_transit','price_found_lower','other')),
+    refund_method   VARCHAR(20)  NOT NULL
+                        CHECK (refund_method IN ('original_payment','cash','store_credit')),
+    refund_amount   NUMERIC(10,2) NOT NULL CHECK (refund_amount >= 0),
+    is_restocked    BOOLEAN      NOT NULL DEFAULT FALSE,
+    scenario_tag    VARCHAR(50),
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE pos.return_items (
+    return_item_id      UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    return_id           UUID        NOT NULL REFERENCES pos.returns(return_id),
+    transaction_item_id UUID        NOT NULL REFERENCES pos.transaction_items(item_id),
+    product_id          UUID        NOT NULL REFERENCES pos.products(product_id),
+    quantity            NUMERIC(8,3) NOT NULL CHECK (quantity > 0),
+    refund_amount       NUMERIC(10,2) NOT NULL CHECK (refund_amount >= 0)
+);
+
+CREATE INDEX idx_returns_txn      ON pos.returns (transaction_id);
+CREATE INDEX idx_returns_dt       ON pos.returns (return_dt);
+CREATE INDEX idx_returns_location ON pos.returns (location_id, return_dt);
+CREATE INDEX idx_return_items_ret ON pos.return_items (return_id);
+CREATE INDEX idx_return_items_ti  ON pos.return_items (transaction_item_id);
+
 CREATE INDEX idx_hr_emp_location      ON hr.employees (location_id, status);
 CREATE INDEX idx_control_stats        ON control.generation_stats (recorded_at DESC);

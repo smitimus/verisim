@@ -32,7 +32,7 @@ import psycopg2.extras
 
 from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
-from models import shrinkage, promotions, scheduling
+from models import shrinkage, promotions, scheduling, returns
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
 logging.basicConfig(
@@ -394,6 +394,12 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         pos.seed_coupons(conn, cfg, departments, products)
         pos.seed_combo_deals(conn, cfg, departments, products)
 
+        # Phase 6: customer returns & refunds for transactions aged 2-14 days
+        # (reversals + stock reintegration)
+        restock = returns.generate_returns(conn, cfg, sim_dt, scenario)
+        if restock:
+            returns.restock_returns(conn, restock)
+
     elapsed_ms = round((time.monotonic() - tick_start) * 1000)
     record_stats(conn, pos_count, tc_count, orders_count,
                  scenario.scenario_tag, sim_dt, elapsed_ms)
@@ -547,6 +553,14 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # a 30-day backfill must not leave deals expired at the end.
             pos.seed_coupons(conn, cfg, departments, products)
             pos.seed_combo_deals(conn, cfg, departments, products)
+
+            # Phase 6: returns for transactions aged 2-14 days relative to
+            # this backfill day (same contract as realtime).
+            restock = returns.generate_returns(conn, cfg,
+                datetime(cur_date.year, cur_date.month, cur_date.day, 23, 30),
+                eod_scenario)
+            if restock:
+                returns.restock_returns(conn, restock)
 
         with conn.cursor() as cur:
             cur.execute("""

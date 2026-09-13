@@ -392,6 +392,19 @@ def _clear_date_range(industry: str, start: date, end: date) -> None:
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
+            # Returns reference transaction_items + transactions — clear
+            # children first (t_2382c671 Phase 6 tables).
+            cur.execute(
+                "DELETE FROM pos.return_items "
+                "WHERE return_id IN ("
+                "  SELECT return_id FROM pos.returns"
+                "  WHERE return_dt BETWEEN %s AND %s)",
+                (start_ts, end_ts))
+            cur.execute(
+                "DELETE FROM pos.returns "
+                "WHERE return_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+
             # POS: items + loyalty points → transactions
             cur.execute(
                 "DELETE FROM pos.transaction_items "
@@ -1797,6 +1810,69 @@ def stats_distributions(industry: str, days: int = Query(30, ge=1, le=365)):
         """, [days], industry)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Grocery only: Customer Returns & Refunds
+# ---------------------------------------------------------------------------
+
+@app.get("/grocery/pos/returns", tags=["Grocery — POS"])
+def grocery_returns(
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    location_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    limit: int = Query(1000, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("r.return_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("r.return_dt <= %s"); params.append(end_dt)
+    if location_id:
+        filters.append("r.location_id = %s::uuid"); params.append(location_id)
+    if reason:
+        filters.append("r.reason = %s"); params.append(reason)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM pos.returns r WHERE {where}",
+                  params, "grocery")[0]["n"]
+    rows = query(f"""
+        SELECT r.return_id, r.transaction_id, r.location_id, r.member_id,
+               r.return_dt, r.reason, r.refund_method, r.refund_amount,
+               r.is_restocked, r.scenario_tag, r.created_at
+        FROM pos.returns r WHERE {where}
+        ORDER BY r.return_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/grocery/pos/return-items", tags=["Grocery — POS"])
+def grocery_return_items(
+    return_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    limit: int = Query(1000, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if return_id:
+        filters.append("ri.return_id = %s::uuid"); params.append(return_id)
+    if product_id:
+        filters.append("ri.product_id = %s::uuid"); params.append(product_id)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM pos.return_items ri WHERE {where}",
+                  params, "grocery")[0]["n"]
+    rows = query(f"""
+        SELECT ri.return_item_id, ri.return_id, ri.transaction_item_id,
+               ri.product_id, p.name AS product_name, ri.quantity,
+               ri.refund_amount, r.return_dt, r.transaction_id
+        FROM pos.return_items ri
+        JOIN pos.products p ON p.product_id = ri.product_id
+        JOIN pos.returns r ON r.return_id = ri.return_id
+        WHERE {where}
+        ORDER BY r.return_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 # ---------------------------------------------------------------------------

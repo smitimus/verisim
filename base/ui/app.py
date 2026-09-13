@@ -611,6 +611,38 @@ GROCERY_TABLE_DOCS = {
         "relationships": ["pos.combo_deals.department_id → pos.departments.department_id"],
         "notes": "deal_savings on pos.transactions reflects total combo deal savings.",
     },
+    "pos.returns": {
+        "title": "POS — Customer Returns",
+        "description": "Return events referencing an original transaction. Refund amounts are prorated from the transaction total, so SUM(refund_amount) reconciles against pos.transactions.total.",
+        "columns": [
+            ("return_id", "UUID PK", "Primary key"),
+            ("transaction_id", "UUID FK → pos.transactions", "Original sale"),
+            ("location_id", "UUID FK → hr.locations", "Store accepting the return"),
+            ("member_id", "UUID FK → pos.loyalty_members", "Loyalty member (nullable)"),
+            ("return_dt", "TIMESTAMPTZ", "When the return happened"),
+            ("reason", "VARCHAR(30)", "defective, wrong_item, changed_mind, damaged_in_transit, price_found_lower, other"),
+            ("refund_method", "VARCHAR(20)", "original_payment, cash, or store_credit"),
+            ("refund_amount", "NUMERIC(10,2)", "Money returned"),
+            ("is_restocked", "BOOLEAN", "TRUE when goods went back on the shelf"),
+            ("scenario_tag", "VARCHAR(50)", "Active scenario at generation time"),
+        ],
+        "relationships": ["pos.returns.transaction_id → pos.transactions", "Referenced by pos.return_items"],
+        "notes": "One return per transaction maximum. Defective/damaged goods are written off (is_restocked=FALSE); sellable goods flow back into inv.stock_levels.",
+    },
+    "pos.return_items": {
+        "title": "POS — Return Line Items",
+        "description": "Line-level detail of what was returned, referencing the original transaction_items rows.",
+        "columns": [
+            ("return_item_id", "UUID PK", "Primary key"),
+            ("return_id", "UUID FK → pos.returns", "Parent return"),
+            ("transaction_item_id", "UUID FK → pos.transaction_items", "Original line sold"),
+            ("product_id", "UUID FK → pos.products", "Product returned"),
+            ("quantity", "NUMERIC(8,3)", "Units returned (≤ sold quantity)"),
+            ("refund_amount", "NUMERIC(10,2)", "Prorated refund for this line"),
+        ],
+        "relationships": ["pos.return_items.return_id → pos.returns", "pos.return_items.transaction_item_id → pos.transaction_items"],
+        "notes": "Return quantity can be a partial of the original line (e.g. 2 of 3 units).",
+    },
     "pos.loyalty_members": {
         "title": "POS — Loyalty Members",
         "description": "Customer loyalty program members. Loyalty members get coupon discounts.",
@@ -878,6 +910,8 @@ GROCERY_SCHEMA_TABLES = {
     "POS": [
         ("pos.transactions", "Transactions"),
         ("pos.transaction_items", "Transaction Items"),
+        ("pos.returns", "Customer Returns"),
+        ("pos.return_items", "Return Line Items"),
         ("pos.products", "Products"),
         ("pos.departments", "Departments"),
         ("pos.coupons", "Coupons"),
@@ -1163,6 +1197,7 @@ NEEDS_DATES = {
     "timeclock.events", "ordering.store_orders", "transport.loads",
     "support.tickets", "support.ticket_comments", "support.ticket_actions",
     "voice.calls", "chat.sessions", "survey.surveys",
+    "pos.returns",
 }
 
 # Tables that support location filter
@@ -1254,6 +1289,13 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
         return flat(f"{pfx}/fuel/pumps", p)
 
     # --- Grocery-only tables ---
+    if table == "pos.returns":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("reason"):
+            p["reason"] = extra["reason"]
+        return paged(f"{pfx}/pos/returns", p)
+    if table == "pos.return_items":
+        return paged(f"{pfx}/pos/return-items", p)
     if table == "pos.departments":
         return flat(f"{pfx}/pos/departments", {})
     if table == "pos.coupons":
@@ -2267,6 +2309,8 @@ with tab6:
                 filter_slots += ["sp_department", "employee_status"]
             else:
                 filter_slots += ["gr_department", "employee_status"]
+        elif table == "pos.returns":
+            filter_slots.append("return_reason")
         elif table == "pos.products":
             filter_slots.append("category")
         elif table == "pos.loyalty_members":
@@ -2353,6 +2397,14 @@ with tab6:
                     es = st.selectbox("Status", ["All", "active", "terminated", "on_leave"], key="ex_estatus")
                     if es != "All":
                         extra["status"] = es
+
+                elif slot == "return_reason":
+                    rr = st.selectbox("Return Reason",
+                                      ["All", "defective", "wrong_item", "changed_mind",
+                                       "damaged_in_transit", "price_found_lower", "other"],
+                                      key="ex_rreason")
+                    if rr != "All":
+                        extra["reason"] = rr
 
                 elif slot == "category":
                     if industry == "gas-station":
