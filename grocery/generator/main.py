@@ -32,7 +32,7 @@ import psycopg2.extras
 
 from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
-from models import shrinkage, promotions, scheduling, returns
+from models import shrinkage, promotions, scheduling, returns, online
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
 logging.basicConfig(
@@ -351,6 +351,13 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     # Timeclock events
     tc_count = timeclock.generate_events(conn, sim_dt, employees, locations)
 
+    # Online orders (e-commerce pickup + delivery) — same shelves as POS
+    online_depletion = online.generate_online_orders(
+        conn, cfg, sim_dt, scenario, locations['stores'], products, members)
+    if online_depletion:
+        inventory.deplete_online_inventory(conn, online_depletion)
+    online.advance_online_lifecycle(conn, cfg, sim_dt)
+
     # Probabilistic events
     pos.maybe_update_product_prices(conn, cfg, products, scenario)
     hr.maybe_hire_employee(conn, cfg, locations)
@@ -504,6 +511,14 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             )
             if depletion:
                 inventory.deplete_inventory(conn, depletion)
+
+            # Online orders for this hour (placed + lifecycle advanced in
+            # time order so statuses converge realistically).
+            online_depletion = online.generate_online_orders(
+                conn, cfg, sim_dt, scenario, locations['stores'], products, members)
+            if online_depletion:
+                inventory.deplete_online_inventory(conn, online_depletion)
+            online.advance_online_lifecycle(conn, cfg, sim_dt)
 
             # Partial day: generate timeclock events per-hour using the same
             # idempotent realtime logic (checks existing events before inserting).

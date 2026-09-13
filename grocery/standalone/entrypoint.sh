@@ -6,7 +6,7 @@ PG_BIN=/usr/lib/postgresql/18/bin
 PG_CTL="$PG_BIN/pg_ctl"
 PSQL="$PG_BIN/psql"
 INITDB="$PG_BIN/initdb"
-SCHEMAS="hr,pos,timeclock,ordering,fulfillment,transport,inv,control,pricing"
+SCHEMAS="hr,pos,timeclock,ordering,fulfillment,transport,inv,control,pricing,online"
 
 POSTGRES_USER=${POSTGRES_USER:-verisim}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-verisim}

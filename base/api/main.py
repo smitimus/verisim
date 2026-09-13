@@ -392,6 +392,23 @@ def _clear_date_range(industry: str, start: date, end: date) -> None:
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
+            # Online orders: events + items → orders (children first)
+            cur.execute(
+                "DELETE FROM online.order_events "
+                "WHERE order_id IN ("
+                "  SELECT order_id FROM online.orders"
+                "  WHERE placed_dt BETWEEN %s AND %s)",
+                (start_ts, end_ts))
+            cur.execute(
+                "DELETE FROM online.order_items "
+                "WHERE order_id IN ("
+                "  SELECT order_id FROM online.orders"
+                "  WHERE placed_dt BETWEEN %s AND %s)",
+                (start_ts, end_ts))
+            cur.execute(
+                "DELETE FROM online.orders WHERE placed_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+
             # Returns reference transaction_items + transactions — clear
             # children first (t_2382c671 Phase 6 tables).
             cur.execute(
@@ -1873,6 +1890,119 @@ def grocery_return_items(
         ORDER BY r.return_dt DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# Grocery only: Online orders (e-commerce pickup + delivery)
+# ---------------------------------------------------------------------------
+
+@app.get("/grocery/online/orders", tags=["Grocery — Online"])
+def online_orders(
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    location_id: Optional[str] = None,
+    status: Optional[str] = None,
+    fulfillment_type: Optional[str] = None,
+    limit: int = Query(1000, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("o.placed_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("o.placed_dt <= %s"); params.append(end_dt)
+    if location_id:
+        filters.append("o.location_id = %s::uuid"); params.append(location_id)
+    if status:
+        filters.append("o.status = %s"); params.append(status)
+    if fulfillment_type:
+        filters.append("o.fulfillment_type = %s"); params.append(fulfillment_type)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM online.orders o WHERE {where}",
+                  params, "grocery")[0]["n"]
+    rows = query(f"""
+        SELECT o.order_id, o.order_number, o.location_id, o.member_id,
+               o.placed_dt, o.fulfillment_type, o.status, o.subtotal,
+               o.service_fee, o.tax, o.total, o.payment_method,
+               o.pickup_window_start, o.pickup_window_end,
+               o.promised_delivery_dt, o.completed_dt, o.scenario_tag
+        FROM online.orders o WHERE {where}
+        ORDER BY o.placed_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/grocery/online/order-items", tags=["Grocery — Online"])
+def online_order_items(
+    order_id: Optional[str] = None,
+    limit: int = Query(2000, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if order_id:
+        filters.append("oi.order_id = %s::uuid"); params.append(order_id)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM online.order_items oi WHERE {where}",
+                  params, "grocery")[0]["n"]
+    rows = query(f"""
+        SELECT oi.item_id, oi.order_id, oi.product_id, p.name AS product_name,
+               oi.quantity, oi.unit_price, oi.line_total, o.placed_dt
+        FROM online.order_items oi
+        JOIN online.orders o ON o.order_id = oi.order_id
+        JOIN pos.products p ON p.product_id = oi.product_id
+        WHERE {where}
+        ORDER BY o.placed_dt DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/grocery/online/order-events", tags=["Grocery — Online"])
+def online_order_events(
+    order_id: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = Query(2000, le=5000),
+    offset: int = 0,
+):
+    filters, params = ["TRUE"], []
+    if order_id:
+        filters.append("e.order_id = %s::uuid"); params.append(order_id)
+    if start_dt:
+        filters.append("e.event_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("e.event_dt <= %s"); params.append(end_dt)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM online.order_events e WHERE {where}",
+                  params, "grocery")[0]["n"]
+    rows = query(f"""
+        SELECT e.event_id, e.order_id, e.event_type, e.event_dt, e.note
+        FROM online.order_events e WHERE {where}
+        ORDER BY e.event_dt LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/grocery/online/summary", tags=["Grocery — Online"])
+def online_summary(start_dt: Optional[datetime] = None,
+                   end_dt: Optional[datetime] = None):
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("placed_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("placed_dt <= %s"); params.append(end_dt)
+    where = " AND ".join(filters)
+    return query(f"""
+        SELECT COUNT(*) AS orders_placed,
+               COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+               COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+               COUNT(*) FILTER (WHERE status = 'no_show') AS no_shows,
+               COUNT(*) FILTER (WHERE fulfillment_type = 'pickup') AS pickups,
+               COUNT(*) FILTER (WHERE fulfillment_type = 'delivery') AS deliveries,
+               ROUND(SUM(total)::numeric, 2) AS total_revenue,
+               ROUND(AVG(EXTRACT(EPOCH FROM (completed_dt - placed_dt))/3600)
+                     FILTER (WHERE completed_dt IS NOT NULL)::numeric, 2) AS avg_fulfillment_hours
+        FROM online.orders WHERE {where}
+    """, params, "grocery")[0]
 
 
 # ---------------------------------------------------------------------------

@@ -133,3 +133,32 @@ def deplete_inventory(conn, depletion_info: List[Dict]) -> None:
                 WHERE product_id = %s::uuid AND location_id = %s::uuid
             """, (int(qty), str(prod_id), str(loc_id)))
     conn.commit()
+
+
+def deplete_online_inventory(conn, depletion_info: List[Dict]) -> None:
+    """
+    Reduce inv.stock_levels for items in a batch of ONLINE orders.
+    depletion_info: list of {transaction_id (=order_id), items: [{product_id, quantity}]}
+    (t_24fae529 — online demand pulls the same store shelves.)
+    """
+    if not depletion_info:
+        return
+
+    order_ids = [d['transaction_id'] for d in depletion_info]
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE inv.stock_levels sl
+            SET quantity_on_hand = GREATEST(0, sl.quantity_on_hand - v.qty),
+                last_updated = NOW()
+            FROM (
+                SELECT o.location_id, oi.product_id,
+                       SUM(oi.quantity)::integer AS qty
+                FROM online.orders o
+                JOIN online.order_items oi ON oi.order_id = o.order_id
+                WHERE o.order_id = ANY(%s::uuid[])
+                GROUP BY 1, 2
+            ) v
+            WHERE sl.location_id = v.location_id AND sl.product_id = v.product_id
+        """, (order_ids,))
+    conn.commit()

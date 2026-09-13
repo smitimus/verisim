@@ -172,6 +172,15 @@ combo_deals:
   valid_duration_days: 7
   combo_use_rate: 0.15             # probability a transaction triggers a deal
 
+online:
+  orders_per_day:
+    min: 90
+    max: 170
+  pickup_share: 0.45               # share of online orders fulfilled as pickup
+  service_fee_delivery: 5.99       # flat fee per delivery order
+  cancel_rate: 0.06                # placed orders cancelled before ready
+  noshow_rate: 0.05                # ready pickup orders that pass window uncalled
+
 scenarios:
   rush_hour:
     volume_multiplier: 2.0

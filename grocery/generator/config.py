@@ -74,6 +74,16 @@ class TransportConfig:
 
 
 @dataclass
+class OnlineConfig:
+    orders_per_day_min: int = 90
+    orders_per_day_max: int = 170
+    pickup_share: float = 0.45
+    service_fee_delivery: float = 5.99
+    cancel_rate: float = 0.06     # per placed order, before ready
+    noshow_rate: float = 0.05     # ready orders that pass window uncalled
+
+
+@dataclass
 class ComboDealConfig:
     active_at_any_time: int = 4
     valid_duration_days: int = 7
@@ -120,6 +130,7 @@ class Config:
     coupons: CouponConfig = field(default_factory=CouponConfig)
     combo_deals: ComboDealConfig = field(default_factory=ComboDealConfig)
     transport: TransportConfig = field(default_factory=TransportConfig)
+    online: OnlineConfig = field(default_factory=OnlineConfig)
     scenarios: ScenarioConfig = field(default_factory=ScenarioConfig)
 
     # Department/product catalog (populated from YAML)
@@ -237,6 +248,16 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
     trp = data.get('transport', {})
     if 'cost_per_mile' in trp:
         cfg.transport.cost_per_mile = float(trp['cost_per_mile'])
+
+    onl = data.get('online', {})
+    opd = onl.get('orders_per_day', {})
+    if 'min' in opd:
+        cfg.online.orders_per_day_min = int(opd['min'])
+    if 'max' in opd:
+        cfg.online.orders_per_day_max = int(opd['max'])
+    for key in ['pickup_share', 'service_fee_delivery', 'cancel_rate', 'noshow_rate']:
+        if key in onl:
+            setattr(cfg.online, key, float(onl[key]))
 
     sc = data.get('scenarios', {})
     rh = sc.get('rush_hour', {})

@@ -919,6 +919,11 @@ GROCERY_SCHEMA_TABLES = {
         ("pos.loyalty_members", "Loyalty Members"),
         ("pos.price_history", "Product Price History"),
     ],
+    "Online": [
+        ("online.orders", "Online Orders"),
+        ("online.order_items", "Order Items"),
+        ("online.order_events", "Lifecycle Events"),
+    ],
     "Timeclock": [
         ("timeclock.events", "Clock Events"),
     ],
@@ -1198,6 +1203,7 @@ NEEDS_DATES = {
     "support.tickets", "support.ticket_comments", "support.ticket_actions",
     "voice.calls", "chat.sessions", "survey.surveys",
     "pos.returns",
+    "online.orders",
 }
 
 # Tables that support location filter
@@ -1206,6 +1212,7 @@ NEEDS_LOCATION = {
     "fuel.transactions", "fuel.pumps", "inv.stock_levels",
     "inv.receipts", "inv.receipt_items",
     "timeclock.events", "ordering.store_orders", "transport.loads",
+    "online.orders",
 }
 
 
@@ -1296,6 +1303,17 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
         return paged(f"{pfx}/pos/returns", p)
     if table == "pos.return_items":
         return paged(f"{pfx}/pos/return-items", p)
+    if table == "online.orders":
+        p.update({"start_dt": sd, "end_dt": ed})
+        if extra.get("status"):
+            p["status"] = extra["status"]
+        if extra.get("fulfillment_type"):
+            p["fulfillment_type"] = extra["fulfillment_type"]
+        return paged(f"{pfx}/online/orders", p)
+    if table == "online.order_items":
+        return paged(f"{pfx}/online/order-items", p)
+    if table == "online.order_events":
+        return paged(f"{pfx}/online/order-events", p)
     if table == "pos.departments":
         return flat(f"{pfx}/pos/departments", {})
     if table == "pos.coupons":
@@ -2311,6 +2329,8 @@ with tab6:
                 filter_slots += ["gr_department", "employee_status"]
         elif table == "pos.returns":
             filter_slots.append("return_reason")
+        elif table == "online.orders":
+            filter_slots += ["online_status", "online_fulfillment"]
         elif table == "pos.products":
             filter_slots.append("category")
         elif table == "pos.loyalty_members":
@@ -2405,6 +2425,20 @@ with tab6:
                                       key="ex_rreason")
                     if rr != "All":
                         extra["reason"] = rr
+
+                elif slot == "online_status":
+                    os_ = st.selectbox("Order Status",
+                                       ["All", "placed", "confirmed", "picking", "ready",
+                                        "out_for_delivery", "completed", "no_show", "cancelled"],
+                                       key="ex_ostatus_o")
+                    if os_ != "All":
+                        extra["status"] = os_
+
+                elif slot == "online_fulfillment":
+                    ft = st.selectbox("Fulfillment", ["All", "pickup", "delivery"],
+                                      key="ex_oftype")
+                    if ft != "All":
+                        extra["fulfillment_type"] = ft
 
                 elif slot == "category":
                     if industry == "gas-station":

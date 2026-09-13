@@ -539,5 +539,73 @@ CREATE INDEX idx_returns_location ON pos.returns (location_id, return_dt);
 CREATE INDEX idx_return_items_ret ON pos.return_items (return_id);
 CREATE INDEX idx_return_items_ti  ON pos.return_items (transaction_item_id);
 
+-- ---------------------------------------------------------------------------
+-- Phase 7: Online orders — e-commerce channel (pickup + delivery) (t_24fae529)
+-- Mirrors a real online-order system as its own source schema: order header,
+-- line items, and an append-only lifecycle event stream (placed→confirmed→
+-- picking→ready/out_for_delivery→completed|no_show|cancelled).
+-- ---------------------------------------------------------------------------
+
+CREATE SCHEMA IF NOT EXISTS online;
+
+CREATE TABLE online.orders (
+    order_id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_number        BIGSERIAL    UNIQUE NOT NULL,
+    location_id         UUID         NOT NULL REFERENCES hr.locations(location_id),
+    member_id           UUID         REFERENCES pos.loyalty_members(member_id),
+    placed_dt           TIMESTAMPTZ  NOT NULL,
+    fulfillment_type    VARCHAR(20)  NOT NULL
+                            CHECK (fulfillment_type IN ('pickup', 'delivery')),
+    status              VARCHAR(30)  NOT NULL DEFAULT 'placed'
+                            CHECK (status IN ('placed', 'confirmed', 'picking',
+                                              'ready', 'out_for_delivery',
+                                              'completed', 'no_show', 'cancelled')),
+    subtotal            NUMERIC(10,2) NOT NULL,
+    service_fee         NUMERIC(10,2) NOT NULL DEFAULT 0,
+    tax                 NUMERIC(10,2) NOT NULL,
+    total               NUMERIC(10,2) NOT NULL,
+    payment_method      VARCHAR(20)  NOT NULL
+                            CHECK (payment_method IN ('credit', 'debit', 'mobile_pay')),
+    pickup_window_start TIMESTAMPTZ,
+    pickup_window_end   TIMESTAMPTZ,
+    promised_delivery_dt TIMESTAMPTZ,
+    completed_dt        TIMESTAMPTZ,
+    customer_count      SMALLINT,          -- party size for no-show realism
+    scenario_tag        VARCHAR(50),
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE online.order_items (
+    item_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id    UUID        NOT NULL REFERENCES online.orders(order_id),
+    product_id  UUID        NOT NULL REFERENCES pos.products(product_id),
+    quantity    NUMERIC(8,3) NOT NULL CHECK (quantity > 0),
+    unit_price  NUMERIC(8,2) NOT NULL,
+    line_total  NUMERIC(10,2) NOT NULL
+);
+
+CREATE TABLE online.order_events (
+    event_id    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id    UUID         NOT NULL REFERENCES online.orders(order_id),
+    event_type  VARCHAR(30)  NOT NULL
+                    CHECK (event_type IN ('placed', 'confirmed', 'picking_started',
+                                          'ready_for_pickup', 'driver_assigned',
+                                          'out_for_delivery', 'delivered',
+                                          'picked_up', 'no_show', 'cancelled',
+                                          'reminder_sent')),
+    event_dt    TIMESTAMPTZ  NOT NULL,
+    note        VARCHAR(200),
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_online_orders_placed   ON online.orders (placed_dt);
+CREATE INDEX idx_online_orders_status   ON online.orders (status, fulfillment_type);
+CREATE INDEX idx_online_orders_location ON online.orders (location_id, placed_dt);
+CREATE INDEX idx_online_orders_member   ON online.orders (member_id);
+CREATE INDEX idx_online_items_order     ON online.order_items (order_id);
+CREATE INDEX idx_online_items_product   ON online.order_items (product_id);
+CREATE INDEX idx_online_events_order    ON online.order_events (order_id, event_dt);
+
 CREATE INDEX idx_hr_emp_location      ON hr.employees (location_id, status);
 CREATE INDEX idx_control_stats        ON control.generation_stats (recorded_at DESC);
