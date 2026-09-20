@@ -12,6 +12,5 @@ pandas==2.2.3
 plotly==5.24.1
 
 # Generator (verisim-gas-station/generator)
-Faker==33.1.0
-pyyaml==6.0.2
-tzdata==2025.1
+faker==24.0.0
+pyyaml==6.0.1

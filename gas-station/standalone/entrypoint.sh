@@ -2,7 +2,7 @@
 set -e
 
 PG_DATA=/var/lib/postgresql/data
-PG_BIN=/usr/lib/postgresql/16/bin
+PG_BIN=/usr/lib/postgresql/18/bin
 PG_CTL="$PG_BIN/pg_ctl"
 PSQL="$PG_BIN/psql"
 INITDB="$PG_BIN/initdb"
@@ -34,7 +34,7 @@ if [ ! -f "$PG_DATA/PG_VERSION" ]; then
 
     echo "[entrypoint] Applying schema..."
     su -s /bin/bash postgres -c \
-        "$PSQL -d $POSTGRES_DB -f /app/schema.sql"
+        "$PSQL -d $POSTGRES_DB -f /app/generator/schema.sql"
 
     # Grant all on each schema
     for schema in ${SCHEMAS//,/ }; do

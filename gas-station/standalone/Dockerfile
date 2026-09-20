@@ -1,7 +1,7 @@
 # =============================================================================
 # Verisim Gas Station — Standalone Image
 # =============================================================================
-# All-in-one container: PostgreSQL 16 + FastAPI + Streamlit + Generator.
+# All-in-one container: PostgreSQL 18 + FastAPI + Streamlit + Generator.
 # Managed by supervisord. Build context: /opt/verisim/
 #
 # Build (from /opt/verisim/):
@@ -15,10 +15,10 @@
 #
 # Run:
 #   docker run -d \
-#     -p 8010:8000 -p 8501:8501 -p 5432:5432 \
-#     -v verisim_data:/var/lib/postgresql/data \
+#     -p 8011:8000 -p 8502:8501 -p 5500:5432 \
+#     -v verisim_gas_data:/var/lib/postgresql/data \
 #     [-e POSTGRES_USER=verisim] \
-#     [-e POSTGRES_PASSWORD=verisim] \
+#     [-e POSTGRES_PASSWORD=*** \
 #     [-e POSTGRES_DB=gas_station] \
 #     smiti/verisim-gas-station:latest
 # =============================================================================
@@ -40,7 +40,7 @@ LABEL org.opencontainers.image.title="Verisim Gas Station" \
       org.opencontainers.image.description="Gas station / convenience store mock data generator — PostgreSQL + API + UI + Generator" \
       org.opencontainers.image.source="https://github.com/smiti/verisim"
 
-# Install PostgreSQL 16 from the official PGDG apt repository + supervisor
+# Install PostgreSQL 18 from the official PGDG apt repository + supervisor
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     gnupg curl ca-certificates lsb-release supervisor locales \
@@ -52,28 +52,18 @@ RUN apt-get update \
     https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
     > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends postgresql-16 \
+ && apt-get install -y --no-install-recommends postgresql-18 \
  && rm -rf /var/lib/apt/lists/*
 
 # Python venv from stage 1
 COPY --from=deps /app/venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-# ── API: strip grocery routes at build time ───────────────────────────────────
-COPY gas-station/standalone/strip_grocery.py /tmp/strip_grocery.py
-COPY base/api/main.py /tmp/api_src.py
-RUN mkdir -p /app/api \
- && python /tmp/strip_grocery.py /tmp/api_src.py /app/api/main.py \
- && rm /tmp/strip_grocery.py /tmp/api_src.py
-
 # ── UI ────────────────────────────────────────────────────────────────────────
 COPY base/ui/app.py /app/ui/app.py
 
-# ── Generator ─────────────────────────────────────────────────────────────────
+# ── Generator (schema.sql ships with it — self-bootstrapping) ─────────────────
 COPY gas-station/generator/ /app/generator/
-
-# ── Schema (gas station DB init SQL) ─────────────────────────────────────────
-COPY base/db/init.sql /app/schema.sql
 
 # ── Default config (overridable by volume mount at /config/config.yaml) ──────
 COPY gas-station/config.yaml /app/config.yaml
@@ -82,6 +72,13 @@ COPY gas-station/config.yaml /app/config.yaml
 COPY gas-station/standalone/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY gas-station/standalone/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# ── API: strip grocery + support routes at build time ─────────────────────────
+COPY gas-station/standalone/strip_grocery.py /tmp/strip_grocery.py
+COPY base/api/main.py /tmp/api_src.py
+RUN mkdir -p /app/api \
+ && python /tmp/strip_grocery.py /tmp/api_src.py /app/api/main.py \
+ && rm /tmp/strip_grocery.py /tmp/api_src.py
 
 # ── Postgres directories ──────────────────────────────────────────────────────
 RUN mkdir -p /var/lib/postgresql/data /config /var/log/supervisor \

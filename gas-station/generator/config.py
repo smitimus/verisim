@@ -78,7 +78,7 @@ class Config:
     db_port: int = 5432
     db_user: str = 'verisim'
     db_password: str = 'verisim'
-    db_name: str = 'gasstation'
+    db_name: str = 'gas_station'
     conf_path: str = '/config/config.yaml'
 
     generator: GeneratorConfig = field(default_factory=GeneratorConfig)
@@ -117,7 +117,7 @@ def load_config() -> Config:
         db_port=int(os.environ.get('POSTGRES_PORT', 5432)),
         db_user=os.environ.get('POSTGRES_USER', 'verisim'),
         db_password=os.environ.get('POSTGRES_PASSWORD', 'verisim'),
-        db_name=os.environ.get('POSTGRES_DB', 'gasstation'),
+        db_name=os.environ.get('POSTGRES_DB', 'gas_station'),
         conf_path=conf_path,
     )
     _apply_yaml(cfg, _load_yaml(conf_path))
@@ -174,7 +174,12 @@ def _apply_yaml(cfg: Config, data: dict) -> None:
     if 'max' in fuel_d:
         cfg.volumes.fuel_transactions_per_day_max = int(fuel_d['max'])
     if 'hourly_weights' in vol:
-        cfg.volumes.hourly_weights = [float(x) for x in vol['hourly_weights']]
+        # The scenario engine scales volume by (weight * 24), which assumes the
+        # 24 weights sum to 1.0. Normalize whatever the user provided.
+        raw = [float(x) for x in vol['hourly_weights']]
+        total = sum(raw)
+        if len(raw) == 24 and total > 0:
+            cfg.volumes.hourly_weights = [w / total for w in raw]
     if 'day_of_week_multipliers' in vol:
         cfg.volumes.day_of_week_multipliers = {k: float(v) for k, v in vol['day_of_week_multipliers'].items()}
 
@@ -206,6 +211,21 @@ def _apply_yaml(cfg: Config, data: dict) -> None:
         cfg.scenarios.rush_hour_multiplier = float(rh['volume_multiplier'])
     if 'hours' in rh:
         cfg.scenarios.rush_hour_hours = list(rh['hours'])
+
+    we = sc.get('weekend', {})
+    if 'volume_multiplier' in we:
+        cfg.scenarios.weekend_multiplier = float(we['volume_multiplier'])
+
+    pro = sc.get('promotion', {})
+    if 'discount_pct' in pro:
+        cfg.scenarios.promotion_discount_pct = float(pro['discount_pct'])
+    if 'affected_categories' in pro:
+        cfg.scenarios.promotion_categories = list(pro['affected_categories'])
+
+    fs = sc.get('fuel_spike', {})
+    if 'price_increase_pct' in fs:
+        cfg.scenarios.fuel_spike_increase_pct = float(fs['price_increase_pct'])
+
     if 'products' in data:
         prods = data['products']
         if 'initial_count' in prods:

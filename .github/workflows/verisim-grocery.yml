@@ -28,8 +28,13 @@ jobs:
 
       # Hard-fail: any generator test failure or coverage regression blocks the build.
       # Coverage floor lives in pyproject.toml [tool.coverage.report] fail_under.
-      - name: Run generator tests (blocking, with coverage floor)
+      # Grocery suite carries the coverage gate; gas-station + support suites
+      # run blocking without their own coverage floor.
+      - name: Run grocery generator tests (blocking, with coverage floor)
         run: python -m pytest grocery/generator/tests/ -v --cov=grocery/generator --cov-report=term
+
+      - name: Run gas-station + support generator tests (blocking)
+        run: python -m pytest gas-station/generator/tests/ support/generator/tests/ -v
 
   integration:
     name: Build standalone image + smoke + API contract tests

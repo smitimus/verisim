@@ -1,0 +1,37 @@
+# 260912 - added (gas-station standalone parity, t_a6ecb731)
+# Verisim Gas Station — local standalone test stack
+# Runs the locally-built standalone image (verisim-gas-station:local) before
+# pushing to Docker Hub. Build first:
+#   docker build -t verisim-gas-station:local -f gas-station/standalone/Dockerfile .
+# Default ports offset from grocery (5500/8011/8502) so both test stacks can
+# coexist; override with VERISIM_GAS_* env.
+
+services:
+
+  verisim-gas-station-test:
+    container_name: verisim-gas-station-test
+    image: verisim-gas-station:local
+    ports:
+      - "${VERISIM_GAS_POSTGRES_PORT:-5500}:5432"
+      - "${VERISIM_GAS_API_PORT:-8011}:8000"
+      - "${VERISIM_GAS_UI_PORT:-8502}:8501"
+    environment:
+      POSTGRES_USER: ${VERISIM_POSTGRES_USER:-verisim}
+      POSTGRES_PASSWORD: ${VERISIM_POSTGRES_PASSWORD:-verisim}
+      POSTGRES_DB: ${VERISIM_GAS_DB:-gas_station}
+      TZ: ${TZ:-America/New_York}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${VERISIM_POSTGRES_USER:-verisim}", "-d", "${VERISIM_GAS_DB:-gas_station}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - ${CONF:-/opt/conf}/verisim-gas-station-test:/var/lib/postgresql/data
+    restart: unless-stopped
+    labels:
+      - homepage.group=${HOMEPAGE_GROUP:-Verisim}
+      - homepage.name=Verisim Gas Station (test)
+      - homepage.icon=docker.png
+      - homepage.href=http://${IP:-localhost}:${VERISIM_GAS_UI_PORT:-8502}/
+      - homepage.description=Gas station mock data generator — local standalone test
