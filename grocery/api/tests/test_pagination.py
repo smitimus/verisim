@@ -23,6 +23,7 @@ Two guards:
 import pathlib
 import re
 import time
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -169,3 +170,50 @@ def test_first_pass_paging_returns_every_row(quiesced_generator, path, pk, limit
 
     _, again = _walk(client, path, pk, limit)
     assert set(again) == distinct, f"{path}: a second pass returned a different set of rows"
+
+
+# (route, timestamp column in the response, the column the window filters on)
+WINDOWED_ROUTES = [
+    ("/grocery/pos/price-history", "changed_at"),
+    ("/grocery/pos/return-items", "return_dt"),
+    ("/grocery/online/order-items", "placed_dt"),
+]
+
+FAR_PAST = "2000-01-01T00:00:00+00:00"
+FAR_FUTURE = "2999-01-01T00:00:00+00:00"
+
+
+def _as_datetime(value):
+    stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+@pytest.mark.usefixtures("ensure_api_reachable")
+@pytest.mark.parametrize("path,column", WINDOWED_ROUTES)
+def test_window_filters_bound_the_result_set(quiesced_generator, path, column):
+    """The three whole-table routes accept start_dt/end_dt so consumers can pull
+    bounded, resumable pieces instead of paging the entire table (the reason
+    data-lab could only *detect* loss on pos_loyalty_members / online_order_items)."""
+    client = quiesced_generator
+    unfiltered = client.get(path, params={"limit": 1}).json()["total"]
+
+    # A window that cannot contain anything must return nothing - and say so in `total`,
+    # otherwise the count and the pages disagree.
+    for params in ({"start_dt": FAR_FUTURE}, {"end_dt": FAR_PAST}):
+        body = client.get(path, params=dict(params, limit=1000)).json()
+        assert body["total"] == 0, f"{path}: {params} should match no rows, got total={body['total']}"
+        assert body["data"] == [], f"{path}: {params} should return no rows"
+
+    # The same wide window must reproduce the unfiltered total exactly.
+    wide = client.get(path, params={"limit": 1, "start_dt": FAR_PAST, "end_dt": FAR_FUTURE}).json()
+    assert wide["total"] == unfiltered, (
+        f"{path}: an all-encompassing window changed the row count "
+        f"({wide['total']} vs {unfiltered} unfiltered)"
+    )
+
+    # ... and every row it returns has to fall inside the window.
+    page = client.get(path, params={"limit": 200, "start_dt": FAR_PAST, "end_dt": FAR_FUTURE})
+    for row in page.json()["data"]:
+        stamp = _as_datetime(row[column])
+        assert _as_datetime(FAR_PAST) <= stamp <= _as_datetime(FAR_FUTURE), \
+            f"{path}: {column}={row[column]} is outside the requested window"

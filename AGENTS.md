@@ -169,6 +169,19 @@ The Verisim grocery standalone image serves a FastAPI API at port 8010 with Swag
 | GET | `/grocery/supply-chain/fulfillments` | Warehouse fulfillments |
 | GET | `/grocery/supply-chain/shipments` | Truck shipments |
 
+**Pagination contract — `ORDER BY` must end on the primary key.** Every paginated route
+slices with `LIMIT %s OFFSET %s`, so ordering by a column that has ties is a silent data
+loss: Postgres may return tied rows in a different order per query, so a tie cluster
+straddling a page boundary can hand one row to two pages while another is never returned
+by any page — and `total` still matches, so the client cannot see it. data-lab lost 272
+`raw_online.order_events` rows this way while the source held them all (t_7c88f2f9, fixed
+in t_d7892e10). `grocery/api/tests/test_pagination.py` fails the build if a paginated
+query in `base/api/main.py` ends its `ORDER BY` on anything but a primary key.
+
+Whole-table routes accept `start_dt`/`end_dt` so consumers can pull bounded, resumable
+pieces instead of paging everything: `/grocery/pos/price-history` (`changed_at`),
+`/grocery/pos/return-items` (`return_dt`), `/grocery/online/order-items` (`placed_dt`).
+
 ### Analytics / Dashboards
 
 Used by the Streamlit UI tabs (`_dashboard`, `_distributions`):

@@ -838,6 +838,8 @@ def loyalty_members(
 def pos_price_history(
     industry: str,
     product_id: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
     limit: int = Query(200, le=1000),
     offset: int = 0,
 ):
@@ -846,6 +848,12 @@ def pos_price_history(
     if product_id:
         filters.append("ph.product_id = %s::uuid")
         params.append(product_id)
+    if start_dt:
+        filters.append("ph.changed_at >= %s")
+        params.append(start_dt)
+    if end_dt:
+        filters.append("ph.changed_at <= %s")
+        params.append(end_dt)
     where = " AND ".join(filters)
     total = query(f"""
         SELECT COUNT(*) AS n FROM pos.price_history ph WHERE {where}
@@ -1868,6 +1876,8 @@ def grocery_returns(
 def grocery_return_items(
     return_id: Optional[str] = None,
     product_id: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
@@ -1876,8 +1886,14 @@ def grocery_return_items(
         filters.append("ri.return_id = %s::uuid"); params.append(return_id)
     if product_id:
         filters.append("ri.product_id = %s::uuid"); params.append(product_id)
+    if start_dt:
+        filters.append("r.return_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("r.return_dt <= %s"); params.append(end_dt)
     where = " AND ".join(filters)
-    total = query(f"SELECT COUNT(*) AS n FROM pos.return_items ri WHERE {where}",
+    # r is joined for the date filters, so the count has to join it too.
+    total = query(f"""SELECT COUNT(*) AS n FROM pos.return_items ri
+                      JOIN pos.returns r ON r.return_id = ri.return_id WHERE {where}""",
                   params, "grocery")[0]["n"]
     rows = query(f"""
         SELECT ri.return_item_id, ri.return_id, ri.transaction_item_id,
@@ -1935,14 +1951,22 @@ def online_orders(
 @app.get("/grocery/online/order-items", tags=["Grocery — Online"])
 def online_order_items(
     order_id: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
     limit: int = Query(2000, le=5000),
     offset: int = 0,
 ):
     filters, params = ["TRUE"], []
     if order_id:
         filters.append("oi.order_id = %s::uuid"); params.append(order_id)
+    if start_dt:
+        filters.append("o.placed_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("o.placed_dt <= %s"); params.append(end_dt)
     where = " AND ".join(filters)
-    total = query(f"SELECT COUNT(*) AS n FROM online.order_items oi WHERE {where}",
+    # o is joined for the date filters, so the count has to join it too.
+    total = query(f"""SELECT COUNT(*) AS n FROM online.order_items oi
+                      JOIN online.orders o ON o.order_id = oi.order_id WHERE {where}""",
                   params, "grocery")[0]["n"]
     rows = query(f"""
         SELECT oi.item_id, oi.order_id, oi.product_id, p.name AS product_name,
