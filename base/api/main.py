@@ -655,16 +655,46 @@ def hr_employees(
 @app.get("/{industry}/pos/transactions", tags=["POS"])
 def pos_transactions(
     industry: str,
-    start_dt: datetime = Query(...),
-    end_dt: datetime = Query(...),
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     location_id: Optional[str] = None,
     scenario: Optional[str] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
+    """POS transaction headers, with **two** independent time windows.
+
+    ``start_dt``/``end_dt`` bound the *business* time (``transaction_dt``) — when
+    the sale happened.
+
+    ``created_after``/``created_before`` bound the *ingest* time (``created_at``)
+    — when the row was written. Use them for an incremental load:
+    ``transaction_dt`` is backdated by the generator (a backfill writes a whole
+    day's sales at one instant, and gap-filling writes days older than the ones
+    already stored), so a watermark of ``MAX(transaction_dt)`` sits above every
+    row a later batch backdates below it. On the 2026-09-21 dev seed, 89320 of
+    92741 rows sat more than a day below the table's own last insert.
+    ``created_at`` is ``DEFAULT NOW()``, written by the same statement as the row
+    and monotone, so ``created_after=<MAX(created_at) of the last load>`` is a
+    complete delta (t_6d2ebc52).
+
+    Both windows are optional and independent, and either side of a window may be
+    given on its own — the same shape as every other windowed route here. (The
+    business window was *required* until t_6d2ebc52; a consumer that wants nothing
+    but the insert clock would have got a 422 instead of a delta.)
+    """
     pool_for(industry)
-    filters = ["t.transaction_dt BETWEEN %s AND %s"]
-    params: list = [start_dt, end_dt]
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("t.transaction_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("t.transaction_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("t.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("t.created_at <= %s"); params.append(created_before)
     if location_id:
         filters.append("t.location_id = %s::uuid")
         params.append(location_id)
@@ -676,9 +706,9 @@ def pos_transactions(
     total = query(f"SELECT COUNT(*) AS n FROM pos.transactions t WHERE {where}", params, industry)[0]["n"]
 
     if industry == "grocery":
-        select = "t.transaction_id, t.location_id, t.employee_id, t.member_id, t.transaction_dt, t.subtotal, t.coupon_savings, t.deal_savings, t.tax, t.total, t.payment_method, t.scenario_tag"
+        select = "t.transaction_id, t.location_id, t.employee_id, t.member_id, t.transaction_dt, t.subtotal, t.coupon_savings, t.deal_savings, t.tax, t.total, t.payment_method, t.scenario_tag, t.created_at"
     else:
-        select = "t.transaction_id, t.location_id, t.employee_id, t.member_id, t.transaction_dt, t.subtotal, t.tax, t.total, t.payment_method, t.scenario_tag"
+        select = "t.transaction_id, t.location_id, t.employee_id, t.member_id, t.transaction_dt, t.subtotal, t.tax, t.total, t.payment_method, t.scenario_tag, t.created_at"
 
     rows = query(f"""
         SELECT {select}
@@ -718,12 +748,23 @@ def pos_transaction_items(
     industry: str,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     location_id: Optional[str] = None,
     transaction_id: Optional[str] = None,
     product_id: Optional[str] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
+    """POS transaction lines, with the same two windows as the header route.
+
+    ``start_dt``/``end_dt`` bound ``pos.transactions.transaction_dt`` (business
+    time); ``created_after``/``created_before`` bound
+    ``pos.transactions.created_at`` (ingest time). ``pos.transaction_items`` has
+    no timestamp of its own — its rows are written in the same statement batch as
+    their header, so the header's ``created_at`` *is* the line's ingest time, and
+    it is returned in the payload so a consumer can watermark on it (t_6d2ebc52).
+    """
     pool_for(industry)
     filters, params = ["TRUE"], []
     if transaction_id:
@@ -735,6 +776,10 @@ def pos_transaction_items(
     if end_dt:
         filters.append("t.transaction_dt <= %s")
         params.append(end_dt)
+    if created_after:
+        filters.append("t.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("t.created_at <= %s"); params.append(created_before)
     if location_id:
         filters.append("t.location_id = %s::uuid")
         params.append(location_id)
@@ -752,7 +797,7 @@ def pos_transaction_items(
         SELECT ti.item_id, ti.transaction_id, ti.product_id,
                p.name AS product_name, p.category,
                ti.quantity, ti.unit_price, ti.discount, ti.line_total,
-               t.transaction_dt, t.location_id{extra_cols}
+               t.transaction_dt, t.location_id, t.created_at{extra_cols}
         FROM pos.transaction_items ti
         JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
         JOIN pos.products p ON p.product_id = ti.product_id
@@ -1953,17 +1998,38 @@ def grocery_return_items(
 def online_orders(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     location_id: Optional[str] = None,
     status: Optional[str] = None,
     fulfillment_type: Optional[str] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
+    """Online orders, with **two** independent time windows.
+
+    ``start_dt``/``end_dt`` bound the *business* time (``placed_dt``) — when the
+    order was placed.
+
+    ``created_after``/``created_before`` bound the *ingest* time (``created_at``)
+    — when the row was written. ``placed_dt`` is backdated by the generator during
+    a backfill (and by a gap-fill of days older than the stored ones), so a
+    ``MAX(placed_dt)`` watermark cannot reach the rows a later batch writes below
+    it: on the 2026-09-21 dev seed, 10699 of 11062 orders sat more than a day
+    below the table's own last insert. ``created_at`` is ``DEFAULT NOW()``,
+    written by the same statement as the row and monotone, so
+    ``created_after=<MAX(created_at) of the last load>`` is a complete delta
+    (t_6d2ebc52).
+    """
     filters, params = ["TRUE"], []
     if start_dt:
         filters.append("o.placed_dt >= %s"); params.append(start_dt)
     if end_dt:
         filters.append("o.placed_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("o.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("o.created_at <= %s"); params.append(created_before)
     if location_id:
         filters.append("o.location_id = %s::uuid"); params.append(location_id)
     if status:
@@ -1978,7 +2044,7 @@ def online_orders(
                o.placed_dt, o.fulfillment_type, o.status, o.subtotal,
                o.service_fee, o.tax, o.total, o.payment_method,
                o.pickup_window_start, o.pickup_window_end,
-               o.promised_delivery_dt, o.completed_dt, o.scenario_tag
+               o.promised_delivery_dt, o.completed_dt, o.scenario_tag, o.created_at
         FROM online.orders o WHERE {where}
         ORDER BY o.placed_dt DESC, o.order_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
@@ -1990,9 +2056,20 @@ def online_order_items(
     order_id: Optional[str] = None,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: int = Query(2000, le=5000),
     offset: int = 0,
 ):
+    """Order lines, with the same two windows as ``/grocery/online/orders``.
+
+    ``start_dt``/``end_dt`` bound ``online.orders.placed_dt`` (business time);
+    ``created_after``/``created_before`` bound ``online.orders.created_at``
+    (ingest time). ``online.order_items`` has no timestamp of its own — its rows
+    are written in the same statement batch as their header, so the header's
+    ``created_at`` *is* the line's ingest time, and it is returned in the payload
+    so a consumer can watermark on it (t_6d2ebc52).
+    """
     filters, params = ["TRUE"], []
     if order_id:
         filters.append("oi.order_id = %s::uuid"); params.append(order_id)
@@ -2000,6 +2077,10 @@ def online_order_items(
         filters.append("o.placed_dt >= %s"); params.append(start_dt)
     if end_dt:
         filters.append("o.placed_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("o.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("o.created_at <= %s"); params.append(created_before)
     where = " AND ".join(filters)
     # o is joined for the date filters, so the count has to join it too.
     total = query(f"""SELECT COUNT(*) AS n FROM online.order_items oi
@@ -2007,7 +2088,7 @@ def online_order_items(
                   params, "grocery")[0]["n"]
     rows = query(f"""
         SELECT oi.item_id, oi.order_id, oi.product_id, p.name AS product_name,
-               oi.quantity, oi.unit_price, oi.line_total, o.placed_dt
+               oi.quantity, oi.unit_price, oi.line_total, o.placed_dt, o.created_at
         FROM online.order_items oi
         JOIN online.orders o ON o.order_id = oi.order_id
         JOIN pos.products p ON p.product_id = oi.product_id

@@ -157,6 +157,13 @@ WINDOWED_ROUTES = [
     # incremental load of it (t_5d2e2ab0). return_items rides its header.
     ("/grocery/pos/returns", "created_at", "created_after", "created_before"),
     ("/grocery/pos/return-items", "created_at", "created_after", "created_before"),
+    # Same pair on the other backdated tables (t_6d2ebc52): the POS header route
+    # (which no longer requires start_dt/end_dt, so it can be asked for the insert
+    # clock alone), the POS line route and both online routes.
+    ("/grocery/pos/transactions", "created_at", "created_after", "created_before"),
+    ("/grocery/pos/transaction-items", "created_at", "created_after", "created_before"),
+    ("/grocery/online/orders", "created_at", "created_after", "created_before"),
+    ("/grocery/online/order-items", "created_at", "created_after", "created_before"),
 ]
 
 FAR_PAST = "2000-01-01T00:00:00+00:00"

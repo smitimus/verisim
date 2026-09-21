@@ -204,14 +204,27 @@ watermark (t_5d2e2ab0). The same shape holds for `pos.transactions` and `online.
 after a backfill: on the 2026-09-21 local seed, 89,320 of 92,741 transactions and 10,699
 of 11,062 orders sat more than a day below the table's own last insert.
 
-So the two return routes carry a second, independent pair —
+So the return routes carry a second, independent pair —
 `created_after`/`created_before`, bound to `pos.returns.created_at` (`DEFAULT NOW()`,
 written by the same statement as the row, monotone) — and
 `/grocery/pos/return-items` returns `r.created_at` in its payload because the line has
 no timestamp of its own and a consumer needs that column to hold the watermark.
-`grocery/api/tests/test_ingest_window.py` fails the build if either route stops
-declaring the pair, stops filtering the insert clock in both the count and the page
-query, or drops the column.
+
+The same pair now sits on the other two backdated families (t_6d2ebc52):
+`/{industry}/pos/transactions` and `/{industry}/pos/transaction-items` filter
+`pos.transactions.created_at`, `/grocery/online/orders` and
+`/grocery/online/order-items` filter `online.orders.created_at`, and all four return it
+in the payload — the two line routes joined from their header, exactly as
+`return-items` does. Why it was needed, measured on CT106 (2026-09-21) after the 07:28Z
+ingest: `raw_pos.transactions` held 95,009 rows while the source had 95,015 at or below
+raw's own `MAX(transaction_dt)` — 6 rows no incremental run could ever reach, two of
+which showed up downstream as a WARN on
+`relationships_stg_pos_loyalty_point_transactions_transaction_id__transaction_id__ref_stg_pos_transactions`.
+`start_dt`/`end_dt` keep their business meaning on all of these routes, unchanged.
+
+`grocery/api/tests/test_ingest_window.py` fails the build if any of the six
+ingest-window routes stops declaring the pair, stops filtering the insert clock in both
+the count and the page query, or drops the column from its payload.
 
 The window is served by a sequential scan: `pos.returns` holds ~10k rows and grows by a
 few hundred a day, so it is cheap today, and t_5d2e2ab0 deliberately added no index —
