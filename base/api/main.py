@@ -2000,13 +2000,15 @@ def online_orders(
     end_dt: Optional[datetime] = None,
     created_after: Optional[datetime] = None,
     created_before: Optional[datetime] = None,
+    updated_after: Optional[datetime] = None,
+    updated_before: Optional[datetime] = None,
     location_id: Optional[str] = None,
     status: Optional[str] = None,
     fulfillment_type: Optional[str] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
-    """Online orders, with **two** independent time windows.
+    """Online orders, with **three** independent windows.
 
     ``start_dt``/``end_dt`` bound the *business* time (``placed_dt``) — when the
     order was placed.
@@ -2020,6 +2022,24 @@ def online_orders(
     written by the same statement as the row and monotone, so
     ``created_after=<MAX(created_at) of the last load>`` is a complete delta
     (t_6d2ebc52).
+
+    ``updated_after``/``updated_before`` bound the *state* clock (``updated_at``)
+    — which version of the row the reader sees. ``status`` is mutated in place at
+    every lifecycle tick and ``updated_at`` is bumped by that same statement
+    (``grocery/generator/models/online.py::advance_online_lifecycle``), so the
+    column is the moment the row last changed. It is the *only* way a reader can
+    bound the state it sees: a window on ``created_at`` alone still returns the
+    current state of every row, so an order that completes while the ingest is
+    reading is loaded ``completed`` while its terminal event is only readable on
+    the next run — the residual that failed
+    ``assert_online_orders_reconcile`` (t_51bbc12e). The generator writes a
+    status change and the event that explains it in **one** transaction, so
+    ``orders.updated_at == MAX(order_events.created_at)`` for that order
+    (measured on the whole CT106 table: 34531 of 34531 orders, 0 differing), and
+    a reader that ends both routes at the same instant ``B``
+    (``updated_before=B`` here, ``created_before=B`` on ``/order-events``) reads a
+    consistent snapshot: every order it loads as ``completed`` already has its
+    terminal event in the same read.
     """
     filters, params = ["TRUE"], []
     if start_dt:
@@ -2030,6 +2050,10 @@ def online_orders(
         filters.append("o.created_at >= %s"); params.append(created_after)
     if created_before:
         filters.append("o.created_at <= %s"); params.append(created_before)
+    if updated_after:
+        filters.append("o.updated_at >= %s"); params.append(updated_after)
+    if updated_before:
+        filters.append("o.updated_at <= %s"); params.append(updated_before)
     if location_id:
         filters.append("o.location_id = %s::uuid"); params.append(location_id)
     if status:
@@ -2044,7 +2068,8 @@ def online_orders(
                o.placed_dt, o.fulfillment_type, o.status, o.subtotal,
                o.service_fee, o.tax, o.total, o.payment_method,
                o.pickup_window_start, o.pickup_window_end,
-               o.promised_delivery_dt, o.completed_dt, o.scenario_tag, o.created_at
+               o.promised_delivery_dt, o.completed_dt, o.scenario_tag,
+               o.created_at, o.updated_at
         FROM online.orders o WHERE {where}
         ORDER BY o.placed_dt DESC, o.order_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
@@ -2103,9 +2128,29 @@ def online_order_events(
     order_id: Optional[str] = None,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: int = Query(2000, le=5000),
     offset: int = 0,
 ):
+    """Lifecycle events, with the same two windows as ``/grocery/online/orders``.
+
+    ``start_dt``/``end_dt`` bound ``event_dt`` — the *business* time, when the
+    event happened. It is written by the generator per event and is backdated by
+    a backfill or a gap-fill, so it cannot drive an incremental load: on CT106 on
+    2026-09-21, 58139 of 170364 events sat more than a day below the table's own
+    last insert. Without a window on anything else the data-lab ingest had to read
+    this route ``strategy="full"`` — the whole table on every run, on the
+    pipeline's critical path (t_51bbc12e).
+
+    ``created_after``/``created_before`` bound ``created_at``, the *insert* clock
+    (``DEFAULT NOW()``, written by the same statement as the row, monotone), which
+    is the column an incremental load watermarks on. It is returned in the payload
+    so the consumer can hold that watermark in its own raw table. Paired with
+    ``updated_before`` on ``/grocery/online/orders`` (the order's state clock,
+    which is bumped by the same transaction that writes the event) both routes can
+    be ended at one instant and read as a consistent snapshot.
+    """
     filters, params = ["TRUE"], []
     if order_id:
         filters.append("e.order_id = %s::uuid"); params.append(order_id)
@@ -2113,11 +2158,15 @@ def online_order_events(
         filters.append("e.event_dt >= %s"); params.append(start_dt)
     if end_dt:
         filters.append("e.event_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("e.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("e.created_at <= %s"); params.append(created_before)
     where = " AND ".join(filters)
     total = query(f"SELECT COUNT(*) AS n FROM online.order_events e WHERE {where}",
                   params, "grocery")[0]["n"]
     rows = query(f"""
-        SELECT e.event_id, e.order_id, e.event_type, e.event_dt, e.note
+        SELECT e.event_id, e.order_id, e.event_type, e.event_dt, e.note, e.created_at
         FROM online.order_events e WHERE {where}
         ORDER BY e.event_dt, e.event_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")

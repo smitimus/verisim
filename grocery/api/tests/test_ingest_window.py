@@ -31,6 +31,20 @@ These tests guard the contract data-lab's ingest depends on:
 verifies them against ``/openapi.json`` before it trusts them, so the parameters
 must be declared on the route (not merely accepted) and must really filter the
 ingest clock in *both* the count query and the page query.
+
+``online.orders`` carries a second clock, and it answers a different question
+(t_51bbc12e). ``created_at`` says *when the row was written*; ``updated_at`` says
+*when it last changed* — the generator mutates ``status`` in place at every
+lifecycle tick and bumps it in the same statement. So a created-window reader sees
+the current state of every row in its window, including rows that changed after the
+window ended: an order that completes while the read is in flight is loaded
+``completed`` while the event that explains it is only readable on the next run,
+which is the residual data-lab's ``assert_online_orders_reconcile`` kept catching on
+a wide-window run. ``updated_after``/``updated_before`` bound that state, and — because
+the generator writes a status change and its event in one transaction, so
+``orders.updated_at == MAX(order_events.created_at)`` for the order — ending the
+events read and the orders read at the same instant makes the pair a consistent
+snapshot.
 """
 import pathlib
 import re
@@ -57,11 +71,22 @@ INGEST_WINDOW_ROUTES = [
     ("/grocery/pos/transaction-items", "/{industry}/pos/transaction-items", "t"),
     ("/grocery/online/orders", "/grocery/online/orders", "o"),
     ("/grocery/online/order-items", "/grocery/online/order-items", "o"),
+    # The lifecycle event stream: event_dt is business time and backdated, so the
+    # whole-table read was the only thing the ingest could do with this route
+    # (t_51bbc12e).
+    ("/grocery/online/order-events", "/grocery/online/order-events", "e"),
     ("/grocery/pos/returns", "/grocery/pos/returns", "r"),
     ("/grocery/pos/return-items", "/grocery/pos/return-items", "r"),
 ]
 
+# (request path, route source path, header alias) for the routes that also expose the
+# *state* clock — which version of the row the reader sees (t_51bbc12e).
+STATE_CLOCK_ROUTES = [
+    ("/grocery/online/orders", "/grocery/online/orders", "o"),
+]
+
 PATHS = [request_path for request_path, _, _ in INGEST_WINDOW_ROUTES]
+STATE_PATHS = [request_path for request_path, _, _ in STATE_CLOCK_ROUTES]
 
 
 def _route_source(path: str) -> str:
@@ -74,7 +99,7 @@ def _route_source(path: str) -> str:
 
 
 def _params(path: str):
-    for route in INGEST_WINDOW_ROUTES:
+    for route in INGEST_WINDOW_ROUTES + STATE_CLOCK_ROUTES:
         if route[0] == path:
             return route
     raise KeyError(path)
@@ -248,4 +273,154 @@ def test_created_window_filters_the_insert_clock(quiesced_generator, path):
     assert both["total"] == window["total"], (
         f"{path}: adding an all-encompassing business window changed the ingest "
         f"window's count ({both['total']} vs {window['total']})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The state clock — ``updated_at`` on online.orders (t_51bbc12e)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", STATE_PATHS)
+def test_route_declares_the_state_clock_on_updated_at(path):
+    """``updated_after``/``updated_before`` must be declared and applied to
+    ``updated_at`` in the count *and* the page query, exactly as the ingest window is:
+    a filter on one and not the other makes ``total`` disagree with the pages."""
+    request_path, source_path, alias = _params(path)
+    body = _route_source(source_path)
+
+    for param in ("updated_after", "updated_before"):
+        assert re.search(rf"^\s+{param}: Optional\[datetime\] = None,$", body, re.M), \
+            f"{request_path}: does not declare {param}"
+
+    assert f'filters.append("{alias}.updated_at >= %s"); params.append(updated_after)' in body, \
+        f"{request_path}: updated_after is not applied to {alias}.updated_at"
+    assert f'filters.append("{alias}.updated_at <= %s"); params.append(updated_before)' in body, \
+        f"{request_path}: updated_before is not applied to {alias}.updated_at"
+
+    uses = body.count("WHERE {where}")
+    assert uses >= 2, (
+        f"{request_path}: the count query and the page query must share one WHERE clause "
+        f"(found {uses} uses of `WHERE {{where}}`)"
+    )
+
+
+@pytest.mark.parametrize("path", STATE_PATHS)
+def test_state_clock_leaves_the_insert_clock_alone(path):
+    """The state window is *additional*: ``created_after``/``created_before`` keep
+    filtering ``created_at``, so an incremental load can combine both."""
+    request_path, source_path, alias = _params(path)
+    body = _route_source(source_path)
+    assert f'filters.append("{alias}.created_at >= %s"); params.append(created_after)' in body
+    assert f'filters.append("{alias}.created_at <= %s"); params.append(created_before)' in body
+
+
+@pytest.mark.parametrize("path", STATE_PATHS)
+def test_payload_carries_updated_at(path):
+    """A consumer watermarks on ``MAX(updated_at)`` of its own raw table, so the
+    column has to be in the response (as ``created_at`` had to be)."""
+    request_path, source_path, alias = _params(path)
+    select_list = _page_select_list(_route_source(source_path))
+    assert f"{alias}.updated_at" in select_list, (
+        f"{request_path} does not return {alias}.updated_at in its payload:\n{select_list}"
+    )
+
+
+@pytest.mark.usefixtures("ensure_api_reachable")
+@pytest.mark.parametrize("path", STATE_PATHS)
+def test_openapi_advertises_the_state_clock(api_base_url, path):
+    """Same trap as the ingest window: FastAPI ignores unknown query parameters, so a
+    configured state window the route does not declare looks like a bounded read that
+    returns the whole table in its *current* state."""
+    with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
+        assert {"updated_after", "updated_before"} <= _route_query_params(client, path), \
+            f"{path}: OpenAPI does not advertise updated_after/updated_before"
+
+
+@pytest.mark.usefixtures("ensure_api_reachable")
+@pytest.mark.parametrize("path", STATE_PATHS)
+def test_state_window_filters_the_state_clock(quiesced_generator, path):
+    """A one-second-wide state window must hold only rows whose state moved in that
+    second — the analogue of the created-window test above, and what tells a real
+    filter apart from one that ran on ``created_at``."""
+    request_path, _, _ = _params(path)
+    client = quiesced_generator
+    page = client.get(path, params={"limit": 5000, "updated_after": FAR_PAST,
+                                    "updated_before": FAR_FUTURE}).json()
+    rows = page["data"]
+    if not rows:
+        pytest.skip(f"{path}: no rows to derive a state timestamp from")
+
+    newest = max(_as_datetime(row["updated_at"]) for row in rows)
+    lo = newest.isoformat()
+    hi = (newest + timedelta(seconds=1)).isoformat()
+
+    window = client.get(path, params={"limit": 5000, "updated_after": lo,
+                                      "updated_before": hi}).json()
+    assert window["total"] >= 1, f"{path}: the state batch stamped {lo} returned no rows"
+    for row in window["data"]:
+        stamp = _as_datetime(row["updated_at"])
+        assert newest <= stamp <= newest + timedelta(seconds=1), (
+            f"{path}: state window [{lo}, {hi}] returned updated_at={row['updated_at']} "
+            f"— the window is not filtering the state clock"
+        )
+
+    # Composable with the insert window and the business window.
+    both = client.get(path, params={"limit": 5000, "updated_after": lo,
+                                    "updated_before": hi, "created_after": FAR_PAST,
+                                    "created_before": FAR_FUTURE,
+                                    "start_dt": FAR_PAST, "end_dt": FAR_FUTURE}).json()
+    assert both["total"] == window["total"], (
+        f"{path}: adding all-encompassing business and insert windows changed the "
+        f"state window's count ({both['total']} vs {window['total']})"
+    )
+
+
+@pytest.mark.usefixtures("ensure_api_reachable")
+def test_state_clock_makes_the_completion_invariant_deterministic(quiesced_generator):
+    """The residual behind data-lab's ``assert_online_orders_reconcile`` (t_51bbc12e).
+
+    A reader that bounds its window on ``created_at`` alone still gets the *current*
+    state of every row in that window: an order that completes while the read is in
+    flight is loaded ``completed`` while the event that explains the completion is only
+    readable on the next run. Bounding the state as well closes the gap — at an instant
+    just before the completion the order is not returned at all, and neither is the
+    terminal event, which is what makes the pair consistent by construction.
+    """
+    client = quiesced_generator
+    completed = client.get("/grocery/online/orders",
+                           params={"status": "completed", "limit": 200}).json()["data"]
+    if not completed:
+        pytest.skip("no completed orders to derive a state stamp from")
+
+    order = max(completed, key=lambda row: _as_datetime(row["updated_at"]))
+    completed_dt = _as_datetime(order["updated_at"])
+    just_before = (completed_dt - timedelta(microseconds=1)).isoformat()
+
+    # 1. The hazard is real: the completion is in the row, its terminal event is not
+    #    readable yet (both carry the same transaction stamp).
+    early = client.get("/grocery/online/order-events",
+                       params={"order_id": order["order_id"],
+                               "created_before": just_before, "limit": 5000}).json()
+    assert not any(_as_datetime(e["created_at"]) == completed_dt for e in early["data"]), (
+        "the terminal event was already readable before the completion it explains"
+    )
+
+    # 2. A created-window-only reader loads the order as completed anyway ...
+    window_only = client.get("/grocery/online/orders",
+                             params={"status": "completed", "created_after": FAR_PAST,
+                                     "created_before": just_before, "limit": 1}).json()
+    assert window_only["total"] >= 1, (
+        "the created-window read did not reach the order, so this test proves nothing"
+    )
+
+    # 3. ... and the state bound is what keeps it out of the load.
+    body = client.get("/grocery/online/orders",
+                      params={"status": "completed", "updated_before": just_before,
+                              "limit": 5000}).json()
+    assert all(_as_datetime(row["updated_at"]) <= _as_datetime(just_before)
+               for row in body["data"]), "updated_before returned a row mutated after it"
+    assert order["order_id"] not in {row["order_id"] for row in body["data"]}, (
+        "updated_before did not bound the state: an order whose completion is stamped "
+        "after the read end is still returned as completed"
     )

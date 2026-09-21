@@ -164,6 +164,13 @@ WINDOWED_ROUTES = [
     ("/grocery/pos/transaction-items", "created_at", "created_after", "created_before"),
     ("/grocery/online/orders", "created_at", "created_after", "created_before"),
     ("/grocery/online/order-items", "created_at", "created_after", "created_before"),
+    # The lifecycle event stream carried no readable insert clock, so its ingest route
+    # was the one whole-table read left on the pipeline's critical path (t_51bbc12e).
+    ("/grocery/online/order-events", "created_at", "created_after", "created_before"),
+    # ... and the *state* clock on the orders it belongs to: updated_at says when the
+    # row last changed, which created_at cannot express (the status is mutated in
+    # place). Together they let a reader bound the window *and* the state it sees.
+    ("/grocery/online/orders", "updated_at", "updated_after", "updated_before"),
 ]
 
 FAR_PAST = "2000-01-01T00:00:00+00:00"

@@ -214,12 +214,13 @@ analysis and the wrong one for a delta load whenever the business timestamp is
 backdated, i.e. whenever the generator writes a row whose business time is in the
 past:
 
-| Table | Business clock | Backdated? | Ingest clock |
-|-------|----------------|-----------|--------------|
-| `pos.transactions` / `pos.transaction_items` | `transaction_dt` | yes, during backfill | `created_at` |
-| `pos.returns` / `pos.return_items` | `return_dt` | yes, always (`txn_dt + rand(2..21)d`, clamped) | `returns.created_at` |
-| `pos.price_history` | `changed_at` | no — stamped at insert | — |
-| `online.orders` / `online.order_items` | `placed_dt` | yes, during backfill | `created_at` |
+| Table | Business clock | Backdated? | Ingest clock | State clock |
+|-------|----------------|-----------|--------------|-------------|
+| `pos.transactions` / `pos.transaction_items` | `transaction_dt` | yes, during backfill | `created_at` | — |
+| `pos.returns` / `pos.return_items` | `return_dt` | yes, always (`txn_dt + rand(2..21)d`, clamped) | `returns.created_at` | — |
+| `pos.price_history` | `changed_at` | no — stamped at insert | — | — |
+| `online.orders` / `online.order_items` | `placed_dt` | yes, during backfill | `created_at` | `orders.updated_at` |
+| `online.order_events` | `event_dt` | yes, during backfill | `created_at` | — |
 
 A consumer that watermarks on a backdated column loses rows: the watermark sits at the
 newest business time already seen, and every row a later batch backdates below it is
@@ -228,7 +229,9 @@ unreachable through *every* `start_dt`/`end_dt` combination. Measured on `pos.re
 than a week — a third to a half of each nightly batch was invisible to a `return_dt`
 watermark (t_5d2e2ab0). The same shape holds for `pos.transactions` and `online.orders`
 after a backfill: on the 2026-09-21 local seed, 89,320 of 92,741 transactions and 10,699
-of 11,062 orders sat more than a day below the table's own last insert.
+of 11,062 orders sat more than a day below the table's own last insert; on CT106 the
+same evening, 58,139 of 170,364 `online.order_events` sat more than a day below their
+table's own last insert.
 
 So the return routes carry a second, independent pair —
 `created_after`/`created_before`, bound to `pos.returns.created_at` (`DEFAULT NOW()`,
@@ -248,16 +251,60 @@ which showed up downstream as a WARN on
 `relationships_stg_pos_loyalty_point_transactions_transaction_id__transaction_id__ref_stg_pos_transactions`.
 `start_dt`/`end_dt` keep their business meaning on all of these routes, unchanged.
 
-`grocery/api/tests/test_ingest_window.py` fails the build if any of the six
+`/grocery/online/order-events` followed (t_51bbc12e): `event_dt` is business time and is
+backdated by a backfill or gap-fill, so with no readable clock the data-lab ingest had to
+read the route `strategy="full"` — 60,797 rows on a fresh seed against 11,765 orders,
+re-read on every run and first in the pipeline's read order. The route now filters
+`e.created_at` on `created_after`/`created_before` and returns it in the payload, so that
+route is incremental too. **No DDL was needed for any of this**: `online.order_events`
+has had `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` since the channel was introduced
+(0cfd0ed, t_24fae529) — the column was simply never surfaced by the API, which is why the
+raw mirror data-lab built from the payload had no column to watermark on.
+
+**The third window: state.** `online.orders.status` is mutated *in place* by
+`grocery/generator/models/online.py::advance_online_lifecycle` (it also bumps
+`updated_at = NOW()` in that same statement), so a window on `created_at` bounds which
+rows are read but not *which version of them*: an order that completes while the read is
+in flight comes back `completed` while the event explaining the completion is only
+readable on the next run. That is precisely the residual that failed data-lab's
+`assert_online_orders_reconcile` (5 rows, test 6 of 224, ERROR=1/224 at 21:22:29Z on the
+test slot; gone on the next ingest at 21:26:02 — the check was probabilistic, not wrong).
+`/grocery/online/orders` therefore takes `updated_after`/`updated_before` bound to
+`o.updated_at` and returns it in the payload.
+
+The two clocks line up exactly, because the generator writes a status change and the
+event that explains it in **one** transaction, so `NOW()` — and therefore
+`orders.updated_at` and that event's `created_at` — is one value. Verified on the whole
+CT106 table (34,531 orders, 2026-09-21): `o.updated_at = MAX(e.created_at)` for every
+order, 0 differing. The recipe for a deterministic read of the pair is therefore:
+
+```
+B = <now, captured before the first of the two reads>
+orders: updated_after=<state watermark>&updated_before=B   # state as of B
+events: created_after=<insert watermark>&created_before=B  # the events that produced it
+```
+
+Every order loaded as `completed` in that read has its terminal event (same stamp) inside
+the same events window, and no order is loaded ahead of its events. An order whose state
+moves after `B` is simply not loaded this run and is picked up by the `updated_after`
+watermark next run — which is why the orders route needs a *state* watermark rather than
+an insert one.
+
+`grocery/api/tests/test_ingest_window.py` fails the build if any of the seven
 ingest-window routes stops declaring the pair, stops filtering the insert clock in both
-the count and the page query, or drops the column from its payload.
+the count and the page query, or drops the column from its payload — and, for the state
+clock, if `/grocery/online/orders` stops declaring `updated_after`/`updated_before`, stops
+filtering `o.updated_at` in both queries, drops `updated_at` from the payload, or stops
+keeping the created window independent of it.
 
 The window is served by a sequential scan: `pos.returns` holds ~10k rows and grows by a
 few hundred a day, so it is cheap today, and t_5d2e2ab0 deliberately added no index —
 `CREATE INDEX idx_returns_created ON pos.returns (created_at)` is a `schema.sql` change
 that only reaches a *fresh* bootstrap (an existing data dir keeps its schema), so it is
 worth doing when the plan actually shows up, not before. Every other window column has
-one (`idx_pos_txn_dt`, `idx_online_orders_placed`, `idx_loyalty_pts_date`).
+one (`idx_pos_txn_dt`, `idx_online_orders_placed`, `idx_loyalty_pts_date`); the two new
+ones (`order_events.created_at`, `orders.updated_at`) follow the same rule — no index
+until the plan shows one, and then only in a `schema.sql` that fresh bootstraps pick up.
 
 ### Analytics / Dashboards
 
