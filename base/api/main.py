@@ -643,7 +643,7 @@ def hr_employees(
         SELECT employee_id, location_id, first_name, last_name, email,
                hire_date, termination_date, department, job_title, hourly_rate, status
         FROM hr.employees WHERE {where}
-        ORDER BY last_name, first_name LIMIT %s OFFSET %s
+        ORDER BY last_name, first_name, employee_id LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -683,7 +683,7 @@ def pos_transactions(
     rows = query(f"""
         SELECT {select}
         FROM pos.transactions t WHERE {where}
-        ORDER BY t.transaction_dt DESC LIMIT %s OFFSET %s
+        ORDER BY t.transaction_dt DESC, t.transaction_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -757,7 +757,7 @@ def pos_transaction_items(
         JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
         JOIN pos.products p ON p.product_id = ti.product_id
         WHERE {where}
-        ORDER BY t.transaction_dt DESC LIMIT %s OFFSET %s
+        ORDER BY t.transaction_dt DESC, ti.item_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -799,7 +799,7 @@ def pos_products(
             FROM pos.products p
             JOIN pos.departments d ON d.department_id = p.department_id
             WHERE {where}
-            ORDER BY d.name, p.category, p.name LIMIT %s OFFSET %s
+            ORDER BY d.name, p.category, p.name, p.product_id LIMIT %s OFFSET %s
         """, params + [limit, offset], industry)
         return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -807,7 +807,7 @@ def pos_products(
     rows = query(f"""
         SELECT product_id, sku, name, category, subcategory, cost, current_price, is_active
         FROM pos.products p WHERE {where}
-        ORDER BY category, name LIMIT %s OFFSET %s
+        ORDER BY category, name, product_id LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -829,7 +829,7 @@ def loyalty_members(
     rows = query(f"""
         SELECT member_id, first_name, last_name, email, signup_date, points_balance, tier
         FROM pos.loyalty_members WHERE {where}
-        ORDER BY points_balance DESC LIMIT %s OFFSET %s
+        ORDER BY points_balance DESC, member_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -856,7 +856,7 @@ def pos_price_history(
         FROM pos.price_history ph
         JOIN pos.products p ON p.product_id = ph.product_id
         WHERE {where}
-        ORDER BY ph.changed_at DESC LIMIT %s OFFSET %s
+        ORDER BY ph.changed_at DESC, ph.price_history_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -891,7 +891,7 @@ def fuel_transactions(
         FROM fuel.transactions t
         JOIN fuel.grades g ON g.grade_id = t.grade_id
         WHERE {where}
-        ORDER BY t.transaction_dt DESC LIMIT %s OFFSET %s
+        ORDER BY t.transaction_dt DESC, t.transaction_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "gas-station")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1052,7 +1052,7 @@ def timeclock_events(
         JOIN hr.employees emp ON emp.employee_id = e.employee_id
         JOIN hr.locations l ON l.location_id = e.location_id
         WHERE {where}
-        ORDER BY e.event_dt DESC LIMIT %s OFFSET %s
+        ORDER BY e.event_dt DESC, e.event_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1104,7 +1104,7 @@ def ordering_orders(
         LEFT JOIN ordering.store_order_items soi ON soi.order_id = so.order_id
         WHERE {where}
         GROUP BY so.order_id, sl.name, wl.name
-        ORDER BY so.order_dt DESC LIMIT %s OFFSET %s
+        ORDER BY so.order_dt DESC, so.order_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1146,7 +1146,7 @@ def fulfillment_orders(
         LEFT JOIN fulfillment.items fi ON fi.fulfillment_id = fo.fulfillment_id
         WHERE {where}
         GROUP BY fo.fulfillment_id, wl.name, emp.first_name, emp.last_name
-        ORDER BY fo.created_at DESC LIMIT %s OFFSET %s
+        ORDER BY fo.created_at DESC, fo.fulfillment_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1190,7 +1190,7 @@ def transport_loads(
         JOIN hr.locations wl ON wl.location_id = l.warehouse_location_id
         JOIN hr.locations dl ON dl.location_id = l.destination_location_id
         WHERE {where}
-        ORDER BY l.created_at DESC LIMIT %s OFFSET %s
+        ORDER BY l.created_at DESC, l.load_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1228,7 +1228,7 @@ def inventory_stock_levels(
         JOIN pos.products p ON p.product_id = sl.product_id
         JOIN inv.products ip ON ip.product_id = sl.product_id
         WHERE {where}
-        ORDER BY sl.quantity_on_hand ASC LIMIT %s OFFSET %s
+        ORDER BY sl.quantity_on_hand ASC, sl.stock_id LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1275,7 +1275,7 @@ def inventory_products(industry: str, limit: int = Query(500, le=2000), offset: 
                ip.unit_of_measure, ip.supplier_name, ip.lead_time_days
         FROM inv.products ip
         JOIN pos.products p ON p.product_id = ip.product_id
-        ORDER BY p.category, p.name LIMIT %s OFFSET %s
+        ORDER BY p.category, p.name, ip.inv_product_id LIMIT %s OFFSET %s
     """, [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1318,7 +1318,7 @@ def inventory_receipt_items(
         JOIN inv.receipts r ON r.receipt_id = ri.receipt_id
         JOIN pos.products p ON p.product_id = ri.product_id
         WHERE {where}
-        ORDER BY r.received_dt DESC LIMIT %s OFFSET %s
+        ORDER BY r.received_dt DESC, ri.receipt_item_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1432,7 +1432,7 @@ def hr_schedules(
         SELECT schedule_id, location_id, employee_id, scheduled_date,
                department, shift_start, shift_end, status, created_at
         FROM hr.schedules WHERE {where}
-        ORDER BY scheduled_date DESC, location_id LIMIT %s OFFSET %s
+        ORDER BY scheduled_date DESC, location_id, schedule_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1465,7 +1465,7 @@ def loyalty_point_transactions(
         SELECT pt_id, member_id, transaction_id, points_earned, points_redeemed,
                reason, balance_after, created_at
         FROM pos.loyalty_point_transactions WHERE {where}
-        ORDER BY created_at DESC LIMIT %s OFFSET %s
+        ORDER BY created_at DESC, pt_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1502,7 +1502,7 @@ def inventory_shrinkage_events(
         SELECT shrinkage_id, product_id, location_id, quantity, reason,
                estimated_cost, recorded_at, recorded_by
         FROM inv.shrinkage_events WHERE {where}
-        ORDER BY recorded_at DESC LIMIT %s OFFSET %s
+        ORDER BY recorded_at DESC, shrinkage_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1517,7 +1517,7 @@ def pricing_weekly_ads(limit: int = Query(500, le=2000), offset: int = 0):
     rows = query("""
         SELECT ad_id, ad_name, start_date, end_date, created_at
         FROM pricing.weekly_ads
-        ORDER BY start_date DESC LIMIT %s OFFSET %s
+        ORDER BY start_date DESC, ad_id DESC LIMIT %s OFFSET %s
     """, [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1537,7 +1537,7 @@ def pricing_ad_items(
     rows = query(f"""
         SELECT ad_item_id, ad_id, product_id, promoted_price, discount_pct, created_at
         FROM pricing.ad_items WHERE {where}
-        ORDER BY ad_id, product_id LIMIT %s OFFSET %s
+        ORDER BY ad_id, product_id, ad_item_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1561,7 +1561,7 @@ def ordering_order_items(
     rows = query(f"""
         SELECT item_id, order_id, product_id, quantity_requested, quantity_approved, notes
         FROM ordering.store_order_items WHERE {where}
-        ORDER BY order_id LIMIT %s OFFSET %s
+        ORDER BY order_id, item_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1586,7 +1586,7 @@ def fulfillment_items(
         SELECT item_id, fulfillment_id, product_id, quantity_requested,
                quantity_picked, pick_status
         FROM fulfillment.items WHERE {where}
-        ORDER BY fulfillment_id LIMIT %s OFFSET %s
+        ORDER BY fulfillment_id, item_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1610,7 +1610,7 @@ def transport_load_items(
     rows = query(f"""
         SELECT item_id, load_id, fulfillment_id, store_order_id
         FROM transport.load_items WHERE {where}
-        ORDER BY load_id LIMIT %s OFFSET %s
+        ORDER BY load_id, item_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1859,7 +1859,7 @@ def grocery_returns(
                r.return_dt, r.reason, r.refund_method, r.refund_amount,
                r.is_restocked, r.scenario_tag, r.created_at
         FROM pos.returns r WHERE {where}
-        ORDER BY r.return_dt DESC LIMIT %s OFFSET %s
+        ORDER BY r.return_dt DESC, r.return_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1887,7 +1887,7 @@ def grocery_return_items(
         JOIN pos.products p ON p.product_id = ri.product_id
         JOIN pos.returns r ON r.return_id = ri.return_id
         WHERE {where}
-        ORDER BY r.return_dt DESC LIMIT %s OFFSET %s
+        ORDER BY r.return_dt DESC, ri.return_item_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1927,7 +1927,7 @@ def online_orders(
                o.pickup_window_start, o.pickup_window_end,
                o.promised_delivery_dt, o.completed_dt, o.scenario_tag
         FROM online.orders o WHERE {where}
-        ORDER BY o.placed_dt DESC LIMIT %s OFFSET %s
+        ORDER BY o.placed_dt DESC, o.order_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1951,7 +1951,7 @@ def online_order_items(
         JOIN online.orders o ON o.order_id = oi.order_id
         JOIN pos.products p ON p.product_id = oi.product_id
         WHERE {where}
-        ORDER BY o.placed_dt DESC LIMIT %s OFFSET %s
+        ORDER BY o.placed_dt DESC, oi.item_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1977,7 +1977,7 @@ def online_order_events(
     rows = query(f"""
         SELECT e.event_id, e.order_id, e.event_type, e.event_dt, e.note
         FROM online.order_events e WHERE {where}
-        ORDER BY e.event_dt LIMIT %s OFFSET %s
+        ORDER BY e.event_dt, e.event_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "grocery")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2201,7 +2201,7 @@ def support_tickets(
         FROM support.tickets t
         JOIN support.queues q ON q.queue_id = t.queue_id
         WHERE {where}
-        ORDER BY t.created_dt DESC LIMIT %s OFFSET %s
+        ORDER BY t.created_dt DESC, t.ticket_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2255,7 +2255,7 @@ def support_ticket_comments(
     rows = query(f"""
         SELECT comment_id, ticket_id, author_type, author_id, body, is_internal, created_dt
         FROM support.ticket_comments WHERE {where}
-        ORDER BY created_dt DESC LIMIT %s OFFSET %s
+        ORDER BY created_dt DESC, comment_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2285,7 +2285,7 @@ def support_ticket_actions(
         SELECT action_id, ticket_id, action_type, from_value, to_value,
                performed_by, created_dt
         FROM support.ticket_actions WHERE {where}
-        ORDER BY created_dt DESC LIMIT %s OFFSET %s
+        ORDER BY created_dt DESC, action_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2330,7 +2330,7 @@ def support_calls(
                c.has_ticket, c.recording_url, c.scenario_tag
         FROM voice.calls c JOIN support.queues q ON q.queue_id = c.queue_id
         WHERE {where}
-        ORDER BY c.offered_dt DESC LIMIT %s OFFSET %s
+        ORDER BY c.offered_dt DESC, c.call_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2392,7 +2392,7 @@ def support_chat_sessions(
                s.wait_seconds, s.duration_seconds, s.scenario_tag
         FROM chat.sessions s JOIN support.queues q ON q.queue_id = s.queue_id
         WHERE {where}
-        ORDER BY s.started_dt DESC LIMIT %s OFFSET %s
+        ORDER BY s.started_dt DESC, s.session_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2415,7 +2415,7 @@ def support_chat_messages(
     rows = query(f"""
         SELECT message_id, session_id, sender_type, sender_id, body, sent_dt
         FROM chat.messages WHERE {where}
-        ORDER BY sent_dt LIMIT %s OFFSET %s
+        ORDER BY sent_dt, message_id LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2456,7 +2456,7 @@ def support_surveys(
         SELECT survey_id, channel, interaction_id, customer_id, agent_id,
                sent_dt, responded_dt, nps_score, csat_score, reason_tag, verbatim
         FROM survey.surveys WHERE {where}
-        ORDER BY sent_dt DESC LIMIT %s OFFSET %s
+        ORDER BY sent_dt DESC, survey_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -2524,7 +2524,7 @@ def support_assignments(
         FROM training.assignments a
         JOIN training.courses c ON c.course_id = a.course_id
         WHERE {where}
-        ORDER BY a.assigned_dt DESC LIMIT %s OFFSET %s
+        ORDER BY a.assigned_dt DESC, a.assignment_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], "support")
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
