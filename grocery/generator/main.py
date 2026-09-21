@@ -170,9 +170,13 @@ def seed_all(conn, cfg):
     pos.seed_price_history(conn, cfg, products)
     inventory.seed_inventory(conn, cfg, products, locations['stores'])
     trucks = transport.seed_trucks(conn, truck_count=4)
-    pos.seed_named_coupons(conn, departments)
-    pos.seed_coupons(conn, cfg, departments, products)
-    pos.seed_combo_deals(conn, cfg, departments, products)
+    # Promotions are seeded with a window that reaches back over the backfill
+    # horizon: the back-dated transactions reference them, so a window opening
+    # "today" would leave every back-dated redemption outside it.
+    history_days = getattr(cfg.generator, 'backfill_lookback_days', 30)
+    pos.seed_named_coupons(conn, departments, history_days)
+    pos.seed_coupons(conn, cfg, departments, products, history_days)
+    pos.seed_combo_deals(conn, cfg, departments, products, history_days)
     pos.seed_loyalty_members(conn, cfg)
     # One-time: mark perishable products + assign shelf_life_days
     shrinkage.mark_perishable_products(conn)
@@ -213,7 +217,8 @@ def auto_backfill_if_fresh(conn, cfg):
     Idempotent and safe to call on every startup.
     """
     today = date.today()
-    lookback = today - timedelta(days=30)
+    lookback_days = getattr(cfg.generator, 'backfill_lookback_days', 30)
+    lookback = today - timedelta(days=lookback_days)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -397,9 +402,14 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         # Phase 5: coupon + combo deal lifecycle — deactivate expired, top up
         # active set so the API always serves a current batch (freshness
         # contract with data-lab: raw_pos.combo_deals went STALE when deals
-        # expired 2026-08-09 and nothing re-seeded them).
-        pos.seed_coupons(conn, cfg, departments, products)
-        pos.seed_combo_deals(conn, cfg, departments, products)
+        # expired 2026-08-09 and nothing re-seeded them). Then reconcile the
+        # promo rows against the redemptions actually on disk: windows that
+        # pass a transaction outside them and a uses_count nobody maintained
+        # are both source bugs data-lab asserts against.
+        history_days = getattr(cfg.generator, 'backfill_lookback_days', 30)
+        pos.seed_coupons(conn, cfg, departments, products, history_days)
+        pos.seed_combo_deals(conn, cfg, departments, products, history_days)
+        pos.reconcile_promotions(conn)
 
         # Phase 6: customer returns & refunds for transactions aged 2-14 days
         # (reversals + stock reintegration)
@@ -566,8 +576,10 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
 
             # Coupon + combo deal lifecycle (same as realtime Phase 5) —
             # a 30-day backfill must not leave deals expired at the end.
-            pos.seed_coupons(conn, cfg, departments, products)
-            pos.seed_combo_deals(conn, cfg, departments, products)
+            history_days = getattr(cfg.generator, 'backfill_lookback_days', 30)
+            pos.seed_coupons(conn, cfg, departments, products, history_days)
+            pos.seed_combo_deals(conn, cfg, departments, products, history_days)
+            pos.reconcile_promotions(conn)
 
             # Phase 6: returns for transactions aged 2-14 days relative to
             # this backfill day (same contract as realtime).
@@ -585,6 +597,11 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             """, (cur_date + timedelta(days=1),))
         conn.commit()
         cur_date += timedelta(days=1)
+
+    # The last (partial) backfill day skips the day-end block above, so its
+    # redemptions would stay uncounted until the next simulated midnight.
+    # Reconcile once here so a freshly loaded database reads exactly correct.
+    pos.reconcile_promotions(conn)
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -614,6 +631,11 @@ def main():
 
     # Auto-start a 30-day backfill on a fresh (empty) database.
     auto_backfill_if_fresh(conn, cfg)
+
+    # Repair promo windows/counters against whatever history is already on
+    # disk — an install generated before the windowing fix would otherwise
+    # keep its out-of-window redemptions (card t_01b4fe4f). Idempotent.
+    pos.reconcile_promotions(conn)
 
     log.info("Generator ready. Entering main loop.")
 

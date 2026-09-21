@@ -37,7 +37,7 @@ SQL_SPEC_PATH = os.path.join(
     os.path.dirname(__file__), "..", "sql", "check_cross_schema_integrity.sql"
 )
 
-VALID_DIMENSIONS = {"hard_fk", "semantic_type"}
+VALID_DIMENSIONS = {"hard_fk", "semantic_type", "temporal"}
 
 # Columns that carry a generation/event timestamp. Assertions that reference one
 # of these MUST also scope to completed days (< CURRENT_DATE), because the
@@ -90,6 +90,7 @@ def test_all_assertions_well_formed():
 def test_dimension_counts_nonzero():
     assert len(by_dimension("hard_fk")) >= 1
     assert len(by_dimension("semantic_type")) >= 1
+    assert len(by_dimension("temporal")) >= 1
 
 
 def test_sql_spec_file_documents_every_assertion():

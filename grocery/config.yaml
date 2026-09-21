@@ -7,6 +7,8 @@
 generator:
   tick_interval_seconds: 30        # wall-clock seconds between generation ticks
   simulation_minutes_per_tick: 15  # simulated time each tick represents
+  backfill_lookback_days: 30       # history a fresh DB is backfilled over; also
+                                   # the horizon promo validity windows start at
 
 locations:
   store_count: 3                   # number of store locations

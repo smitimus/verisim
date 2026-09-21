@@ -22,6 +22,69 @@ PAYMENT_WEIGHTS = [0.12, 0.38, 0.28, 0.08, 0.10, 0.04]
 
 TIERS = ['bronze', 'silver', 'gold', 'platinum']
 
+# Fallback horizon for promotion validity windows when the caller does not
+# pass one in. Keep in sync with GeneratorConfig.backfill_lookback_days.
+DEFAULT_PROMO_HISTORY_DAYS = 30
+
+
+# ---------------------------------------------------------------------------
+# Promotion validity windows
+# ---------------------------------------------------------------------------
+
+def _as_date(value) -> Optional[date]:
+    """Coerce a DATE (or an ISO string from JSON) to a `date`, else None."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _promo_applies_on(promo: Dict, on_date: date) -> bool:
+    """True when `on_date` falls inside the promotion's own validity window.
+
+    Promotions are only applied to — and therefore only ever tagged on —
+    transactions whose date is inside `[valid_from, valid_until]`. That is the
+    contract data-lab asserts (`assert_coupon_dates_valid` /
+    `assert_deal_dates_valid`: every item carrying a promo id must satisfy
+    `transaction_dt between valid_from and valid_until`).
+
+    A promo with no resolvable window is treated as *not* applicable: the
+    window is the contract, so an unknown one fails closed rather than
+    silently writing a violating row.
+    """
+    valid_from = _as_date(promo.get('valid_from'))
+    valid_until = _as_date(promo.get('valid_until'))
+    if valid_from is None or valid_until is None:
+        return False
+    return valid_from <= on_date <= valid_until
+
+
+def _promo_history_start(cur, history_days: int) -> date:
+    """Earliest date a promotion seeded *now* has to be valid from.
+
+    The generator back-dates POS transactions across the backfill horizon
+    (`main.auto_backfill_if_fresh` / `main.run_backfill`), so a promo row
+    created at the end of that horizon must not start after the oldest
+    transaction that can carry its id. Take the earlier of the configured
+    horizon and the oldest transaction already on disk, so a database older
+    than the horizon still gets a window that covers its own history.
+    """
+    today = date.today()
+    horizon = today - timedelta(days=max(0, int(history_days)))
+    cur.execute("SELECT min(transaction_dt)::date FROM pos.transactions")
+    row = cur.fetchone()
+    earliest = row[0] if row else None
+    earliest = _as_date(earliest)
+    if earliest is not None and earliest < horizon:
+        return earliest
+    return horizon
+
 
 # ---------------------------------------------------------------------------
 # Seeding
@@ -146,11 +209,17 @@ def fetch_active_products(conn) -> List[Dict]:
         return _fetch_active_products(cur)
 
 
-def seed_named_coupons(conn, departments: List[Dict]) -> None:
+def seed_named_coupons(conn, departments: List[Dict],
+                       history_days: int = DEFAULT_PROMO_HISTORY_DAYS) -> None:
     """Seed recognizable pre-defined coupons. Idempotent by code."""
     dept_by_name = {d['name'].lower(): d['department_id'] for d in departments}
     today = date.today()
     valid_until = today + timedelta(days=365)
+    with conn.cursor() as cur:
+        # Back-date the window to the backfill horizon: these coupons are what
+        # the back-dated transactions reference, so a window starting "today"
+        # leaves every one of those items outside it (card t_01b4fe4f).
+        valid_from = _promo_history_start(cur, history_days)
 
     NAMED_COUPONS = [
         ("SAVE5OFF50",  "$5 off any purchase of $50 or more",         "dollar_off", 5.00,  50.00, None,                           None),
@@ -166,7 +235,7 @@ def seed_named_coupons(conn, departments: List[Dict]) -> None:
     records = []
     for code, desc, ctype, disc, min_purch, dept_id, prod_id in NAMED_COUPONS:
         records.append((code, desc, ctype, disc, min_purch, dept_id, prod_id,
-                        None, 0, today, valid_until, True))
+                        None, 0, valid_from, valid_until, True))
 
     with conn.cursor() as cur:
         execute_values(cur, """
@@ -180,7 +249,8 @@ def seed_named_coupons(conn, departments: List[Dict]) -> None:
     log.info("Named coupons seeded (or already present).")
 
 
-def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict]) -> List[Dict]:
+def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict],
+                 history_days: int = DEFAULT_PROMO_HISTORY_DAYS) -> List[Dict]:
     """Seed active coupons. Idempotent; deactivates expired coupons and tops
     the active set back up to `active_at_any_time`."""
     with conn.cursor() as cur:
@@ -205,6 +275,11 @@ def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict
     dept_ids = [d['department_id'] for d in departments]
     prod_ids = [p['product_id'] for p in products]
     today = date.today()
+    with conn.cursor() as cur:
+        # Same horizon rule as seed_named_coupons: a freshly created coupon is
+        # referenced by the back-dated transactions of the whole horizon, so
+        # its window has to start where that history starts.
+        horizon = _promo_history_start(cur, history_days)
     records = []
 
     for i in range(cfg.coupons.active_at_any_time - active):
@@ -213,7 +288,8 @@ def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict
             else round(random.uniform(0.50, 2.00), 2)
         dept_id = random.choice(dept_ids) if random.random() < 0.7 else None
         prod_id = random.choice(prod_ids) if (not dept_id and random.random() < 0.5) else None
-        valid_from = today - timedelta(days=random.randint(0, 3))
+        # Spread the start a little (never later than the horizon).
+        valid_from = horizon - timedelta(days=random.randint(0, 3))
         valid_until = today + timedelta(days=cfg.coupons.valid_duration_days)
         code = f"FRESH{fake.bothify('??##??').upper()}"
         desc = f"{int(discount * 100)}% off {coupon_type.replace('_', ' ')}" \
@@ -236,14 +312,16 @@ def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict
 def _fetch_active_coupons(cur) -> List[Dict]:
     today = date.today()
     cur.execute("""
-        SELECT coupon_id, coupon_type, discount_value, department_id, product_id
+        SELECT coupon_id, coupon_type, discount_value, department_id, product_id,
+               valid_from, valid_until
         FROM pos.coupons
         WHERE is_active = TRUE AND valid_from <= %s AND valid_until >= %s
     """, (today, today))
     return [
         {'coupon_id': str(r[0]), 'coupon_type': r[1], 'discount_value': float(r[2]),
          'department_id': str(r[3]) if r[3] else None,
-         'product_id': str(r[4]) if r[4] else None}
+         'product_id': str(r[4]) if r[4] else None,
+         'valid_from': r[5], 'valid_until': r[6]}
         for r in cur.fetchall()
     ]
 
@@ -253,7 +331,8 @@ def fetch_active_coupons(conn) -> List[Dict]:
         return _fetch_active_coupons(cur)
 
 
-def seed_combo_deals(conn, cfg: Config, departments: List[Dict], products: List[Dict]) -> List[Dict]:
+def seed_combo_deals(conn, cfg: Config, departments: List[Dict], products: List[Dict],
+                     history_days: int = DEFAULT_PROMO_HISTORY_DAYS) -> List[Dict]:
     """Seed combo deals. Idempotent; deactivates expired deals and tops the
     active set back up to `active_at_any_time`."""
     with conn.cursor() as cur:
@@ -277,6 +356,9 @@ def seed_combo_deals(conn, cfg: Config, departments: List[Dict], products: List[
              cfg.combo_deals.active_at_any_time - active, cfg.combo_deals.active_at_any_time)
     dept_ids = [d['department_id'] for d in departments]
     today = date.today()
+    with conn.cursor() as cur:
+        # Same horizon rule as the coupon seeds — see seed_named_coupons.
+        horizon = _promo_history_start(cur, history_days)
     records = []
 
     DEAL_TEMPLATES = [
@@ -290,7 +372,7 @@ def seed_combo_deals(conn, cfg: Config, departments: List[Dict], products: List[
         template = DEAL_TEMPLATES[i % len(DEAL_TEMPLATES)]
         name, deal_type, trigger_qty, deal_price = template
         dept_id = random.choice(dept_ids)
-        valid_from = today - timedelta(days=random.randint(0, 2))
+        valid_from = horizon - timedelta(days=random.randint(0, 2))
         valid_until = today + timedelta(days=cfg.combo_deals.valid_duration_days)
         desc = f"{name} on selected items"
         records.append((name, desc, deal_type, trigger_qty, None, dept_id,
@@ -311,7 +393,7 @@ def _fetch_active_deals(cur) -> List[Dict]:
     today = date.today()
     cur.execute("""
         SELECT deal_id, deal_type, trigger_qty, trigger_product_id,
-               trigger_department_id, deal_price
+               trigger_department_id, deal_price, valid_from, valid_until
         FROM pos.combo_deals
         WHERE is_active = TRUE AND valid_from <= %s AND valid_until >= %s
     """, (today, today))
@@ -319,7 +401,8 @@ def _fetch_active_deals(cur) -> List[Dict]:
         {'deal_id': str(r[0]), 'deal_type': r[1], 'trigger_qty': r[2],
          'trigger_product_id': str(r[3]) if r[3] else None,
          'trigger_department_id': str(r[4]) if r[4] else None,
-         'deal_price': float(r[5])}
+         'deal_price': float(r[5]),
+         'valid_from': r[6], 'valid_until': r[7]}
         for r in cur.fetchall()
     ]
 
@@ -327,6 +410,91 @@ def _fetch_active_deals(cur) -> List[Dict]:
 def fetch_active_deals(conn) -> List[Dict]:
     with conn.cursor() as cur:
         return _fetch_active_deals(cur)
+
+
+def reconcile_promotions(conn) -> Dict[str, int]:
+    """Make the promotion rows agree with the history that references them.
+
+    Two derived facts are recomputed from `pos.transaction_items` — the only
+    place a redemption is ever written:
+
+    * `pos.coupons.uses_count` — one redemption per coupon-tagged transaction.
+      Nothing ever wrote it after seeding, so every coupon read 0 uses while
+      tens of thousands of line items referenced it (card t_01b4fe4f).
+    * `valid_from` / `valid_until` — widened to cover usage that already falls
+      outside the window. Seeding only stamps the window from *now* forward,
+      so a database generated before the windowing fix keeps its out-of-window
+      redemptions. This repairs those rows in place instead of requiring a
+      wipe. It is idempotent: the generator no longer tags outside the window
+      (`_promo_applies_on`), so after the first pass there is nothing to widen.
+
+    Cheap enough for a per-simulated-day lifecycle step; commits its own work
+    and returns the row counts touched, for logging.
+    """
+    touched = {'coupons': 0, 'deals': 0, 'coupons_zeroed': 0}
+    with conn.cursor() as cur:
+        # Coupons: window + redemption count in one aggregate pass.
+        cur.execute("""
+            WITH usage AS (
+                SELECT ti.coupon_id,
+                       count(DISTINCT ti.transaction_id) AS redemptions,
+                       min(t.transaction_dt)::date AS min_used,
+                       max(t.transaction_dt)::date AS max_used
+                FROM pos.transaction_items ti
+                JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+                WHERE ti.coupon_id IS NOT NULL
+                GROUP BY ti.coupon_id
+            )
+            UPDATE pos.coupons c
+               SET valid_from  = LEAST(c.valid_from, u.min_used),
+                   valid_until = GREATEST(c.valid_until, u.max_used),
+                   uses_count  = u.redemptions
+              FROM usage u
+             WHERE u.coupon_id = c.coupon_id
+               AND (c.valid_from > u.min_used
+                    OR c.valid_until < u.max_used
+                    OR c.uses_count IS DISTINCT FROM u.redemptions)
+        """)
+        touched['coupons'] = cur.rowcount
+
+        # Combo deals have no counter column — windows only.
+        cur.execute("""
+            WITH usage AS (
+                SELECT ti.deal_id,
+                       min(t.transaction_dt)::date AS min_used,
+                       max(t.transaction_dt)::date AS max_used
+                FROM pos.transaction_items ti
+                JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+                WHERE ti.deal_id IS NOT NULL
+                GROUP BY ti.deal_id
+            )
+            UPDATE pos.combo_deals d
+               SET valid_from  = LEAST(d.valid_from, u.min_used),
+                   valid_until = GREATEST(d.valid_until, u.max_used)
+              FROM usage u
+             WHERE u.deal_id = d.deal_id
+               AND (d.valid_from > u.min_used OR d.valid_until < u.max_used)
+        """)
+        touched['deals'] = cur.rowcount
+
+        # A coupon whose redemptions were removed (API item delete) must not
+        # keep a stale count. Bounded by the distinct coupon ids in usage.
+        cur.execute("""
+            WITH used AS (
+                SELECT DISTINCT coupon_id FROM pos.transaction_items
+                WHERE coupon_id IS NOT NULL
+            )
+            UPDATE pos.coupons c
+               SET uses_count = 0
+             WHERE c.uses_count <> 0
+               AND NOT EXISTS (SELECT 1 FROM used u WHERE u.coupon_id = c.coupon_id)
+        """)
+        touched['coupons_zeroed'] = cur.rowcount
+    conn.commit()
+    if any(touched.values()):
+        log.info("Promotion reconcile: %d coupons, %d deals, %d counters zeroed",
+                 touched['coupons'], touched['deals'], touched['coupons_zeroed'])
+    return touched
 
 
 def seed_loyalty_members(conn, cfg: Config) -> List[Dict]:
@@ -503,6 +671,17 @@ def generate_pos_transactions(
                 ('store', 'produce', 'deli', 'bakery', 'meat', 'management')
                 and e['location_type'] == 'store']
 
+    # Promotions are only applied inside their own validity window. The
+    # candidate list is fetched against *today*, so during a backfill it also
+    # contains promos that were not on the books yet on the simulated date;
+    # tagging those onto a back-dated transaction is what put 24k coupon /
+    # 7k deal items outside their promo's window (card t_01b4fe4f). Filtering
+    # on the simulated date makes `transaction_dt between valid_from and
+    # valid_until` hold by construction.
+    txn_date = simulation_dt.date()
+    active_coupons = [c for c in coupons if _promo_applies_on(c, txn_date)]
+    active_deals = [d for d in deals if _promo_applies_on(d, txn_date)]
+
     # Active promotions by department name
     promo_dept_discount = {dept: disc for dept, disc in scenario.active_promotions}
 
@@ -561,8 +740,8 @@ def generate_pos_transactions(
         coupon_savings = 0.0
         coupon = None
         loyalty_eng = getattr(scenario, 'loyalty_engagement_modifier', 1.0)
-        if member_id and coupons and random.random() < cfg.coupons.coupon_use_rate * scenario.coupon_multiplier * loyalty_eng:
-            coupon = random.choice(coupons)
+        if member_id and active_coupons and random.random() < cfg.coupons.coupon_use_rate * scenario.coupon_multiplier * loyalty_eng:
+            coupon = random.choice(active_coupons)
             if coupon['coupon_type'] == 'percent_off':
                 coupon_savings = round(subtotal * coupon['discount_value'] * scenario.coupon_multiplier, 2)
             elif coupon['coupon_type'] == 'dollar_off':
@@ -571,8 +750,8 @@ def generate_pos_transactions(
         # Apply a combo deal
         deal_savings = 0.0
         deal = None
-        if deals and random.random() < cfg.combo_deals.combo_use_rate:
-            deal = random.choice(deals)
+        if active_deals and random.random() < cfg.combo_deals.combo_use_rate:
+            deal = random.choice(active_deals)
             deal_dept_products = [p for p in cart
                                    if deal['trigger_department_id'] is None
                                    or _dept_id_for_product(p) == deal['trigger_department_id']]

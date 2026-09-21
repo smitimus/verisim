@@ -19,6 +19,13 @@ Two assertion classes
   e.g. ``ordering.store_orders.store_location_id`` must resolve to a location
   whose ``location_type = 'store'``, not a warehouse or DC. An orphan row ==
   failure.
+* ``temporal`` — the key and its parent both exist, but the *window* on the
+  parent does not cover the child's timestamp: a coupon/deal-tagged line item
+  whose ``transaction_dt`` falls outside the promotion's
+  ``valid_from``/``valid_until``. Also NOT FK-enforced, and the same invariant
+  data-lab asserts with ``assert_coupon_dates_valid`` /
+  ``assert_deal_dates_valid`` (verisim card t_01b4fe4f: 24k coupon + 7k deal
+  items were outside their promo's window). An offending row == failure.
 
 Partial-day tolerance
 ---------------------
@@ -459,6 +466,41 @@ ASSERTIONS: List[AssertionSpec] = [
                 WHERE fi.fulfillment_id = li.fulfillment_id)
         """,
     ),
+    # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
+    # The promo key resolves, but the promotion's validity window does not
+    # cover the transaction date it was applied to. Fixed at the source by
+    # pos._promo_applies_on() (application-time guard) + the horizon-aware
+    # seeding and reconcile_promotions() (verisim t_01b4fe4f).
+    AssertionSpec(
+        id="TIME-01",
+        dimension="temporal",
+        title="pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until",
+        sql="""
+            SELECT ti.item_id, ti.coupon_id, t.transaction_dt::date,
+                   c.valid_from, c.valid_until
+            FROM pos.transaction_items ti
+            JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+            JOIN pos.coupons c ON c.coupon_id = ti.coupon_id
+            WHERE ti.coupon_id IS NOT NULL
+              AND t.transaction_dt::date NOT BETWEEN c.valid_from AND c.valid_until
+              AND t.transaction_dt::date < CURRENT_DATE
+        """,
+    ),
+    AssertionSpec(
+        id="TIME-02",
+        dimension="temporal",
+        title="pos.transaction_items.deal_id — transaction_dt must be inside the combo deal's valid_from..valid_until",
+        sql="""
+            SELECT ti.item_id, ti.deal_id, t.transaction_dt::date,
+                   d.valid_from, d.valid_until
+            FROM pos.transaction_items ti
+            JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+            JOIN pos.combo_deals d ON d.deal_id = ti.deal_id
+            WHERE ti.deal_id IS NOT NULL
+              AND t.transaction_dt::date NOT BETWEEN d.valid_from AND d.valid_until
+              AND t.transaction_dt::date < CURRENT_DATE
+        """,
+    ),
 ]
 
 
@@ -495,6 +537,7 @@ def summarize(results) -> dict:
     failed = [(spec, rows) for spec, rows in results if rows]
     hard_failed = [spec.id for spec, rows in failed if spec.dimension == "hard_fk"]
     sema_failed = [spec.id for spec, rows in failed if spec.dimension == "semantic_type"]
+    temporal_failed = [spec.id for spec, rows in failed if spec.dimension == "temporal"]
     return {
         "total": total,
         "passed": total - len(failed),
@@ -502,6 +545,7 @@ def summarize(results) -> dict:
         "failed_ids": [spec.id for spec, _ in failed],
         "hard_failed": hard_failed,
         "semantic_failed": sema_failed,
+        "temporal_failed": temporal_failed,
     }
 
 

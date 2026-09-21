@@ -59,6 +59,10 @@ class InventoryConfig:
 class GeneratorConfig:
     tick_interval_seconds: int = 30
     simulation_minutes_per_tick: int = 15
+    # How far back a fresh database is backfilled. Also the horizon promotion
+    # validity windows are back-dated to, so a promo seeded at the end of the
+    # horizon covers every transaction that can reference it.
+    backfill_lookback_days: int = 30
 
 
 @dataclass
@@ -179,6 +183,8 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.generator.tick_interval_seconds = int(gen['tick_interval_seconds'])
     if 'simulation_minutes_per_tick' in gen:
         cfg.generator.simulation_minutes_per_tick = int(gen['simulation_minutes_per_tick'])
+    if 'backfill_lookback_days' in gen:
+        cfg.generator.backfill_lookback_days = int(gen['backfill_lookback_days'])
 
     loc = data.get('locations', {})
     if 'store_count' in loc:

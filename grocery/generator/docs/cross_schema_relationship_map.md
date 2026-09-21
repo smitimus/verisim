@@ -81,6 +81,32 @@ the highest-risk gaps and are asserted explicitly in the harness:
 | `fulfillment.orders.assigned_to` | employee with `department = 'warehouse'` at a `warehouse` location |
 | `ordering.store_orders.created_by` / `approved_by` | employee with `department = 'management'` |
 
+### Promotion validity windows (temporal — also NOT FK-enforced)
+
+The FK guarantees `pos.transaction_items.coupon_id` / `deal_id` resolves to a
+promo row, not that the promo was *valid* on that day. A promotion may only be
+applied inside its own window, so every attributed line item must satisfy:
+
+    transaction_dt::date BETWEEN valid_from AND valid_until
+
+Enforced at the source in `models/pos.py`:
+
+* `_promo_applies_on()` — application-time guard; a promo is never tagged onto
+  a transaction dated outside its window (the backfill fetches promos against
+  *today*, so without this a back-dated transaction inherits a window that
+  opens later — 24k coupon / 7k deal items on the dev EDW, verisim
+  t_01b4fe4f);
+* seeding (`seed_named_coupons` / `seed_coupons` / `seed_combo_deals`) back-dates
+  `valid_from` over `generator.backfill_lookback_days`, so a promo created at
+  the end of the horizon covers the history that references it;
+* `reconcile_promotions()` (startup, each backfill day-end, end of backfill, and
+  each simulated midnight) widens any window that still does not cover recorded
+  usage, and derives `pos.coupons.uses_count` from the redemptions on disk
+  (one per coupon-tagged transaction).
+
+Asserted by harness checks `TIME-01` / `TIME-02`; data-lab mirrors them with
+`assert_coupon_dates_valid` / `assert_deal_dates_valid`.
+
 ### Generation-order guarantee
 
 `grocery/generator/main.py::run_tick` runs the supply-chain block

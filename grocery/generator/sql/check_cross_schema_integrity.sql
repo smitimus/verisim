@@ -5,11 +5,14 @@
 -- Each block returns the OFFENDING child rows for one cross-schema link.
 -- Zero rows returned == integrity holds.
 --
--- Two classes:
+-- Three classes:
 --   hard_fk      : child key references a parent row that does not exist
 --                  (Postgres FK constraints normally prevent these).
 --   semantic_type: key exists but points at the WRONG KIND of parent
 --                  (NOT FK-enforced — highest-risk gaps).
+--   temporal     : key and parent both exist but the parent's validity window
+--                  does not cover the child's timestamp (coupon/deal-tagged
+--                  line items outside valid_from..valid_until).
 --
 -- Partial-day tolerance: time-bounded tables filter to completed days
 -- (col::date < CURRENT_DATE) because the supply-chain block only runs at
@@ -295,5 +298,38 @@ SELECT li.item_id, li.load_id, li.fulfillment_id
               AND NOT EXISTS (
                 SELECT 1 FROM fulfillment.items fi
                 WHERE fi.fulfillment_id = li.fulfillment_id)
+;
+
+
+-- ---------------------------------------------------------------------------
+-- TEMPORAL WINDOW MISMATCHES (2 checks)
+-- ---------------------------------------------------------------------------
+-- The promo key resolves, but the promotion's validity window does not cover
+-- the transaction date it was applied to. Source-side contract: only apply a
+-- promotion inside its window (pos._promo_applies_on), seed the window over
+-- the backfill horizon, and reconcile the window against recorded usage
+-- (pos.reconcile_promotions). Same invariant as data-lab's
+-- assert_coupon_dates_valid / assert_deal_dates_valid.
+
+-- [TIME-01] transaction_dt must be inside the referenced coupon's window
+SELECT ti.item_id, ti.coupon_id, t.transaction_dt::date,
+                   c.valid_from, c.valid_until
+            FROM pos.transaction_items ti
+            JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+            JOIN pos.coupons c ON c.coupon_id = ti.coupon_id
+            WHERE ti.coupon_id IS NOT NULL
+              AND t.transaction_dt::date NOT BETWEEN c.valid_from AND c.valid_until
+              AND t.transaction_dt::date < CURRENT_DATE
+;
+
+-- [TIME-02] transaction_dt must be inside the referenced combo deal's window
+SELECT ti.item_id, ti.deal_id, t.transaction_dt::date,
+                   d.valid_from, d.valid_until
+            FROM pos.transaction_items ti
+            JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+            JOIN pos.combo_deals d ON d.deal_id = ti.deal_id
+            WHERE ti.deal_id IS NOT NULL
+              AND t.transaction_dt::date NOT BETWEEN d.valid_from AND d.valid_until
+              AND t.transaction_dt::date < CURRENT_DATE
 ;
 

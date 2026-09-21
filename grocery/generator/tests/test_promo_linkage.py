@@ -6,7 +6,7 @@ used to leave them NULL. This test forces a coupon + a combo deal to apply and
 asserts the applied IDs are propagated onto the relevant line items (no schema
 change — just population of the existing columns).
 """
-from datetime import datetime
+from datetime import datetime, date
 from unittest.mock import patch
 
 import random
@@ -87,6 +87,8 @@ def test_coupon_deal_linkage(monkeypatch):
         }
     ]
     members = [{"member_id": "m1"}]
+    # Windows must cover sim_dt — promotions are only applied inside their own
+    # validity window (see test_promo_validity.py).
     coupons = [
         {
             "coupon_id": "c1",
@@ -94,6 +96,8 @@ def test_coupon_deal_linkage(monkeypatch):
             "discount_value": 0.1,
             "department_id": None,
             "product_id": None,
+            "valid_from": date(2026, 5, 1),
+            "valid_until": date(2026, 7, 1),
         }
     ]
     deals = [
@@ -104,6 +108,8 @@ def test_coupon_deal_linkage(monkeypatch):
             "trigger_department_id": None,
             "trigger_product_id": None,
             "deal_price": 1.0,
+            "valid_from": date(2026, 5, 1),
+            "valid_until": date(2026, 7, 1),
         }
     ]
 
