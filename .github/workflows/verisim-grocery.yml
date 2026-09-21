@@ -107,6 +107,14 @@ jobs:
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # The `secrets` context is not available in a job-level `if:`, so the credentials are
+    # mapped to env here and every publishing step is gated on DOCKER_USERNAME being set.
+    # Without the repo secrets the job stays green and skips publishing; with them it
+    # publishes exactly as before. (Previously an unset secret failed the whole run at the
+    # "Log in to Docker Hub" step, so a red X meant "no credentials", not "bad code".)
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -114,10 +122,11 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
+        if: env.DOCKER_USERNAME != ''
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
 
       - name: Compute tags
         id: meta
@@ -129,6 +138,7 @@ jobs:
           fi
 
       - name: Push to Docker Hub
+        if: env.DOCKER_USERNAME != ''
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -137,3 +147,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
+
+      - name: Publish skipped — no Docker Hub credentials
+        if: env.DOCKER_USERNAME == ''
+        run: |
+          echo "::notice title=Docker Hub publishing skipped::Add the repository secrets DOCKER_USERNAME and DOCKER_PASSWORD to publish ${IMAGE_NAME}:latest and :${GITHUB_SHA}. Until then this job verifies nothing and publishes nothing."
