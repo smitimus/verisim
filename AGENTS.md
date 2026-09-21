@@ -114,14 +114,40 @@ docker stop verisim-grocery-test && sleep 120 && docker start verisim-grocery-te
 `.github/workflows/verisim-grocery.yml` has two blocking jobs before `publish`:
 - `test`: generator pytest (`grocery/generator/tests/`) with `--cov` and a
   coverage floor (`fail_under` in `pyproject.toml`). Any failure blocks the build.
-- `integration`: builds the standalone image, runs the smoke test, then runs the
-  API contract tests (`grocery/api/tests/`) against the live container. API
-  regressions block. `publish` runs `needs: [test, integration]`.
+- `integration`: builds the standalone image, runs the smoke test, **waits for the
+  container's first-boot 30-day backfill to finish** (the contract tests compare row
+  counts between two calls, so they must not start while the backfill is still
+  writing), then runs the API contract tests (`grocery/api/tests/`) against the live
+  container. API regressions block. `publish` runs `needs: [test, integration]`.
 
 The API suite's `ensure_api_reachable` fixture auto-skips when no API is up
 (useful locally); in CI the container is already verified reachable, so a
-network failure there is a real error. Docker Hub push requires
-`DOCKER_USERNAME`/`DOCKER_PASSWORD` repo secrets.
+network failure there is a real error. The `quiesced_generator` fixture also
+auto-skips on that path — it pauses the generator for the session and then blocks
+until a canary row count stops moving, because `/generator/pause` is cooperative
+and a paused generator can still be finishing the tick (or backfill day) in flight.
+
+### Publishing — an absent credential is a failure
+
+`publish` maps `secrets.DOCKER_USERNAME` / `secrets.DOCKER_PASSWORD` to job env and its
+steps are gated on the **event**, never on the secret being empty:
+
+- `github.event_name != 'pull_request'` → the credential guard, login, tag computation
+  and push. On main and on `v*` tags these steps always run, so they cannot be skipped
+  silently.
+- `github.event_name == 'pull_request'` → the skip notice. A PR (fork or in-repo)
+  builds and tests only.
+
+The guard (`Require Docker Hub credentials`) fails the run when either secret is empty,
+naming the missing one and where to add it (`smitimus/verisim` → Settings → Secrets and
+variables → Actions; `DOCKER_USERNAME` = the Docker Hub account, `DOCKER_PASSWORD` = a
+Docker Hub access token with read/write on `smiti/verisim-grocery`). An unusable
+credential fails at `docker/login-action` instead. That is deliberate: between
+2026-08-31 and 2026-09-21 the job reported **success** while publishing nothing, so
+`smiti/verisim-grocery:latest` sat frozen at 1.3.2 and the deploy shipped the stale tag.
+**Never re-introduce an `env.DOCKER_USERNAME != ''` gate or a green "publishing
+skipped" notice** — a Publish job that passes without publishing makes every
+image-by-digest pin in the data-lab record worthless.
 
 ## Generator Config (`config.yaml`)
 

@@ -90,6 +90,30 @@ jobs:
             fi
           done
 
+      # /health answers as soon as uvicorn is up — long before the container's
+      # first-boot 30-day backfill has finished writing. The contract tests compare
+      # row counts between two calls, so starting them mid-backfill makes a moving
+      # row count look like pagination loss (that is exactly how main went red on
+      # 2026-09-21: 3 failures, all "the count changed between two reads"). Wait for
+      # the generator to leave backfill mode; the suite's quiesced_generator fixture
+      # then pauses realtime generation for each walk.
+      - name: Wait for the initial 30-day backfill to finish
+        run: |
+          for i in $(seq 1 180); do
+            MODE=$(curl -s http://localhost:8010/grocery/status \
+              | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p' | head -1)
+            TOTAL=$(curl -s "http://localhost:8010/grocery/pos/transactions?limit=1" \
+              | sed -n 's/.*"total":\([0-9]*\).*/\1/p' | head -1)
+            echo "[$i] mode=${MODE:-unknown} pos.transactions=${TOTAL:-unknown}"
+            if [ "$MODE" = "realtime" ] || [ "$MODE" = "stopped" ]; then
+              echo "Generator is out of backfill (mode=$MODE) — contract tests can run."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error title=Backfill never finished::The generator was still in backfill mode after 15 minutes, so the contract tests could not run against a settled dataset."
+          exit 1
+
       # Hard-fail: image API regressions block the build. If the container's API
       # is up (smoke test passed) every contract test must pass; unreachable API
       # here means the smoke test raced, so fail rather than silently skip.
@@ -104,25 +128,46 @@ jobs:
     name: Push to Docker Hub
     runs-on: ubuntu-latest
     needs: [test, integration]
+    # Runs for a main/version-tag push (and publishes), and for a pull request, where it
+    # deliberately skips publishing: a fork cannot see the repository secrets. Which of
+    # the two branches this job takes is decided by the EVENT and never by whether the
+    # credential happens to be empty — see "Require Docker Hub credentials" below.
     if: >-
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    # The `secrets` context is not available in a job-level `if:`, so the credentials are
-    # mapped to env here and every publishing step is gated on DOCKER_USERNAME being set.
-    # Without the repo secrets the job stays green and skips publishing; with them it
-    # publishes exactly as before. (Previously an unset secret failed the whole run at the
-    # "Log in to Docker Hub" step, so a red X meant "no credentials", not "bad code".)
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     env:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
+      # A publish that cannot run is a FAILURE, not a green notice. 2026-08-31 → 2026-09-21
+      # is what the old behaviour bought: main went green on every push while publishing
+      # nothing, `smiti/verisim-grocery:latest` sat frozen at 1.3.2, and the deploy picked
+      # up the stale tag. On main and on v* tags an absent (or unusable) credential has to
+      # be loud. Pull requests are the only skip, and that skip is the event's, not the
+      # secret's — a release can therefore never be skipped silently again.
+      - name: Require Docker Hub credentials
+        if: github.event_name != 'pull_request'
+        run: |
+          missing=""
+          if [ -z "${DOCKER_USERNAME}" ]; then missing="DOCKER_USERNAME"; fi
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            missing="${missing:+${missing} and }DOCKER_PASSWORD"
+          fi
+          if [ -n "${missing}" ]; then
+            echo "::error title=Missing Docker Hub credential::Cannot publish ${IMAGE_NAME} for ${GITHUB_REF_NAME}: the repository secret(s) ${missing} are not set. Add them under smitimus/verisim -> Settings -> Secrets and variables -> Actions (DOCKER_USERNAME = the Docker Hub account, DOCKER_PASSWORD = a Docker Hub access token with read/write on ${IMAGE_NAME}). Publishing on main and on version tags is required, so this run fails instead of skipping."
+            exit 1
+          fi
+          echo "Docker Hub credentials are present (DOCKER_USERNAME=${DOCKER_USERNAME})."
+
       - name: Set up Docker Buildx
+        if: github.event_name != 'pull_request'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: env.DOCKER_USERNAME != ''
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKER_USERNAME }}
@@ -130,6 +175,7 @@ jobs:
 
       - name: Compute tags
         id: meta
+        if: github.event_name != 'pull_request'
         run: |
           if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
@@ -138,7 +184,7 @@ jobs:
           fi
 
       - name: Push to Docker Hub
-        if: env.DOCKER_USERNAME != ''
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -148,7 +194,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
 
-      - name: Publish skipped — no Docker Hub credentials
-        if: env.DOCKER_USERNAME == ''
+      - name: Publishing skipped — pull request
+        if: github.event_name == 'pull_request'
         run: |
-          echo "::notice title=Docker Hub publishing skipped::Add the repository secrets DOCKER_USERNAME and DOCKER_PASSWORD to publish ${IMAGE_NAME}:latest and :${GITHUB_SHA}. Until then this job verifies nothing and publishes nothing."
+          echo "::notice title=Docker Hub publishing skipped (pull request)::Publishing runs on pushes to main and on v* tags. A pull request cannot see the repository secrets, so it builds and tests only - nothing is published and nothing needs to be."
