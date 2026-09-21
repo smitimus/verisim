@@ -424,3 +424,40 @@ def test_state_clock_makes_the_completion_invariant_deterministic(quiesced_gener
         "updated_before did not bound the state: an order whose completion is stamped "
         "after the read end is still returned as completed"
     )
+
+
+def test_the_generator_bumps_the_state_clock_with_every_transition():
+    """``updated_at`` is only a state clock while every status change moves it.
+
+    ``advance_online_lifecycle`` is the only code that mutates ``online.orders``, and it
+    must stamp the change and write the event it explains in **one** transaction — the
+    route's as-of filter and the ``orders.updated_at == MAX(order_events.created_at)``
+    identity the ingest's snapshot recipe rests on both come from that. A later edit that
+    drops the ``updated_at`` bump, or commits between the two statements, would leave the
+    API's contract silently wrong (nothing else would fail: ``updated_before`` would just
+    start returning rows in a state the events read cannot match).
+    """
+    source = (REPO_ROOT / "grocery" / "generator" / "models" / "online.py").read_text()
+    lifecycle = source[source.index("def advance_online_lifecycle"):]
+
+    update_start = lifecycle.index("UPDATE online.orders")
+    update_end = lifecycle.index('"""', update_start)
+    update_statement = lifecycle[update_start:update_end]
+    assert re.search(r"SET status = v\.st", update_statement), \
+        "advance_online_lifecycle no longer sets the status"
+    assert re.search(r"updated_at = NOW\(\)", update_statement), (
+        "advance_online_lifecycle no longer bumps updated_at: a status change would stop "
+        "moving the state clock and the as-of read would return rows in a state the events "
+        "read cannot match (t_51bbc12e)"
+    )
+
+    # The event that explains the change is inserted before that function's only commit,
+    # i.e. in the same transaction — which is why the two stamps are one value.
+    events_at = lifecycle.index("INSERT INTO online.order_events", update_start)
+    commits = [m.start() for m in re.finditer(r"conn\.commit\(\)", lifecycle)]
+    assert commits, "advance_online_lifecycle does not commit any more"
+    assert events_at < min(commits), (
+        "the lifecycle event is written after a commit: the order's updated_at and its "
+        "event's created_at would no longer be the same stamp, and an as-of read ending "
+        "at one instant B would no longer be consistent (t_51bbc12e)"
+    )
