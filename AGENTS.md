@@ -182,6 +182,44 @@ Whole-table routes accept `start_dt`/`end_dt` so consumers can pull bounded, res
 pieces instead of paging everything: `/grocery/pos/price-history` (`changed_at`),
 `/grocery/pos/return-items` (`return_dt`), `/grocery/online/order-items` (`placed_dt`).
 
+**Two windows, and which one an incremental load needs.** `start_dt`/`end_dt` always
+bound the *business* time — when the event happened. That is the right window for
+analysis and the wrong one for a delta load whenever the business timestamp is
+backdated, i.e. whenever the generator writes a row whose business time is in the
+past:
+
+| Table | Business clock | Backdated? | Ingest clock |
+|-------|----------------|-----------|--------------|
+| `pos.transactions` / `pos.transaction_items` | `transaction_dt` | yes, during backfill | `created_at` |
+| `pos.returns` / `pos.return_items` | `return_dt` | yes, always (`txn_dt + rand(2..21)d`, clamped) | `returns.created_at` |
+| `pos.price_history` | `changed_at` | no — stamped at insert | — |
+| `online.orders` / `online.order_items` | `placed_dt` | yes, during backfill | `created_at` |
+
+A consumer that watermarks on a backdated column loses rows: the watermark sits at the
+newest business time already seen, and every row a later batch backdates below it is
+unreachable through *every* `start_dt`/`end_dt` combination. Measured on `pos.returns`
+(9,185 rows): 4,055 sat more than a day below their own batch's clamp value, 2,072 more
+than a week — a third to a half of each nightly batch was invisible to a `return_dt`
+watermark (t_5d2e2ab0). The same shape holds for `pos.transactions` and `online.orders`
+after a backfill: on the 2026-09-21 local seed, 89,320 of 92,741 transactions and 10,699
+of 11,062 orders sat more than a day below the table's own last insert.
+
+So the two return routes carry a second, independent pair —
+`created_after`/`created_before`, bound to `pos.returns.created_at` (`DEFAULT NOW()`,
+written by the same statement as the row, monotone) — and
+`/grocery/pos/return-items` returns `r.created_at` in its payload because the line has
+no timestamp of its own and a consumer needs that column to hold the watermark.
+`grocery/api/tests/test_ingest_window.py` fails the build if either route stops
+declaring the pair, stops filtering the insert clock in both the count and the page
+query, or drops the column.
+
+The window is served by a sequential scan: `pos.returns` holds ~10k rows and grows by a
+few hundred a day, so it is cheap today, and t_5d2e2ab0 deliberately added no index —
+`CREATE INDEX idx_returns_created ON pos.returns (created_at)` is a `schema.sql` change
+that only reaches a *fresh* bootstrap (an existing data dir keeps its schema), so it is
+worth doing when the plan actually shows up, not before. Every other window column has
+one (`idx_pos_txn_dt`, `idx_online_orders_placed`, `idx_loyalty_pts_date`).
+
 ### Analytics / Dashboards
 
 Used by the Streamlit UI tabs (`_dashboard`, `_distributions`):

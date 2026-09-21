@@ -25,7 +25,6 @@ import re
 import time
 from datetime import datetime, timezone
 
-import httpx
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -103,30 +102,6 @@ PAGINATED_ROUTES = [
 ]
 
 
-@pytest.fixture
-def quiesced_generator(api_base_url):
-    """Pause the generator for the duration of a walk.
-
-    Paging and row counts are only comparable while nothing is inserting: a tick that
-    lands mid-walk shifts every later page by a few rows, which looks like pagination
-    loss but is not. The generator is resumed even if the test fails.
-    """
-    with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
-        state = {}
-        try:
-            state = client.get("/grocery/status").json()["state"]
-        except Exception as exc:                       # noqa: BLE001
-            pytest.skip(f"generator status unavailable: {exc}")
-        was_running = bool(state.get("is_running")) and not state.get("is_paused")
-        if was_running:
-            client.post("/grocery/generator/pause")
-        try:
-            yield client
-        finally:
-            if was_running:
-                client.post("/grocery/generator/resume")
-
-
 def _walk(client, path, pk, limit):
     """Page a route once; return (advertised total, pk string per row returned)."""
     total = client.get(path, params={"limit": 1, "offset": 0}).json()["total"]
@@ -172,11 +147,16 @@ def test_first_pass_paging_returns_every_row(quiesced_generator, path, pk, limit
     assert set(again) == distinct, f"{path}: a second pass returned a different set of rows"
 
 
-# (route, timestamp column in the response, the column the window filters on)
+# (route, timestamp column in the response, start param, end param)
 WINDOWED_ROUTES = [
-    ("/grocery/pos/price-history", "changed_at"),
-    ("/grocery/pos/return-items", "return_dt"),
-    ("/grocery/online/order-items", "placed_dt"),
+    ("/grocery/pos/price-history", "changed_at", "start_dt", "end_dt"),
+    ("/grocery/pos/return-items", "return_dt", "start_dt", "end_dt"),
+    ("/grocery/online/order-items", "placed_dt", "start_dt", "end_dt"),
+    # The ingest-time window: pos.returns is backdated on return_dt, so
+    # created_after/created_before is the only window that can drive an
+    # incremental load of it (t_5d2e2ab0). return_items rides its header.
+    ("/grocery/pos/returns", "created_at", "created_after", "created_before"),
+    ("/grocery/pos/return-items", "created_at", "created_after", "created_before"),
 ]
 
 FAR_PAST = "2000-01-01T00:00:00+00:00"
@@ -189,30 +169,34 @@ def _as_datetime(value):
 
 
 @pytest.mark.usefixtures("ensure_api_reachable")
-@pytest.mark.parametrize("path,column", WINDOWED_ROUTES)
-def test_window_filters_bound_the_result_set(quiesced_generator, path, column):
-    """The three whole-table routes accept start_dt/end_dt so consumers can pull
+@pytest.mark.parametrize("path,column,start_param,end_param", WINDOWED_ROUTES)
+def test_window_filters_bound_the_result_set(quiesced_generator, path, column,
+                                             start_param, end_param):
+    """The whole-table routes accept an explicit window so consumers can pull
     bounded, resumable pieces instead of paging the entire table (the reason
-    data-lab could only *detect* loss on pos_loyalty_members / online_order_items)."""
+    data-lab could only *detect* loss on pos_loyalty_members / online_order_items).
+    """
     client = quiesced_generator
     unfiltered = client.get(path, params={"limit": 1}).json()["total"]
 
     # A window that cannot contain anything must return nothing - and say so in `total`,
     # otherwise the count and the pages disagree.
-    for params in ({"start_dt": FAR_FUTURE}, {"end_dt": FAR_PAST}):
+    for params in ({start_param: FAR_FUTURE}, {end_param: FAR_PAST}):
         body = client.get(path, params=dict(params, limit=1000)).json()
         assert body["total"] == 0, f"{path}: {params} should match no rows, got total={body['total']}"
         assert body["data"] == [], f"{path}: {params} should return no rows"
 
     # The same wide window must reproduce the unfiltered total exactly.
-    wide = client.get(path, params={"limit": 1, "start_dt": FAR_PAST, "end_dt": FAR_FUTURE}).json()
+    wide = client.get(path, params={"limit": 1, start_param: FAR_PAST,
+                                    end_param: FAR_FUTURE}).json()
     assert wide["total"] == unfiltered, (
         f"{path}: an all-encompassing window changed the row count "
         f"({wide['total']} vs {unfiltered} unfiltered)"
     )
 
     # ... and every row it returns has to fall inside the window.
-    page = client.get(path, params={"limit": 200, "start_dt": FAR_PAST, "end_dt": FAR_FUTURE})
+    page = client.get(path, params={"limit": 200, start_param: FAR_PAST,
+                                    end_param: FAR_FUTURE})
     for row in page.json()["data"]:
         stamp = _as_datetime(row[column])
         assert _as_datetime(FAR_PAST) <= stamp <= _as_datetime(FAR_FUTURE), \

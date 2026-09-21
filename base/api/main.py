@@ -1845,16 +1845,38 @@ def stats_distributions(industry: str, days: int = Query(30, ge=1, le=365)):
 def grocery_returns(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     location_id: Optional[str] = None,
     reason: Optional[str] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
+    """Customer returns, with **two** independent time windows.
+
+    ``start_dt``/``end_dt`` bound the *business* time (``return_dt``) — when the
+    return happened.
+
+    ``created_after``/``created_before`` bound the *ingest* time (``created_at``)
+    — when the row was written. Use them for an incremental load: ``return_dt`` is
+    backdated by the generator (``return_dt = transaction_dt + rand(2..21) days``,
+    clamped to the simulated now), so one nightly batch carries ``return_dt`` values
+    spread over the previous month. A watermark of ``MAX(return_dt)`` therefore
+    cannot reach the older half of every later batch — measured on the dev seed,
+    4055 of 9185 rows sat more than a day below the batch's own clamp value.
+    ``created_at`` is stamped at insert time and never moves backwards, so
+    ``created_after=<MAX(created_at) of the last load>`` is a complete delta
+    (t_5d2e2ab0).
+    """
     filters, params = ["TRUE"], []
     if start_dt:
         filters.append("r.return_dt >= %s"); params.append(start_dt)
     if end_dt:
         filters.append("r.return_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("r.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("r.created_at <= %s"); params.append(created_before)
     if location_id:
         filters.append("r.location_id = %s::uuid"); params.append(location_id)
     if reason:
@@ -1878,9 +1900,20 @@ def grocery_return_items(
     product_id: Optional[str] = None,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
+    """Return lines, with the same two windows as ``/grocery/pos/returns``.
+
+    ``start_dt``/``end_dt`` bound ``pos.returns.return_dt`` (business time);
+    ``created_after``/``created_before`` bound ``pos.returns.created_at`` (ingest
+    time). ``pos.return_items`` has no timestamp of its own — its row is written in
+    the same batch as its header, so the header's ``created_at`` *is* the line's
+    ingest time, and it is returned in the payload so a consumer can watermark on it
+    (t_5d2e2ab0).
+    """
     filters, params = ["TRUE"], []
     if return_id:
         filters.append("ri.return_id = %s::uuid"); params.append(return_id)
@@ -1890,6 +1923,10 @@ def grocery_return_items(
         filters.append("r.return_dt >= %s"); params.append(start_dt)
     if end_dt:
         filters.append("r.return_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("r.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("r.created_at <= %s"); params.append(created_before)
     where = " AND ".join(filters)
     # r is joined for the date filters, so the count has to join it too.
     total = query(f"""SELECT COUNT(*) AS n FROM pos.return_items ri
@@ -1898,7 +1935,7 @@ def grocery_return_items(
     rows = query(f"""
         SELECT ri.return_item_id, ri.return_id, ri.transaction_item_id,
                ri.product_id, p.name AS product_name, ri.quantity,
-               ri.refund_amount, r.return_dt, r.transaction_id
+               ri.refund_amount, r.return_dt, r.transaction_id, r.created_at
         FROM pos.return_items ri
         JOIN pos.products p ON p.product_id = ri.product_id
         JOIN pos.returns r ON r.return_id = ri.return_id
