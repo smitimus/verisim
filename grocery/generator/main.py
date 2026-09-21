@@ -129,6 +129,34 @@ def read_state(conn):
         return dict(cur.fetchone())
 
 
+def generation_halted(state) -> bool:
+    """True when the operator has asked the generator to stop writing.
+
+    ``control.generator_state`` is the only channel between the API/UI (which writes
+    it) and this loop (which reads it), and the loop samples it once per iteration.
+    A backfill iteration used to be a whole range -- 30 days, minutes of writing --
+    so a pause or a stop requested while the range was being generated was silently
+    ignored until the range ran out. `run_backfill` now samples the row between
+    batches as well; this is the test it applies (t_057e3ad0).
+    """
+    return (not state['is_running']) or state['is_paused'] or state['mode'] == 'stopped'
+
+
+def record_backfill_heartbeat(conn):
+    """Stamp the writer's liveness clock for one backfill batch and commit it.
+
+    ``last_tick_at`` is how anything outside this process can tell whether the
+    database is still being written to: ``record_stats`` stamps it once per realtime
+    tick, and a backfill used to leave it untouched for its whole range. Committed
+    immediately, because an uncommitted stamp is invisible to the API session that
+    reads it -- the same stamp is what `quiesced_generator` in the API contract tests
+    waits on before it measures any row count.
+    """
+    with conn.cursor() as cur:
+        cur.execute("UPDATE control.generator_state SET last_tick_at = NOW() WHERE state_id = 1")
+    conn.commit()
+
+
 def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms):
     with conn.cursor() as cur:
         cur.execute("""
@@ -444,6 +472,12 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
 
     cur_date = current
     while cur_date <= end:
+        # A stop/pause requested before this day starts costs nothing to honour: no
+        # hour of it has been written, so the resumption probe below regenerates it.
+        if generation_halted(read_state(conn)):
+            log.info("Backfill halted — %s not started, yielding to the main loop", cur_date)
+            return
+
         # Re-read now_dt each day so the partial-day cutoff stays current
         # for slow backfills that span midnight.
         now_dt = datetime.now()
@@ -482,7 +516,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE control.generator_state
-                    SET backfill_current_date = %s, updated_at = NOW()
+                    SET backfill_current_date = %s, last_tick_at = NOW(), updated_at = NOW()
                     WHERE state_id = 1
                 """, (cur_date + timedelta(days=1),))
             conn.commit()
@@ -498,6 +532,21 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                  cur_date, " [partial — up to current hour]" if is_partial else "", start_hour, end_hour)
 
         for hour in range(start_hour, end_hour + 1):
+            # Between batches, not between ranges: a 30-day backfill is minutes of
+            # writing, and the models commit as they go, so honouring a pause here
+            # loses nothing — the probe above restarts this day from the hour after
+            # the last row written. Today's partial day is exempt: it has no
+            # hour-level resume guard, so stopping inside it would regenerate (and
+            # duplicate) the hours already written; it stops at the next day
+            # boundary instead, which for a fresh backfill is the end of the range.
+            if not is_partial and generation_halted(read_state(conn)):
+                log.info("Backfill halted at %s hour %d — yielding to the main loop",
+                         cur_date, hour)
+                conn.commit()
+                return
+
+            record_backfill_heartbeat(conn)
+
             # For the last hour of a partial day, use the exact current time so
             # the final backfill tick aligns with where realtime picks up.
             # All previous hours use the hour boundary (e.g. 13:00:00).
@@ -592,7 +641,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE control.generator_state
-                SET backfill_current_date = %s, updated_at = NOW()
+                SET backfill_current_date = %s, last_tick_at = NOW(), updated_at = NOW()
                 WHERE state_id = 1
             """, (cur_date + timedelta(days=1),))
         conn.commit()
@@ -608,7 +657,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             UPDATE control.generator_state
             SET mode = 'realtime', is_running = TRUE,
                 backfill_start_date = NULL, backfill_end_date = NULL,
-                backfill_current_date = NULL, updated_at = NOW()
+                backfill_current_date = NULL, last_tick_at = NOW(), updated_at = NOW()
             WHERE state_id = 1
         """)
     conn.commit()
