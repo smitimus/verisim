@@ -419,8 +419,12 @@ def reconcile_promotions(conn) -> Dict[str, int]:
     place a redemption is ever written:
 
     * `pos.coupons.uses_count` — one redemption per coupon-tagged transaction.
-      Nothing ever wrote it after seeding, so every coupon read 0 uses while
-      tens of thousands of line items referenced it (card t_01b4fe4f).
+      The write path (`generate_pos_transactions`) increments it as it goes;
+      this pass recomputes the *absolute* value from `pos.transaction_items`,
+      which is the source of truth — so a regenerated backfill day or a
+      deleted item cannot leave a drifting counter behind. Before t_01b4fe4f
+      nothing ever wrote it, so every coupon read 0 uses while tens of
+      thousands of line items referenced it.
     * `valid_from` / `valid_until` — widened to cover usage that already falls
       outside the window. Seeding only stamps the window from *now* forward,
       so a database generated before the windowing fix keeps its out-of-window
@@ -689,6 +693,11 @@ def generate_pos_transactions(
     item_records = []
     new_members = []
     depletion_info = []
+    # Redemptions served by this batch, per coupon. `pos.coupons.uses_count` is
+    # incremented once per coupon-tagged transaction (the same definition
+    # reconcile_promotions() recomputes), so the counter stays live instead of
+    # going stale between reconcile passes.
+    coupon_uses: Dict[str, int] = {}
 
     for _ in range(count):
         loc = random.choice(store_locations)
@@ -783,11 +792,19 @@ def generate_pos_transactions(
         # populate them on the items the promo actually applied to.
         if coupon is not None:
             coupon_products = _applicable_promo_products(cart, coupon, 'coupon')
+            tagged = False
             for i, p in enumerate(cart):
                 if p['product_id'] in coupon_products:
                     rec = list(item_recs[i])
                     rec[5] = coupon['coupon_id']
                     item_recs[i] = tuple(rec)
+                    tagged = True
+            # Only a redemption that actually reached a line item counts as a
+            # use — a department/product-scoped coupon whose scope is not in
+            # this basket discounts the transaction but attributes to nothing.
+            if tagged:
+                cid = coupon['coupon_id']
+                coupon_uses[cid] = coupon_uses.get(cid, 0) + 1
         if deal is not None:
             deal_products = _applicable_promo_products(cart, deal, 'deal')
             for i, p in enumerate(cart):
@@ -844,6 +861,18 @@ def generate_pos_transactions(
                     (first_name, last_name, email, phone, signup_date, points_balance, tier)
                 VALUES %s ON CONFLICT (email) DO NOTHING
             """, new_members)
+
+        # Counter for the redemptions this batch attributed, so the API's
+        # uses_count is current rather than waiting for the next reconcile.
+        # One statement per touched coupon (the promo set is a handful of
+        # rows), and reconcile_promotions() still recomputes the absolute value
+        # from the items table, so any drift from a regenerated day self-heals.
+        for coupon_id, uses in coupon_uses.items():
+            cur.execute(
+                "UPDATE pos.coupons SET uses_count = uses_count + %s "
+                "WHERE coupon_id = %s::uuid",
+                (uses, coupon_id),
+            )
 
     conn.commit()
 

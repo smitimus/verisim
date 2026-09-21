@@ -78,7 +78,7 @@ def _capture_items(cur, sql, records, template=None):
 
 
 def _generate(sim_dt, coupons, deals):
-    """Run one transaction batch and return the captured transaction_items."""
+    """Run one transaction batch and return (captured items, fake conn)."""
     random.seed(7)
     cfg = Config()
     cfg.coupons.coupon_use_rate = 1.0
@@ -99,14 +99,15 @@ def _generate(sim_dt, coupons, deals):
     employees = [{"department": "store", "location_type": "store",
                   "employee_id": "e1", "location_id": "loc1"}]
 
+    conn = _ScriptedConn()
     _captured_items.clear()
     with patch.object(random, "random", lambda: 0.0), \
          patch("grocery.generator.models.pos.execute_values", side_effect=_capture_items):
         pos.generate_pos_transactions(
-            _ScriptedConn(), cfg, sim_dt, 4, _Scenario(), stores, products,
+            conn, cfg, sim_dt, 4, _Scenario(), stores, products,
             employees, [{"member_id": "m1"}], coupons, deals,
         )
-    return list(_captured_items)
+    return list(_captured_items), conn
 
 
 def _coupon(**over):
@@ -132,7 +133,7 @@ def _deal(**over):
 
 def test_promo_is_applied_inside_its_window():
     """Control: a promo valid on the simulated date still gets tagged."""
-    items = _generate(SIM_DT, [_coupon()], [_deal()])
+    items, _ = _generate(SIM_DT, [_coupon()], [_deal()])
     assert items, "no transaction_items captured"
     assert any(r[5] == "c1" for r in items), "coupon not tagged inside its window"
     assert any(r[6] == "d1" for r in items), "deal not tagged inside its window"
@@ -141,24 +142,24 @@ def test_promo_is_applied_inside_its_window():
 def test_coupon_not_applied_before_its_window():
     """The reported bug: a back-dated transaction must not carry a coupon id
     whose window opens later."""
-    items = _generate(SIM_DT, [_coupon(valid_from=date(2026, 6, 2),
-                                      valid_until=date(2026, 7, 1))], [_deal()])
+    items, _ = _generate(SIM_DT, [_coupon(valid_from=date(2026, 6, 2),
+                                          valid_until=date(2026, 7, 1))], [_deal()])
     assert items, "no transaction_items captured"
     assert all(r[5] is None for r in items), "coupon tagged before valid_from"
 
 
 def test_deal_not_applied_before_its_window():
-    items = _generate(SIM_DT, [_coupon()], [_deal(valid_from=date(2026, 6, 2),
-                                                  valid_until=date(2026, 7, 1))])
+    items, _ = _generate(SIM_DT, [_coupon()], [_deal(valid_from=date(2026, 6, 2),
+                                                     valid_until=date(2026, 7, 1))])
     assert items, "no transaction_items captured"
     assert all(r[6] is None for r in items), "deal tagged before valid_from"
 
 
 def test_promo_not_applied_after_its_window():
-    items = _generate(SIM_DT, [_coupon(valid_from=date(2026, 1, 1),
-                                       valid_until=date(2026, 5, 31))],
-                      [_deal(valid_from=date(2026, 1, 1),
-                             valid_until=date(2026, 5, 31))])
+    items, _ = _generate(SIM_DT, [_coupon(valid_from=date(2026, 1, 1),
+                                          valid_until=date(2026, 5, 31))],
+                         [_deal(valid_from=date(2026, 1, 1),
+                                valid_until=date(2026, 5, 31))])
     assert items, "no transaction_items captured"
     assert all(r[5] is None for r in items), "coupon tagged after valid_until"
     assert all(r[6] is None for r in items), "deal tagged after valid_until"
@@ -166,15 +167,30 @@ def test_promo_not_applied_after_its_window():
 
 def test_promo_without_a_window_is_not_applied():
     """Fail closed: an unknown window must not produce a violating row."""
-    items = _generate(SIM_DT, [{"coupon_id": "c1", "coupon_type": "percent_off",
-                                "discount_value": 0.1, "department_id": None,
-                                "product_id": None}],
-                      [{"deal_id": "d1", "deal_type": "x_for_price",
-                        "trigger_qty": 2, "trigger_department_id": None,
-                        "trigger_product_id": None, "deal_price": 1.0}])
+    items, _ = _generate(SIM_DT, [{"coupon_id": "c1", "coupon_type": "percent_off",
+                                   "discount_value": 0.1, "department_id": None,
+                                   "product_id": None}],
+                         [{"deal_id": "d1", "deal_type": "x_for_price",
+                           "trigger_qty": 2, "trigger_department_id": None,
+                           "trigger_product_id": None, "deal_price": 1.0}])
     assert items, "no transaction_items captured"
     assert all(r[5] is None for r in items)
     assert all(r[6] is None for r in items)
+
+
+def test_uses_count_is_incremented_once_per_tagged_transaction():
+    """`uses_count` is maintained at write time (not only at reconcile), and it
+    counts transactions the coupon actually reached, not baskets it merely
+    discounted."""
+    items, conn = _generate(SIM_DT, [_coupon()], [_deal()])
+    tagged_txns = {r[0] for r in items if r[5] == "c1"}
+    assert tagged_txns, "coupon was never tagged"
+
+    increments = [(params[0], params[1]) for _, sql, params in conn.executed
+                  if "uses_count = uses_count +" in sql]
+    assert increments, "no uses_count increment issued"
+    assert sum(n for n, _ in increments) == len(tagged_txns)
+    assert {cid for _, cid in increments} == {"c1"}
 
 
 def test_promo_applies_on_boundaries():
