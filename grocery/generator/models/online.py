@@ -6,12 +6,21 @@ Basket behavior is deliberately different from in-store POS:
 
   * bigger baskets (weekly haul: 8-30 lines vs 1-12 in store)
   * card/mobile payment only (no cash/EBT), no coupons or combo deals
-  * ordering skew to browsing hours (8am-9pm), lighter than store peaks
+  * ordering skews to browsing hours through the shared hourly weights (0.0008 at
+    03:00 against 0.0938 at 18:00), and is lighter than the store peaks
   * service fee on delivery; pickup has a 2-hour pickup window
   * append-only lifecycle event stream; ~3-8% of orders never complete
     (cancel before ready, no_show after ready_for_pickup window closes)
 
 Online demand depletes store stock exactly like POS does.
+
+Volume is computed by the caller (`main.compute_online_count`) and passed in as
+`count`, the same contract `pos.generate_pos_transactions()` has: the per-tick
+budget is one law for the whole product, sized from the cadence the loop runs at
+and from the date (`online.orders_per_day`) — see `main.per_tick_volume_expectation`.
+Until t_eb31c99f this module carried its own private law that both ignored the
+tick length and applied the hour weight a second time, which ran realtime online
+days ~120x their configured volume.
 """
 import random
 import logging
@@ -25,22 +34,17 @@ from config import Config
 
 log = logging.getLogger(__name__)
 
-ONLINE_HOURS = list(range(7, 22))          # ordering window: 7am-9pm
 BASKET_WEIGHTS = [10, 12, 14, 13, 11, 9, 7, 6, 5]   # sizes 8..16+ (compressed)
 
 
-def _online_count_for_tick(cfg: Config, ctx, sim_dt: datetime) -> int:
-    """Orders this tick, weighted to browsing hours."""
-    daily = random.randint(cfg.online.orders_per_day_min, cfg.online.orders_per_day_max)
-    hour_w = cfg.volumes.hourly_weights[sim_dt.hour]
-    return max(0, round(daily * hour_w * ctx.volume_multiplier))
-
-
-def generate_online_orders(conn, cfg: Config, sim_dt: datetime, ctx,
+def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
                            store_locations: List[Dict], products: List[Dict],
                            members: List[Dict]) -> List[Dict]:
-    """Create placed orders (status='placed', 'placed' event). Returns depletion info."""
-    n = _online_count_for_tick(cfg, ctx, sim_dt)
+    """Create `count` placed orders (status='placed', 'placed' event).
+
+    Returns depletion info.
+    """
+    n = max(0, int(count))
     if n <= 0 or not store_locations or not products:
         return []
 

@@ -187,9 +187,15 @@ transport:
   cost_per_mile: 1.85              # operational cost per mile (fuel + maintenance)
 
 online:
-  orders_per_day:
-    min: 90
-    max: 170
+  orders_per_day:                  # the channel's own baseline day, drawn once per
+    min: 90                        # date (like pos_transactions_per_day). The
+    max: 170                       # realised day is that draw shaped by the shared
+                                   # hourly weights x day-of-week x rush hour
+                                   # (~1.3x a Monday, ~1.9x a Saturday). Realtime
+                                   # writes one tick per tick_interval_seconds
+                                   # (2880/day at 30 s), each carrying its share of
+                                   # the hour — sizing it any other way ran online
+                                   # days ~120x this band (t_eb31c99f).
   pickup_share: 0.45               # share of online orders fulfilled as pickup
   service_fee_delivery: 5.99       # flat fee per delivery order
   cancel_rate: 0.06                # placed orders cancelled before ready
