@@ -375,7 +375,7 @@ The data-lab dbt project expects these 27 source tables from the generator. If y
 ## Known Bugs (Fixed — Do Not Revert)
 
 Both confirmed fixed on fresh backfill data:
-- **Timeclock pairing**: `generate_events()` queries existing events before inserting; `generate_day_events()` clamps clock_out to 23:30 same day
+- **Timeclock pairing**: `generate_events()` queries existing events before inserting; `generate_day_events()` clamps clock_out to 23:30 same day. Since t_a24cfbc6 a break is also written as a **closed pair in one tick** (`break_start` + `break_end` `BREAK_LENGTH_MINUTES` apart) on the realtime path, not `break_start` now and `break_end` in the next break hour — hour 18 has no hour 19 behind it, so that shape left every 18:xx break open and failed data-lab's hard `assert_timeclock_pairs` on every run. `test_timeclock_breaks.py` pins it.
 - **Loyalty points balance**: `_record_loyalty_points()` uses `FOR UPDATE` row lock; dbt test orders by `(transaction_dt, points_balance_after)` for same-tick tiebreaks
 
 ## Gas Station Status

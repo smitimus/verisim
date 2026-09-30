@@ -6,6 +6,10 @@ Shift simulation:
 - Afternoon/evening shift: clock_in 2-5pm, clock_out 10pm-12am
 - Each shift includes a 30-min break (break_start + break_end at midpoint)
 
+Pairing invariant: a `break_start` is always written together with its
+`break_end`, never in a later tick. data-lab's `assert_timeclock_pairs` is a
+hard error, so an open break fails the whole pipeline (t_a24cfbc6).
+
 In realtime mode, this generates events for employees whose shift should
 be starting or ending at the current simulated time.
 In backfill mode, a full day's worth of events is generated per simulated day.
@@ -24,6 +28,9 @@ MORNING_IN_HOURS = [6, 7, 8, 9]
 AFTERNOON_IN_HOURS = [13, 14, 15, 16]
 EVENING_IN_HOURS = [17, 18]
 SHIFT_LENGTH_HOURS = 8
+
+# A break is one 30-minute event written as a start/end pair in a single tick.
+BREAK_LENGTH_MINUTES = 30
 
 # Early morning shift window (overnight stocking/early opening staff)
 EARLY_MORNING_IN_HOURS = list(range(0, 6))  # hours 0-5
@@ -85,22 +92,36 @@ def generate_events(conn, simulation_dt: datetime, employees: List[Dict],
             records.append((emp['employee_id'], emp['location_id'], 'clock_in', event_dt, None))
 
     elif hour in EVENING_IN_HOURS:
-        # Break events for employees currently on shift; start closing out
+        # Break events for employees currently on shift.
+        #
+        # The two halves are written in the SAME tick, BREAK_LENGTH_MINUTES
+        # apart. The older shape emitted break_start here and only closed it in
+        # the *next* hour with a break branch, which orphans every break_start
+        # written at hour 18: there is no hour 19 behind it, and the dedup map
+        # above is per calendar day, so nothing ever closes it. On the backfill's
+        # partial day (hours 0…now.hour in one pass) that left exactly
+        # sample_size open breaks — the 12 employee-days data-lab's hard
+        # assert_timeclock_pairs failed on (t_a24cfbc6). generate_day_events()
+        # has always written breaks as a pair; the realtime path now agrees.
         sample_size = max(1, len(store_employees) // 8)
         on_shift    = [e for e in store_employees if has(e['employee_id'], 'clock_in')
                        and not has(e['employee_id'], 'clock_out')]
-        need_break_end = [e for e in on_shift
-                          if has(e['employee_id'], 'break_start')
-                          and not has(e['employee_id'], 'break_end')]
-        need_break_start = [e for e in on_shift
-                            if not has(e['employee_id'], 'break_start')]
-        # Emit break_end for those mid-break, break_start for those who haven't broken yet
-        for emp in random.sample(need_break_end, min(sample_size, len(need_break_end))):
+        # Close anything still open — a row written by an older build, or a tick
+        # killed between the two inserts. Keeps the pair invariant for state this
+        # build did not create; a no-op once the pairs are atomic.
+        open_breaks = [e for e in on_shift
+                       if has(e['employee_id'], 'break_start')
+                       and not has(e['employee_id'], 'break_end')]
+        need_break = [e for e in on_shift if not has(e['employee_id'], 'break_start')]
+
+        for emp in random.sample(open_breaks, min(sample_size, len(open_breaks))):
             event_dt = simulation_dt.replace(minute=random.randint(0, 59))
             records.append((emp['employee_id'], emp['location_id'], 'break_end', event_dt, None))
-        for emp in random.sample(need_break_start, min(sample_size, len(need_break_start))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'break_start', event_dt, None))
+        for emp in random.sample(need_break, min(sample_size, len(need_break))):
+            break_start = simulation_dt.replace(minute=random.randint(0, 59))
+            records.append((emp['employee_id'], emp['location_id'], 'break_start', break_start, None))
+            records.append((emp['employee_id'], emp['location_id'], 'break_end',
+                            break_start + timedelta(minutes=BREAK_LENGTH_MINUTES), None))
 
     elif hour in LATE_NIGHT_OUT_HOURS:
         # Late night clock-outs for anyone still clocked in (extended from 20-23 to full late window)
@@ -186,7 +207,7 @@ def generate_day_events(conn, sim_date, employees: List[Dict]) -> int:
         # Break at ~midpoint
         break_start = in_dt + timedelta(hours=SHIFT_LENGTH_HOURS // 2 - 1,
                                          minutes=random.randint(0, 30))
-        break_end = break_start + timedelta(minutes=30)
+        break_end = break_start + timedelta(minutes=BREAK_LENGTH_MINUTES)
         records.append((emp['employee_id'], emp['location_id'], 'break_start', break_start, None))
         records.append((emp['employee_id'], emp['location_id'], 'break_end', break_end, None))
 
