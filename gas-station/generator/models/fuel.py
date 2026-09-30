@@ -162,6 +162,14 @@ def maybe_change_fuel_price(conn, cfg: Config, grades: List[Dict]) -> None:
     Probabilistically change fuel prices based on configured frequency.
     All grades change together (as in real life).
     """
+    # 96 ticks/day assumes the 15-simulated-minute clock the config advertises
+    # but the loop does not implement (it sleeps tick_interval_seconds — 2880
+    # ticks/day at 30 s), so a fuel price really moves every frequency_days/30
+    # days. Left unchanged by t_093fa22c on purpose: it is an event RATE, not the
+    # measured per-tick volume defect, and the identical grocery line
+    # (grocery/generator/models/pos.py) is unchanged too. The equivalent fix is
+    # `simulated_seconds / (frequency_days * 86400)` — a separate card, because it
+    # moves realised price-change frequency 30x with no consumer to validate it.
     ticks_per_day = (24 * 60) / 15
     prob_per_tick = 1.0 / (cfg.pricing.fuel_price_change_frequency_days * ticks_per_day)
     if random.random() > prob_per_tick:

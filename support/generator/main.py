@@ -127,17 +127,147 @@ def record_stats(conn, tickets_n, calls_n, chats_n, surveys_n, scenario_tag,
 
 # ---------------------------------------------------------------------------
 # Volume calculation
+#
+# One law, three contact channels: a tick carries `simulated_seconds / 3600` of
+# the hour's demand, the hour's demand is the date's budget draw shaped by the
+# scenario context, and the date's budget is a pure function of the date.
+# `tickets`, `calls` and `chats` differ only in which config band their budget
+# comes from — the private laws are exactly how the 30x realtime defect happened
+# in grocery (t_94bbf1ce) and, verbatim, here (t_093fa22c).
 # ---------------------------------------------------------------------------
 
-def _daily_volumes(cfg, ctx):
-    """(tickets, calls, chats) for one tick given scenario context."""
-    ticks_per_day = (24 * 60) / max(1, cfg.generator.simulation_minutes_per_tick)
-    t = random.randint(cfg.volumes.tickets_per_day_min, cfg.volumes.tickets_per_day_max)
-    c = random.randint(cfg.volumes.calls_per_day_min, cfg.volumes.calls_per_day_max)
-    h = random.randint(cfg.volumes.chats_per_day_min, cfg.volumes.chats_per_day_max)
-    return (max(0, round(t / ticks_per_day * ctx.volume_multiplier)),
-            max(0, round(c / ticks_per_day * ctx.volume_multiplier)),
-            max(0, round(h / ticks_per_day * ctx.volume_multiplier)))
+# One simulated hour of demand. The backfill writes exactly one tick per
+# simulated hour; realtime writes one tick per `tick_interval_seconds` of wall
+# clock, so the same hour arrives in 120 ticks at the default 30 s cadence
+# (2880 a day) — that ratio is what the per-tick volume must be divided by.
+SIM_HOUR_SECONDS = 3600
+
+DEFAULT_TICK_INTERVAL_SECONDS = 30
+
+
+def realtime_tick_seconds(cfg, state) -> int:
+    """Seconds of simulated time one realtime tick writes.
+
+    The main loop sleeps `control.generator_state.tick_interval_seconds` (seeded
+    from config, settable 5-3600 s from the API/UI) — that is the cadence the
+    generator really runs at, so it is the one the volume law must use, not
+    `simulation_minutes_per_tick`.
+    """
+    value = (state or {}).get('tick_interval_seconds') or cfg.generator.tick_interval_seconds
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TICK_INTERVAL_SECONDS
+    return seconds if seconds > 0 else DEFAULT_TICK_INTERVAL_SECONDS
+
+
+def partial_hour_seconds(now) -> int:
+    """Simulated seconds of the hour that have elapsed at `now`.
+
+    The backfill's last tick writes the current hour at `datetime.now()`, and
+    realtime continues from there: sizing that tick from the elapsed part of the
+    hour is what makes the hour total one hour of demand instead of two.
+    """
+    return now.minute * 60 + now.second
+
+
+def daily_volume_target(sim_date, seed_prefix, low, high) -> int:
+    """A channel's day budget — a pure function of the date.
+
+    Neither writer may own the day's volume: the backfill replays a day one
+    simulated hour at a time (and resumes a partial day after a restart), while
+    realtime writes it 120 times an hour. Drawing the band once per call would
+    hand the same date a different total depending on who wrote it, and a
+    resumed day a different total from an uninterrupted one. The seed is the
+    channel plus the ISO date, so it is stable across processes and runs (and
+    the three channels do not draw the same number); different dates still draw
+    different budgets from the band.
+    """
+    rng = random.Random('%s-%s' % (seed_prefix, sim_date.isoformat()))
+    return rng.randint(low, high)
+
+
+def daily_tickets_target(cfg, sim_date) -> int:
+    """The day's configured ticket budget."""
+    return daily_volume_target(sim_date, 'verisim-tickets',
+                               cfg.volumes.tickets_per_day_min,
+                               cfg.volumes.tickets_per_day_max)
+
+
+def daily_calls_target(cfg, sim_date) -> int:
+    """The day's configured inbound-call budget (see `daily_volume_target`)."""
+    return daily_volume_target(sim_date, 'verisim-calls',
+                               cfg.volumes.calls_per_day_min,
+                               cfg.volumes.calls_per_day_max)
+
+
+def daily_chats_target(cfg, sim_date) -> int:
+    """The day's configured chat-session budget (see `daily_volume_target`)."""
+    return daily_volume_target(sim_date, 'verisim-chats',
+                               cfg.volumes.chats_per_day_min,
+                               cfg.volumes.chats_per_day_max)
+
+
+def per_tick_volume_expectation(daily, ctx, simulated_seconds) -> float:
+    """Un-rounded volume for ONE tick, before sampling — the shared law.
+
+    `ctx.volume_multiplier` already carries the hour-of-day weight
+    (`hourly_weights[hour] * 24`) and the day-of-week / rush-hour multipliers —
+    see `scenario_engine.get_scenario_context` — so one simulated hour's demand is
+    `daily * volume_multiplier / 24`, and a tick carries that hour's share:
+
+        per_tick = (daily / 24) * volume_multiplier * simulated_seconds / 3600
+
+    Sizing a tick from anything else is how the defect happened: dividing by
+    `(24 * 60) / simulation_minutes_per_tick` — a 96-tick day — while the loop
+    sleeps 30 s (2880 ticks a day) made every realtime day exactly 30x the
+    configured band (t_093fa22c, same class as grocery's t_94bbf1ce).
+    """
+    per_hour = (daily / 24.0) * ctx.volume_multiplier
+    return max(0.0, per_hour * simulated_seconds / SIM_HOUR_SECONDS)
+
+
+def tickets_count_expectation(cfg, ctx, simulated_seconds, sim_date, daily=None) -> float:
+    """Ticket-creation volume for one tick, from the date's ticket budget."""
+    if daily is None:
+        daily = daily_tickets_target(cfg, sim_date)
+    return per_tick_volume_expectation(daily, ctx, simulated_seconds)
+
+
+def calls_count_expectation(cfg, ctx, simulated_seconds, sim_date, daily=None) -> float:
+    """Call volume for one tick, from the date's call budget (same law)."""
+    if daily is None:
+        daily = daily_calls_target(cfg, sim_date)
+    return per_tick_volume_expectation(daily, ctx, simulated_seconds)
+
+
+def chats_count_expectation(cfg, ctx, simulated_seconds, sim_date, daily=None) -> float:
+    """Chat volume for one tick, from the date's chat budget (same law)."""
+    if daily is None:
+        daily = daily_chats_target(cfg, sim_date)
+    return per_tick_volume_expectation(daily, ctx, simulated_seconds)
+
+
+def compute_counts(cfg, ctx, simulated_seconds, sim_date):
+    """(tickets, calls, chats) for one tick from the date's budgets + context."""
+    return (_unbiased_count(tickets_count_expectation(cfg, ctx, simulated_seconds, sim_date)),
+            _unbiased_count(calls_count_expectation(cfg, ctx, simulated_seconds, sim_date)),
+            _unbiased_count(chats_count_expectation(cfg, ctx, simulated_seconds, sim_date)))
+
+
+def _unbiased_count(expected) -> int:
+    """Round a fractional count to an int without biasing the mean.
+
+    A 30 s tick carries well under one contact outside the business-hours peak
+    (tickets ~0.4/hour overnight, calls ~0.05), so plain `round()` would return 0
+    for every tick of the quiet half of the night and quietly shrink the day.
+    Carrying the fraction as a probability keeps the hour's expected volume exact
+    while still writing an integer per tick.
+    """
+    if expected <= 0:
+        return 0
+    whole = int(expected)
+    return whole + (1 if random.random() < expected - whole else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +348,17 @@ def auto_backfill_if_fresh(conn, cfg):
 # Per-tick generation
 # ---------------------------------------------------------------------------
 
-def generate_for_dt(conn, cfg, sim_dt, ctx, caches, seed_followups=False):
-    """Generate one tick's worth of activity. Shared by realtime + backfill."""
+def generate_for_dt(conn, cfg, sim_dt, ctx, simulated_seconds, caches, seed_followups=False):
+    """Generate one tick's worth of activity. Shared by realtime + backfill.
+
+    `simulated_seconds` is the cadence the caller really runs at: the interval
+    the main loop sleeps in realtime, one whole simulated hour in the backfill.
+    """
     queues = caches['queues']
     customers = caches['customers']
     agents = caches['agents']
 
-    n_tickets, n_calls, n_chats = _daily_volumes(cfg, ctx)
+    n_tickets, n_calls, n_chats = compute_counts(cfg, ctx, simulated_seconds, sim_dt.date())
 
     calls_n, call_followups = voice.generate_calls(
         conn, cfg, sim_dt, n_calls, ctx, queues, customers, agents)
@@ -259,7 +393,8 @@ def run_tick(conn, cfg, state, sim_dt, caches):
                     (ctx.scenario_tag[:50],))
 
     tick_start = time.monotonic()
-    created, calls_n, chats_n, surveys_n = generate_for_dt(conn, cfg, sim_dt, ctx, caches)
+    created, calls_n, chats_n, surveys_n = generate_for_dt(
+        conn, cfg, sim_dt, ctx, realtime_tick_seconds(cfg, state), caches)
 
     # Probabilistic HR churn + new customers each simulated day
     if sim_dt.hour == 0:
@@ -329,13 +464,15 @@ def run_backfill(conn, cfg, state, caches):
         for hour in range(start_hour, end_hour + 1):
             if is_partial and hour == end_hour:
                 sim_dt = datetime.now()
+                tick_seconds = partial_hour_seconds(sim_dt)
             else:
                 sim_dt = datetime(cur_date.year, cur_date.month, cur_date.day, hour)
+                tick_seconds = SIM_HOUR_SECONDS
             names = get_active_scenario_names(conn, sim_dt)
             ctx = get_scenario_context(names, float(state['volume_multiplier']),
                                        sim_dt, cfg)
             created, calls_n, chats_n, surveys_n = generate_for_dt(
-                conn, cfg, sim_dt, ctx, caches)
+                conn, cfg, sim_dt, ctx, tick_seconds, caches)
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO control.generation_stats

@@ -222,6 +222,12 @@ def generate_pos_transactions(
 def maybe_update_product_prices(conn, cfg: Config, products: List[Dict]) -> None:
     """Randomly change a small number of product prices (monthly cadence)."""
     # probability per tick: 1 / (days * 24*60/sim_minutes) ≈ monthly
+    # The 96-tick day here is the same dead 15-simulated-minute clock as fuel.py
+    # (the loop sleeps tick_interval_seconds: 2880 ticks/day at 30 s), so prices
+    # really move every frequency_days/30 days. Left unchanged by t_093fa22c on
+    # purpose — an event rate, not the measured volume defect, and the identical
+    # grocery line is unchanged as well. The equivalent fix is
+    # `simulated_seconds / (frequency_days * 86400)`.
     ticks_per_day = (24 * 60) / 15  # at default 15 sim-min per tick
     prob_per_tick = 1.0 / (cfg.pricing.product_price_change_frequency_days * ticks_per_day)
     # Change ~1-3 products per event

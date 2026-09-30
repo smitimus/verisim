@@ -63,6 +63,14 @@ def generate_chats(conn, cfg: Config, sim_dt: datetime, n_chats: int, ctx,
 
     for _ in range(n_chats):
         queue = random.choice(queues)
+        # Backdated by up to 15 simulated minutes — the same dead 15-minute clock
+        # the volume law no longer uses (t_093fa22c): at the realtime cadence
+        # (`control.generator_state.tick_interval_seconds`, 30 s) a tick only
+        # covers 30 s, so this window reaches back across ~30 ticks. Left as-is on
+        # purpose: it is a contact's own start offset, not a volume, and the right
+        # replacement is per-mode (backward for realtime, forward inside the hour
+        # for the backfill's hour-boundary stamps) — a plain wider backward window
+        # would attribute contacts to the previous simulated hour.
         started = sim_dt - timedelta(seconds=random.randint(0,
             max(1, cfg.generator.simulation_minutes_per_tick * 60 - 1)))
         cust = random.choice(cust_ids) if cust_ids else None

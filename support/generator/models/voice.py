@@ -41,6 +41,10 @@ def generate_calls(conn, cfg: Config, sim_dt: datetime, n_calls: int, ctx,
 
     for _ in range(n_calls):
         queue = _pick_queue(queues)
+        # Backdated by up to 15 simulated minutes — the same dead 15-minute clock
+        # the volume law no longer uses (t_093fa22c). See chat.py for why it is
+        # left as-is: a contact's own start offset, not a volume, and the right
+        # replacement is per-mode rather than one wider backward window.
         offered = sim_dt - timedelta(seconds=random.randint(0,
             max(1, cfg.generator.simulation_minutes_per_tick * 60 - 1)))
         cust = random.choice(cust_ids) if (cust_ids and random.random() < 0.75) else None
