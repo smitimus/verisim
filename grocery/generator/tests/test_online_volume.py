@@ -165,16 +165,17 @@ def test_the_hour_weight_is_applied_once():
     assert ratio == pytest.approx(w[12] / w[3], rel=0.01), ratio
     assert ratio < 1000, ratio
 
-    # With a context that carries no hour shaping at all, one tick IS 1/24 of the
-    # day's budget times its share of the hour — no second weight anywhere.
+    # With a context that carries no hour shaping of its own, an hour tick is
+    # exactly 1/24 of the day's budget and a 30 s tick is 1/120 of the hour — the
+    # hour enters once, through the context, and nowhere else.
     class _Flat:
         volume_multiplier = 1.0
         scenario_tag = 'normal'
 
-    for hour in range(24):
-        expected = 240 / 24.0
-        assert online_count_expectation(cfg, _Flat(), SIM_HOUR_SECONDS,
-                                        MONDAY.date(), daily=240) == pytest.approx(expected)
+    assert online_count_expectation(cfg, _Flat(), SIM_HOUR_SECONDS,
+                                    MONDAY.date(), daily=240) == pytest.approx(240 / 24.0)
+    assert online_count_expectation(cfg, _Flat(), 30, MONDAY.date(),
+                                    daily=240) == pytest.approx(240 / 24.0 / 120)
 
 
 def test_realtime_and_backfill_write_the_same_day_at_the_same_volume():
