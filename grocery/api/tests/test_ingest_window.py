@@ -26,6 +26,15 @@ timestamp of their own, so ``created_at`` is taken from their header — and it 
 returned in the payload, because a consumer needs that column in its own raw table
 to hold the watermark.
 
+``/grocery/timeclock/events`` is the same shape on its own table (t_de287826): it was
+the last route in this family whose only window was a backdating business column
+(``event_dt``), which is why data-lab's ingest had to re-read its whole history every
+run (a 365-day reach-back and a stranded-row guard, t_64da90fb). ``created_at`` has
+been on ``timeclock.events`` all along; the route simply neither filtered nor returned
+it. Like ``/grocery/pos/transactions`` before it, ``start_dt``/``end_dt`` are now
+optional there too, so a reader whose only watermark is the insert clock can ask for
+it alone.
+
 These tests guard the contract data-lab's ingest depends on:
 ``grocery_ingest_api.py`` names the window parameters in ``TABLE_CONFIGS`` and
 verifies them against ``/openapi.json`` before it trusts them, so the parameters
@@ -77,6 +86,11 @@ INGEST_WINDOW_ROUTES = [
     ("/grocery/online/order-events", "/grocery/online/order-events", "e"),
     ("/grocery/pos/returns", "/grocery/pos/returns", "r"),
     ("/grocery/pos/return-items", "/grocery/pos/return-items", "r"),
+    # The last route whose only window was a backdating business column: its
+    # event_dt is stamped with the simulated instant a punch belongs to, so a
+    # watermark on it could not see a re-generated day or a half written late
+    # (t_de287826). Rows here have their own created_at, so the window binds e.
+    ("/grocery/timeclock/events", "/grocery/timeclock/events", "e"),
 ]
 
 # (request path, route source path, header alias) for the routes that also expose the
@@ -158,6 +172,30 @@ def test_payload_carries_created_at(path):
     assert f"{alias}.created_at" in select_list, (
         f"{request_path} does not return {alias}.created_at in its payload:\n{select_list}"
     )
+
+
+def test_timeclock_events_keeps_event_dt_as_the_business_window():
+    """``/grocery/timeclock/events`` keeps its ``start_dt``/``end_dt`` window on
+    ``event_dt``, and answers the insert clock alone (t_de287826).
+
+    The route *required* both bounds while the date column was its only window. A
+    consumer whose only watermark is the insert clock must be able to ask for it
+    without inventing a business window — otherwise the delta request is a 422 and
+    the ingest is back to re-reading the whole history every run (data-lab
+    t_64da90fb). Adding the insert clock must not move the business window off
+    ``event_dt``: that is the date-column window every existing reader uses.
+    """
+    request_path, source_path, _ = _params("/grocery/timeclock/events")
+    body = _route_source(source_path)
+
+    for param in ("start_dt", "end_dt"):
+        assert re.search(rf"^\s+{param}: Optional\[datetime\] = None,$", body, re.M), \
+            f"{request_path}: {param} is not optional"
+
+    assert 'filters.append("e.event_dt >= %s"); params.append(start_dt)' in body, \
+        f"{request_path}: start_dt no longer filters event_dt"
+    assert 'filters.append("e.event_dt <= %s"); params.append(end_dt)' in body, \
+        f"{request_path}: end_dt no longer filters event_dt"
 
 
 def test_pos_transactions_answers_the_insert_clock_alone():

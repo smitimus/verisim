@@ -1075,16 +1075,60 @@ def pos_combo_deals(active_only: bool = True):
 
 @app.get("/grocery/timeclock/events", tags=["Grocery — Timeclock"])
 def timeclock_events(
-    start_dt: datetime = Query(...),
-    end_dt: datetime = Query(...),
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     location_id: Optional[str] = None,
     employee_id: Optional[str] = None,
     event_type: Optional[str] = None,
     limit: int = Query(1000, le=5000),
     offset: int = 0,
 ):
-    filters = ["e.event_dt BETWEEN %s AND %s"]
-    params: list = [start_dt, end_dt]
+    """Clock events, with **two** independent time windows.
+
+    ``start_dt``/``end_dt`` bound the *business* time (``event_dt``) — the
+    simulated instant the punch belongs to.
+
+    ``created_after``/``created_before`` bound the *ingest* time (``created_at``)
+    — when the row was written. Use them for an incremental load: ``event_dt`` is
+    not monotone in insert order, because ``event_dt`` is business time and the
+    generator writes rows whose business time is already behind the newest row
+    on the clock. ``generate_day_events()`` writes a whole past day in one
+    instant (replayed by a backfill, or re-generated after the fact), so every
+    row of it lands below the rows a later day already put there; the same holds
+    for any half written late — a pair completed after the fact carries the
+    timestamp it should have had, not the moment it was written. Realtime used to
+    be the worst offender (every tick sampled the whole roster and stamped hour
+    0, so a row written at 18:16 carried ``00:25``; now floored above the day's
+    newest row, t_ca6642e0), but a business clock cannot be made complete by
+    flooring per day.
+
+    Measured by data-lab on the dev slot (2026-09-30), before that flooring: the
+    source held 11,008 rows while the incremental mirror held 11,006, and the two
+    missing rows were one employee-day — ``clock_in 2026-09-27 00:25:00-04`` /
+    ``clock_out 01:04:00-04``, ``created_at 2026-09-27 18:16:35-04``, i.e. ~17h
+    below a watermark that had already passed 16:13. They were a MATCHED pair, so
+    pairing and row-count checks passed on both sides and the shortfall was
+    invisible (data-lab t_64da90fb).
+
+    ``created_at`` (``DEFAULT NOW()``, written by the same statement as the row,
+    monotone in insert order and never rewritten) is the clock that can:
+    ``created_after=<MAX(created_at) of the last load>`` is a complete delta.
+    Both windows are optional and independent, so a reader whose only watermark
+    is the insert clock can ask for it alone. **No DDL** — the column has been in
+    ``timeclock.events`` since the schema was written; the route simply neither
+    filtered nor returned it (t_de287826).
+    """
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("e.event_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("e.event_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("e.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("e.created_at <= %s"); params.append(created_before)
     if location_id:
         filters.append("e.location_id = %s::uuid")
         params.append(location_id)
@@ -1100,7 +1144,7 @@ def timeclock_events(
         SELECT e.event_id, e.employee_id,
                emp.first_name || ' ' || emp.last_name AS employee_name,
                e.location_id, l.name AS location_name,
-               e.event_type, e.event_dt, e.notes
+               e.event_type, e.event_dt, e.notes, e.created_at
         FROM timeclock.events e
         JOIN hr.employees emp ON emp.employee_id = e.employee_id
         JOIN hr.locations l ON l.location_id = e.location_id

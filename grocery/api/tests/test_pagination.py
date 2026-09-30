@@ -167,6 +167,10 @@ WINDOWED_ROUTES = [
     # The lifecycle event stream carried no readable insert clock, so its ingest route
     # was the one whole-table read left on the pipeline's critical path (t_51bbc12e).
     ("/grocery/online/order-events", "created_at", "created_after", "created_before"),
+    # ... and the last route in the family (t_de287826): timeclock.events carries its own
+    # created_at, and the route no longer requires a business window, so it can be asked
+    # for the insert clock alone.
+    ("/grocery/timeclock/events", "created_at", "created_after", "created_before"),
     # ... and the *state* clock on the orders it belongs to: updated_at says when the
     # row last changed, which created_at cannot express (the status is mutated in
     # place). Together they let a reader bound the window *and* the state it sees.
