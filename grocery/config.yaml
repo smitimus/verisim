@@ -5,8 +5,16 @@
 # =============================================================================
 
 generator:
-  tick_interval_seconds: 30        # wall-clock seconds between generation ticks
-  simulation_minutes_per_tick: 15  # simulated time each tick represents
+  tick_interval_seconds: 30        # wall-clock seconds between generation ticks.
+                                   # Realtime writes one tick per this many seconds
+                                   # (2880/day at 30 s) and the POS volume law sizes
+                                   # the tick from it — not from the simulated clock
+                                   # below (t_94bbf1ce).
+  simulation_minutes_per_tick: 15  # simulated time a tick would represent under an
+                                   # accelerated clock. Realtime does NOT implement
+                                   # that clock and this value must not size the
+                                   # volume: doing so ran every realtime day at 30x
+                                   # the configured pos_transactions_per_day.
   backfill_lookback_days: 30       # history a fresh DB is backfilled over; also
                                    # the horizon promo validity windows start at
 

@@ -149,12 +149,90 @@ def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, s
 # Volume calculation
 # ---------------------------------------------------------------------------
 
-def compute_pos_count(cfg, scenario_ctx):
-    daily = random.randint(cfg.volumes.pos_transactions_per_day_min,
-                           cfg.volumes.pos_transactions_per_day_max)
-    ticks_per_day = (24 * 60) / max(1, cfg.generator.simulation_minutes_per_tick)
-    per_tick = daily / ticks_per_day
-    return max(0, round(per_tick * scenario_ctx.volume_multiplier))
+# One simulated hour of demand. The backfill writes exactly one tick per
+# simulated hour; realtime writes one tick per `tick_interval_seconds` of wall
+# clock, so the same hour arrives in 120 ticks at the default 30 s cadence
+# (2880 a day) — that ratio is what the per-tick volume must be divided by.
+SIM_HOUR_SECONDS = 3600
+
+DEFAULT_TICK_INTERVAL_SECONDS = 30
+
+
+def realtime_tick_seconds(cfg, state) -> int:
+    """Seconds of simulated time one realtime tick writes.
+
+    The main loop sleeps `control.generator_state.tick_interval_seconds` (seeded
+    from config, settable 5-3600 s from the API/UI) — that is the cadence the
+    generator really runs at, so it is the one the volume law must use, not
+    `simulation_minutes_per_tick`.
+    """
+    value = (state or {}).get('tick_interval_seconds') or cfg.generator.tick_interval_seconds
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TICK_INTERVAL_SECONDS
+    return seconds if seconds > 0 else DEFAULT_TICK_INTERVAL_SECONDS
+
+
+def daily_pos_target(cfg, sim_date) -> int:
+    """The day's configured transaction budget — a pure function of the date.
+
+    Neither writer may own the day's volume: the backfill replays a day one
+    simulated hour at a time (and resumes a partial day after a restart), while
+    realtime writes it 120 times an hour. Drawing the band once per call would
+    hand the same date a different total depending on who wrote it, and a resumed
+    day a different total from an uninterrupted one — the same reasoning that made
+    `timeclock.plan_shift()` a pure function of (date, employee id) (t_ca6642e0).
+    The seed is the ISO date, so it is stable across processes and runs; different
+    dates still draw different budgets from the configured band.
+    """
+    rng = random.Random('verisim-pos-%s' % sim_date.isoformat())
+    return rng.randint(cfg.volumes.pos_transactions_per_day_min,
+                       cfg.volumes.pos_transactions_per_day_max)
+
+
+def pos_count_expectation(cfg, scenario_ctx, simulated_seconds, sim_date, daily=None) -> float:
+    """Un-rounded POS transaction volume for ONE tick, before sampling.
+
+    `scenario_ctx.volume_multiplier` already carries the hour-of-day weight
+    (`hourly_weights[hour] * 24`) and the day-of-week multiplier — see
+    `scenario_engine.get_scenario_context` — so one simulated hour's demand is
+    `daily * volume_multiplier / 24`, and a tick carries that hour's share:
+
+        per_tick = (daily / 24) * volume_multiplier * simulated_seconds / 3600
+
+    Sizing the tick from `simulation_minutes_per_tick` instead (15 simulated
+    minutes in a 96-tick day) while realtime ticks 2880 times a day is what ran
+    every realtime day at exactly 30x the configured volume (t_94bbf1ce).
+
+    `daily` is the date's draw from `volumes.pos_transactions_per_day`; callers
+    pass it only to make the arithmetic testable.
+    """
+    if daily is None:
+        daily = daily_pos_target(cfg, sim_date)
+    per_hour = (daily / 24.0) * scenario_ctx.volume_multiplier
+    return max(0.0, per_hour * simulated_seconds / SIM_HOUR_SECONDS)
+
+
+def compute_pos_count(cfg, scenario_ctx, simulated_seconds, sim_date) -> int:
+    """Integer POS transaction count for one tick."""
+    return _unbiased_count(
+        pos_count_expectation(cfg, scenario_ctx, simulated_seconds, sim_date))
+
+
+def _unbiased_count(expected) -> int:
+    """Round a fractional count to an int without biasing the mean.
+
+    A 30 s tick carries well under one transaction outside the peaks (0.011 in
+    the dead hours, 2.6 at the 18:00 peak), so plain `round()` would return 0 for
+    every tick of the quiet half of the night and quietly shrink the day.
+    Carrying the fraction as a probability keeps the hour's expected volume
+    exact while still writing an integer per tick.
+    """
+    if expected <= 0:
+        return 0
+    whole = int(expected)
+    return whole + (1 if random.random() < expected - whole else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +420,7 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
             (scenario.scenario_tag,)
         )
 
-    pos_count = compute_pos_count(cfg, scenario)
+    pos_count = compute_pos_count(cfg, scenario, realtime_tick_seconds(cfg, state), sim_dt.date())
     tick_start = time.monotonic()
 
     # POS transactions
@@ -511,9 +589,11 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 float(state['volume_multiplier']),
                 sim_dt, cfg,
             )
-            daily = random.randint(cfg.volumes.pos_transactions_per_day_min,
-                                   cfg.volumes.pos_transactions_per_day_max)
-            pos_count = max(0, round((daily / 24) * scenario.volume_multiplier))
+            # One tick per simulated hour here, so the whole hour's demand is
+            # written at once — the same law realtime applies 120 times an hour,
+            # against the same date-keyed daily budget, so both paths write the
+            # same day at the same volume (t_94bbf1ce).
+            pos_count = compute_pos_count(cfg, scenario, SIM_HOUR_SECONDS, cur_date)
 
             depletion = pos.generate_pos_transactions(
                 conn, cfg, sim_dt, pos_count, scenario,
