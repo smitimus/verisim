@@ -1,227 +1,412 @@
 """
-Timeclock model — generates employee clock-in/clock-out and break events.
+Timeclock model — employee clock-in/clock-out and break events.
 
-Shift simulation:
-- Morning shift: clock_in 6-9am, clock_out 2-5pm
-- Afternoon/evening shift: clock_in 2-5pm, clock_out 10pm-12am
-- Each shift includes a 30-min break (break_start + break_end at midpoint)
+A simulated day is a *shift plan*, not a per-tick lottery. For every active
+store employee, `plan_shift()` decides — purely from (date, employee_id) —
+whether that employee works that day (~80% do) and, if so, the four instants of
+their shift:
 
-Pairing invariant: a `break_start` is always written together with its
-`break_end`, never in a later tick. data-lab's `assert_timeclock_pairs` is a
-hard error, so an open break fails the whole pipeline (t_a24cfbc6).
+    clock_in      06-09 / 00-05 / 13-15   (55% / 10% / ~35% of the roster)
+    break_start   clock_in + 3h + 0-30min
+    break_end     break_start + 30min
+    clock_out     clock_in + 8h ± jitter, never past 23:30
 
-In realtime mode, this generates events for employees whose shift should
-be starting or ending at the current simulated time.
-In backfill mode, a full day's worth of events is generated per simulated day.
+Two callers write that same plan, and both agree on the day because the plan is
+a pure function — no shared RNG stream, no stored state, the same answer on any
+tick, in any order, after any restart:
+
+* `generate_day_events()` — the backfill writes a whole past day in one pass.
+* `generate_events()`     — realtime (and the backfill's partial day) writes
+  each instant as the clock reaches it, one tick at a time. Idempotency comes
+  from the dedup SELECT below: an event is inserted only once, and only once
+  its instant has passed.
+
+Why the plan (t_ca6642e0)
+-------------------------
+Realtime used to re-sample a fraction of the *whole* pool on every tick against
+that per-calendar-day dedup. `EARLY_MORNING_IN_HOURS` clocked in
+`len(store)//6` employees per tick, so with a 30-second tick the entire roster
+was clocked in — and mostly back out — within minutes of midnight; from hour 1
+onwards `can_in`, `can_out` and `on_shift` were all empty, so the afternoon
+branch clocked out nobody, the EVENING branch emitted no break at all, and
+every punch of the day carried hour 0. Measured on the dev slot 2026-09-30:
+each of 2026-09-21 … 09-30 held ~100 `clock_in`, ~100 `clock_out`, **0**
+`break_start` and **0** `break_end`, all at hour 00, while the backfill's
+complete days held 4 events per working employee spread across the day.
+`mart_attendance_summary` therefore saw a 0-hour shift for essentially everyone
+and `break_hours = 0` on every day after the seed day.
+
+Why not an accelerated simulated clock: the realtime clock IS the wall clock —
+`main.py` passes `datetime.now()` — and data-lab's freshness windows, its
+`event_dt` ingest watermark and the backfill's notion of "today" are all built on
+that. Moving realtime onto a simulated clock changes what "today" means for
+every model and every ingest window; making the day a plan fixes the shape of
+the day and leaves the clock where it is.
+
+Writes are monotone in event_dt
+-------------------------------
+Everything below follows from one constraint: data-lab reads this table
+incrementally with its cursor on `event_dt`, so a row written *below* the newest
+`event_dt` already on the clock can never be read again — the later incremental
+run starts at `MAX(event_dt)` and looks forward (t_fa8cad04, and see the
+"two windows" table in AGENTS.md: `event_dt` is business time and backdated,
+the right delta clock is the insert clock this route does not surface yet).
+
+* An event is written at its planned instant, when that instant arrives; a
+  tick that misses one still writes it late, and `_add()` floors every write
+  above the day's newest row, so nothing is ever written into that blind spot.
+* A break is written in two halves 30 minutes apart, *not* as one atomic pair
+  (which is what the previous build did): the pair can only be written once
+  its `break_end` is due, and that would back-date `break_start` 30 minutes
+  below the cursor — data-lab would receive every `break_end` and no
+  `break_start`, failing the very `assert_timeclock_pairs` the atomic pair was
+  introduced to fix (t_a24cfbc6). The tick loop runs every 30s, and the
+  closing tick needs nothing but the plan, so a missed `break_end` is written
+  by the next tick; data-lab's check only looks at days before today, and a
+  break's halves are at most 30 minutes apart, so nothing is ever left open on
+  a finished day by a running generator.
+* A shift whose start was never observed at its instant (a generator restart,
+  an employee hired mid-day) is moved as a whole — see `_due_records()` — to
+  just above the day's newest row rather than back-dated below it.
+* An employee with an open punch or open break on today's clock is always
+  closed out, even if the plan does not roster them for the day, and even if
+  they have dropped off the active roster (terminated mid-shift). Half a shift
+  is an unpaired punch, which is a hard data-lab error.
+* A generator that was down across midnight left the *previous* day open, and
+  that is the day data-lab's check judges (`event_date < current_date`). The
+  first tick of the new day closes whatever is still open on it, before any of
+  the new day's rows exist — after that, a timestamp on yesterday would sit
+  below today's rows and no incremental read could reach it.
 """
-import random
+import hashlib
 import logging
+import random
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from psycopg2.extras import execute_values
 
 log = logging.getLogger(__name__)
 
-# Approximate shift windows (hour of day → event type)
+# Shift windows: the hour of day an employee clocks in.
 MORNING_IN_HOURS = [6, 7, 8, 9]
+EARLY_MORNING_IN_HOURS = list(range(0, 6))     # overnight stocking / prep
 AFTERNOON_IN_HOURS = [13, 14, 15, 16]
-EVENING_IN_HOURS = [17, 18]
 SHIFT_LENGTH_HOURS = 8
-
-# A break is one 30-minute event written as a start/end pair in a single tick.
 BREAK_LENGTH_MINUTES = 30
 
-# Early morning shift window (overnight stocking/early opening staff)
-EARLY_MORNING_IN_HOURS = list(range(0, 6))  # hours 0-5
-LATE_NIGHT_OUT_HOURS = list(range(21, 24))   # hours 21-23
+# Latest start that still ends the shift on the same calendar day: SHIFT_LENGTH
+# (8h) + max jitter (30min) from hour 15 ends by 23:30.
+SAFE_AFTERNOON_HOURS = [h for h in AFTERNOON_IN_HOURS
+                        if h + SHIFT_LENGTH_HOURS <= 23]
+
+# Share of the roster that works a given day, and the mix of shift windows.
+WORK_PROBABILITY = 0.80
+MORNING_SHARE = 0.55
+EARLY_MORNING_SHARE = 0.10
+
+EVENT_TYPES = ("clock_in", "break_start", "break_end", "clock_out")
+
+
+# ---------------------------------------------------------------------------
+# The shift plan
+# ---------------------------------------------------------------------------
+
+def _plan_seed(sim_date, employee_id) -> int:
+    """A stable int seed for one (day, employee) — never the process hash."""
+    key = "%s|%s" % (sim_date.isoformat(), employee_id)
+    return int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big")
+
+
+def _day_end(sim_date) -> datetime:
+    return datetime(sim_date.year, sim_date.month, sim_date.day, 23, 59, 59)
+
+
+def _shift_limit(sim_date) -> datetime:
+    """Latest instant a planned event may carry: a shift must not cross
+    midnight, or its employee-day would be split in two downstream."""
+    return datetime(sim_date.year, sim_date.month, sim_date.day, 23, 30)
+
+
+def plan_shift(sim_date, employee_id) -> Optional[Dict[str, datetime]]:
+    """The four instants of one employee's shift on `sim_date`, or None when
+    that employee does not work that day (~20% of employee-days).
+
+    Pure and deterministic in (sim_date, employee_id): every caller, on every
+    tick, in any order, derives the same shift — which is what lets realtime and
+    the backfill write the same day.
+    """
+    rng = random.Random(_plan_seed(sim_date, employee_id))
+    if rng.random() > WORK_PROBABILITY:
+        return None
+
+    roll = rng.random()
+    if roll < MORNING_SHARE:
+        in_hour = rng.choice(MORNING_IN_HOURS)
+    elif roll < MORNING_SHARE + EARLY_MORNING_SHARE:
+        in_hour = rng.choice(EARLY_MORNING_IN_HOURS)
+    else:
+        in_hour = rng.choice(SAFE_AFTERNOON_HOURS)
+
+    clock_in = datetime(sim_date.year, sim_date.month, sim_date.day,
+                        in_hour, rng.randint(0, 59))
+    clock_out = clock_in + timedelta(hours=SHIFT_LENGTH_HOURS,
+                                     minutes=rng.randint(-15, 30))
+    clock_out = min(clock_out, _shift_limit(sim_date))
+    break_start = clock_in + timedelta(hours=SHIFT_LENGTH_HOURS // 2 - 1,
+                                       minutes=rng.randint(0, 30))
+    return {
+        "clock_in": clock_in,
+        "break_start": break_start,
+        "break_end": break_start + timedelta(minutes=BREAK_LENGTH_MINUTES),
+        "clock_out": clock_out,
+    }
+
+
+def _shift_records(employee, shift: Dict[str, datetime]) -> List[tuple]:
+    """The insert rows of one planned shift, in clock order."""
+    return [(employee['employee_id'], employee['location_id'], etype,
+             shift[etype], None)
+            for etype in EVENT_TYPES if etype in shift]
+
+
+# ---------------------------------------------------------------------------
+# Reading the day's clock back
+# ---------------------------------------------------------------------------
+
+def _local_naive(dt: datetime) -> datetime:
+    """One time frame for the comparisons below.
+
+    `timeclock.events.event_dt` is `TIMESTAMPTZ`, so the driver hands it back as
+    an *aware* datetime, while the generator's clock (`datetime.now()` in
+    `main.py`) and `plan_shift()` are naive local time — the same wall clock the
+    write path sends. Compare and store them as naive local.
+    """
+    return dt.astimezone().replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
+def _events_on(conn, sim_date) -> Dict[str, Dict[str, datetime]]:
+    """employee_id -> {event_type: event_dt} for one simulated day."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT employee_id::text, event_type, event_dt
+            FROM timeclock.events
+            WHERE event_dt::date = %s
+        """, (sim_date,))
+        today: Dict[str, Dict[str, datetime]] = {}
+        for emp_id, etype, event_dt in cur.fetchall():
+            today.setdefault(emp_id, {})[etype] = _local_naive(event_dt)
+    return today
+
+
+def _locations_for(conn, employee_ids: Iterable[str]) -> List[Tuple[str, str]]:
+    """(employee_id, location_id) for employees no longer on the roster."""
+    employee_ids = list(employee_ids)
+    if not employee_ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT employee_id::text, location_id::text
+            FROM hr.employees
+            WHERE employee_id = ANY(%s::uuid[])
+        """, (employee_ids,))
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def _insert(conn, records: List[tuple]) -> int:
+    if not records:
+        return 0
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO timeclock.events
+                (employee_id, location_id, event_type, event_dt, notes)
+            VALUES %s
+        """, records, template="(%s::uuid,%s::uuid,%s,%s,%s)")
+    conn.commit()
+    return len(records)
+
+
+# ---------------------------------------------------------------------------
+# Realtime (and the backfill's partial day)
+# ---------------------------------------------------------------------------
+
+def _due_records(employee_id: str, location_id, sim_date,
+                 seen: Dict[str, datetime], day_max: Optional[datetime],
+                 simulation_dt: datetime) -> List[tuple]:
+    """The events one employee's simulated day owes as of `simulation_dt`.
+
+    `seen` is what that employee already has on today's clock, `day_max` the
+    newest `event_dt` anywhere on it (see the module docstring).
+    """
+    out: List[tuple] = []
+
+    def add(event_type, planned_dt):
+        # Floored above the day's newest row: a row written below it is in the
+        # blind spot of every later incremental read (data-lab watermarks on
+        # event_dt), so a late event moves up rather than back-dating.
+        if day_max is not None and planned_dt <= day_max:
+            planned_dt = day_max + timedelta(seconds=1)
+        if planned_dt <= simulation_dt:
+            out.append((employee_id, location_id, event_type, planned_dt, None))
+
+    shift = plan_shift(sim_date, employee_id)
+    if shift is None:
+        # Not rostered today: never invent a shift for them, only close what
+        # today's clock already holds open (an older build's shape).
+        open_in = seen.get('clock_in')
+        if seen.get('break_start') is not None and 'break_end' not in seen:
+            add('break_end', seen['break_start'] + timedelta(minutes=BREAK_LENGTH_MINUTES))
+        if open_in is not None and 'clock_out' not in seen:
+            add('clock_out', min(open_in + timedelta(hours=SHIFT_LENGTH_HOURS),
+                                 _day_end(sim_date)))
+        return out
+
+    written_in = seen.get('clock_in')
+    if written_in is not None:
+        # The shift is wherever its clock_in was written — which is what keeps
+        # a shift moved by an earlier tick (below) in one piece.
+        offset = written_in - shift['clock_in']
+    elif day_max is not None and shift['clock_in'] <= day_max:
+        # We were not looking when this shift started (a generator restart, an
+        # employee hired mid-day): move the whole shift — break at the midpoint,
+        # out 8h later — to just above the day's newest row. Back-dating it is
+        # what would hide its punches from the incremental read.
+        offset = day_max - shift['clock_in'] + timedelta(seconds=1)
+    else:
+        offset = timedelta(0)
+
+    if offset:
+        shift = {etype: dt + offset for etype, dt in shift.items()}
+        shift['clock_out'] = min(shift['clock_out'], _day_end(sim_date))
+        # A shift moved forward can end up too short to hold a break; a day
+        # with no break still pairs (0 == 0), one that crossed midnight does not.
+        if not (shift['clock_in'] <= shift['break_start']
+                and shift['break_end'] <= shift['clock_out']):
+            shift.pop('break_start', None)
+            shift.pop('break_end', None)
+
+    if written_in is None:
+        add('clock_in', shift['clock_in'])
+    # A break is two halves 30 minutes apart, each written when it comes due
+    # (see the module docstring on why they are not written as one atomic pair);
+    # both are only ever written together-or-not-at-all, never one alone.
+    if 'break_start' in shift and 'break_end' not in seen:
+        if 'break_start' not in seen:
+            add('break_start', shift['break_start'])
+        add('break_end', shift['break_end'])
+    if 'clock_out' not in seen:
+        add('clock_out', shift['clock_out'])
+    return out
+
+
+def _day_is_open(events: Dict[str, datetime]) -> bool:
+    """True when this employee-day is missing half of a punch or of a break."""
+    if ('clock_in' in events) != ('clock_out' in events):
+        return True
+    return ('break_start' in events) != ('break_end' in events)
+
+
+def _close_previous_day(conn, sim_date, store_employees: List[Dict],
+                        simulation_dt: datetime) -> List[tuple]:
+    """Close the previous simulated day's open punches and breaks.
+
+    Only reachable from the first tick of a day (see `generate_events`), which
+    is the last moment it can work: once today's own rows exist, a timestamp on
+    yesterday would sit below them and no incremental read would ever see it.
+    """
+    prev_date = sim_date - timedelta(days=1)
+    prev = _events_on(conn, prev_date)
+    open_ids = {eid for eid, events in prev.items() if _day_is_open(events)}
+    if not open_ids:
+        return []
+
+    prev_max = max((dt for events in prev.values() for dt in events.values()),
+                   default=None)
+    location = {str(e['employee_id']): e['location_id'] for e in store_employees}
+    location.update(dict(_locations_for(conn, sorted(open_ids - set(location)))))
+
+    records: List[tuple] = []
+    for employee_id in sorted(open_ids):
+        if location.get(employee_id) is None:
+            continue
+        # Re-derive the shift from the plan and write whatever half is missing,
+        # floored above the previous day's newest row: a day with an unpaired
+        # punch is what data-lab's hard check fails on.
+        records.extend(_due_records(employee_id, location[employee_id], prev_date,
+                                    prev[employee_id], prev_max, simulation_dt))
+    if records:
+        log.info("Closed %d open timeclock event(s) on %s (generator was down "
+                 "across the day boundary)", len(records), prev_date)
+    return records
 
 
 def generate_events(conn, simulation_dt: datetime, employees: List[Dict],
                     locations: Dict[str, List[Dict]]) -> int:
     """
-    Generate timeclock events for the current simulated hour.
-    Returns number of events created.
+    Write the planned events that have come due on `simulation_dt`'s day.
+    Returns the number of events created.
 
-    Queries existing events for today before inserting so each employee only
-    receives each event type once per day (prevents duplicate clock_ins from
-    repeated 15-minute ticks within the same hour window).
+    Called every realtime tick (sub-minute) and once per hour by the backfill's
+    partial day. Reads today's clock back first, so an event is written once and
+    only once its instant has passed.
     """
-    hour = simulation_dt.hour
+    sim_date = simulation_dt.date()
     store_employees = [e for e in employees
-                        if e['location_type'] == 'store' and e['status'] == 'active']
+                       if e['location_type'] == 'store' and e['status'] == 'active']
     if not store_employees:
         return 0
 
-    # Build a map of employee_id → set of event_types already recorded today
-    sim_date = simulation_dt.date()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT employee_id::text, event_type
-            FROM timeclock.events
-            WHERE event_dt::date = %s
-        """, (sim_date,))
-        today: dict = {}
-        for emp_id, etype in cur.fetchall():
-            today.setdefault(emp_id, set()).add(etype)
+    seen = _events_on(conn, sim_date)
 
-    def has(emp_id, etype):
-        return etype in today.get(str(emp_id), set())
+    records: List[tuple] = []
+    if not seen:
+        # First tick of a new simulated day. A generator that was down across
+        # midnight has left the *previous* day's shifts open — and that is the
+        # day data-lab's `assert_timeclock_pairs` judges (`event_date <
+        # current_date`). Close them now, before today's rows exist.
+        records.extend(_close_previous_day(conn, sim_date, store_employees,
+                                           simulation_dt))
 
-    records = []
-    sample_size_morning   = max(1, len(store_employees) // (len(MORNING_IN_HOURS) * 3))
-    sample_size_afternoon = max(1, len(store_employees) // (len(AFTERNOON_IN_HOURS) * 3))
+    day_max = max((dt for events in seen.values() for dt in events.values()),
+                  default=None)
 
-    if hour in MORNING_IN_HOURS:
-        # Clock in employees who haven't clocked in yet today
-        eligible = [e for e in store_employees if not has(e['employee_id'], 'clock_in')]
-        for emp in random.sample(eligible, min(sample_size_morning, len(eligible))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'clock_in', event_dt, None))
+    roster = set()
+    for emp in store_employees:
+        employee_id = str(emp['employee_id'])
+        roster.add(employee_id)
+        records.extend(_due_records(employee_id, emp['location_id'], sim_date,
+                                    seen.get(employee_id, {}), day_max, simulation_dt))
 
-    elif hour in AFTERNOON_IN_HOURS:
-        # Clock out morning workers; clock in afternoon workers
-        can_out = [e for e in store_employees
-                   if has(e['employee_id'], 'clock_in') and not has(e['employee_id'], 'clock_out')]
-        can_in  = [e for e in store_employees if not has(e['employee_id'], 'clock_in')]
-        for emp in random.sample(can_out, min(sample_size_afternoon, len(can_out))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'clock_out', event_dt, None))
-        for emp in random.sample(can_in, min(sample_size_afternoon, len(can_in))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'clock_in', event_dt, None))
+    # Today's clock also holds employees who are no longer on the active roster:
+    # `hr.maybe_terminate_employee()` can fire while someone is on shift, and a
+    # shift that started today still has to be closed — half a shift is an
+    # unpaired punch, a hard error downstream.
+    off_roster = sorted(set(seen) - roster)
+    for employee_id, location_id in _locations_for(conn, off_roster):
+        records.extend(_due_records(employee_id, location_id, sim_date,
+                                    seen[employee_id], day_max, simulation_dt))
 
-    elif hour in EVENING_IN_HOURS:
-        # Break events for employees currently on shift.
-        #
-        # The two halves are written in the SAME tick, BREAK_LENGTH_MINUTES
-        # apart. The older shape emitted break_start here and only closed it in
-        # the *next* hour with a break branch, which orphans every break_start
-        # written at hour 18: there is no hour 19 behind it, and the dedup map
-        # above is per calendar day, so nothing ever closes it. On the backfill's
-        # partial day (hours 0…now.hour in one pass) that left exactly
-        # sample_size open breaks — the 12 employee-days data-lab's hard
-        # assert_timeclock_pairs failed on (t_a24cfbc6). generate_day_events()
-        # has always written breaks as a pair; the realtime path now agrees.
-        sample_size = max(1, len(store_employees) // 8)
-        on_shift    = [e for e in store_employees if has(e['employee_id'], 'clock_in')
-                       and not has(e['employee_id'], 'clock_out')]
-        # Close anything still open — a row written by an older build, or a tick
-        # killed between the two inserts. Keeps the pair invariant for state this
-        # build did not create; a no-op once the pairs are atomic.
-        open_breaks = [e for e in on_shift
-                       if has(e['employee_id'], 'break_start')
-                       and not has(e['employee_id'], 'break_end')]
-        need_break = [e for e in on_shift if not has(e['employee_id'], 'break_start')]
+    return _insert(conn, records)
 
-        for emp in random.sample(open_breaks, min(sample_size, len(open_breaks))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'break_end', event_dt, None))
-        for emp in random.sample(need_break, min(sample_size, len(need_break))):
-            break_start = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'break_start', break_start, None))
-            records.append((emp['employee_id'], emp['location_id'], 'break_end',
-                            break_start + timedelta(minutes=BREAK_LENGTH_MINUTES), None))
 
-    elif hour in LATE_NIGHT_OUT_HOURS:
-        # Late night clock-outs for anyone still clocked in (extended from 20-23 to full late window)
-        sample_size = max(1, len(store_employees) // 10)
-        can_out = [e for e in store_employees
-                   if has(e['employee_id'], 'clock_in') and not has(e['employee_id'], 'clock_out')]
-        for emp in random.sample(can_out, min(sample_size, len(can_out))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'clock_out', event_dt, None))
-
-    elif hour in EARLY_MORNING_IN_HOURS:
-        # Early morning: clock_in for overnight arrivals AND clock_out for late finishers
-        on_shift = [e for e in store_employees
-                    if has(e['employee_id'], 'clock_in') and not has(e['employee_id'], 'clock_out')]
-        can_in = [e for e in store_employees
-                  if not has(e['employee_id'], 'clock_in')]
-        # Clock out late finishers
-        sample_out = max(1, len(on_shift) // 4)
-        for emp in random.sample(on_shift, min(sample_out, len(on_shift))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'clock_out', event_dt, None))
-        # Clock in early arrivals (stockers/prep staff)
-        sample_in = max(1, len(store_employees) // 6)
-        for emp in random.sample(can_in, min(sample_in, len(can_in))):
-            event_dt = simulation_dt.replace(minute=random.randint(0, 59))
-            records.append((emp['employee_id'], emp['location_id'], 'clock_in', event_dt, None))
-
-    if not records:
-        return 0
-
-    with conn.cursor() as cur:
-        execute_values(cur, """
-            INSERT INTO timeclock.events
-                (employee_id, location_id, event_type, event_dt, notes)
-            VALUES %s
-        """, records, template="(%s::uuid,%s::uuid,%s,%s,%s)")
-    conn.commit()
-    return len(records)
-
+# ---------------------------------------------------------------------------
+# Backfill — complete days
+# ---------------------------------------------------------------------------
 
 def generate_day_events(conn, sim_date, employees: List[Dict]) -> int:
     """
-    Generate a full day of timeclock events for backfill mode.
-    Each active store employee gets 1-2 shifts worth of events.
+    Write every event of one simulated day in one pass.
+    Each working employee gets one shift's worth of events.
     """
     store_employees = [e for e in employees
-                        if e['location_type'] == 'store' and e['status'] == 'active']
+                       if e['location_type'] == 'store' and e['status'] == 'active']
     if not store_employees:
         return 0
 
-    records = []
-
-    # Maximum start hour for a shift to guarantee clock_out falls on the same calendar
-    # day: SHIFT_LENGTH_HOURS (8) + max_jitter (30 min) must end by 23:59.
-    # So latest safe start = 23 - 8 = 15, giving a worst-case end of 15:30+8h = 23:30.
-    safe_afternoon_hours = [h for h in AFTERNOON_IN_HOURS if h + SHIFT_LENGTH_HOURS <= 23]
-
+    records: List[tuple] = []
     for emp in store_employees:
-        # ~80% of employees work on any given day
-        if random.random() > 0.80:
+        shift = plan_shift(sim_date, emp['employee_id'])
+        if shift is None:
             continue
-
-        # Pick a shift — now includes early morning and late afternoon options for 24/7 coverage
-        if random.random() < 0.55:
-            in_hour = random.choice(MORNING_IN_HOURS)
-        elif random.random() < 0.10:  # ~10% of employees get an early morning shift
-            in_hour = random.choice(EARLY_MORNING_IN_HOURS)
-        else:
-            in_hour = random.choice(safe_afternoon_hours)
-
-        in_dt = datetime(sim_date.year, sim_date.month, sim_date.day,
-                          in_hour, random.randint(0, 59))
-        out_dt = in_dt + timedelta(hours=SHIFT_LENGTH_HOURS,
-                                    minutes=random.randint(-15, 30))
-
-        # Clamp clock_out to 23:30 same day — guards against in_minute + jitter
-        # pushing the shift end past midnight regardless of in_hour choice.
-        max_out = datetime(sim_date.year, sim_date.month, sim_date.day, 23, 30)
-        out_dt = min(out_dt, max_out)
-
-        records.append((emp['employee_id'], emp['location_id'], 'clock_in', in_dt, None))
-
-        # Break at ~midpoint
-        break_start = in_dt + timedelta(hours=SHIFT_LENGTH_HOURS // 2 - 1,
-                                         minutes=random.randint(0, 30))
-        break_end = break_start + timedelta(minutes=BREAK_LENGTH_MINUTES)
-        records.append((emp['employee_id'], emp['location_id'], 'break_start', break_start, None))
-        records.append((emp['employee_id'], emp['location_id'], 'break_end', break_end, None))
-
-        # Clock out — always same calendar day due to clamp above
-        records.append((emp['employee_id'], emp['location_id'], 'clock_out', out_dt, None))
-
-    if not records:
-        return 0
-
-    with conn.cursor() as cur:
-        execute_values(cur, """
-            INSERT INTO timeclock.events
-                (employee_id, location_id, event_type, event_dt, notes)
-            VALUES %s
-        """, records, template="(%s::uuid,%s::uuid,%s,%s,%s)")
-    conn.commit()
-    return len(records)
+        records.extend(_shift_records(emp, shift))
+    return _insert(conn, records)

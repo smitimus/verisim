@@ -1,36 +1,43 @@
 """
-Regression tests for verisim card t_a24cfbc6 — a break must never be left open.
+Regression tests for the break contract — verisim cards t_a24cfbc6 and t_ca6642e0.
 
 data-lab's `assert_timeclock_pairs` is a **hard** invariant (`severity: error`,
 "clock in/out pairing is a hard integrity invariant; failures block the
-pipeline"), so it fails `dbt_test_staging` on every run while any employee-day
-holds a `break_start` with no `break_end`.
+pipeline"), so it fails `dbt_test_staging` on every run while a day holds an
+unpaired punch or an unpaired break.
+
+What that invariant is checked against: `where event_date < current_date`, so a
+shift or a break that is still open *today* is not a violation — but a finished
+day must be complete.
 
 `generate_events()` used to write the two halves of a break in **different**
 hourly ticks: the EVENING branch (hours 17 and 18) emitted `break_start` in one
 tick and only closed it in the *next* hour that has a break branch. Hour 18 —
 the last such hour — has no hour 19 behind it and the dedup map is per calendar
-day, so every `break_start` written at 18:xx stayed open forever.
+day, so every `break_start` written at 18:xx stayed open **forever** (measured
+on the test slot 2026-09-30: 12 employee-days on 2026-09-21, all at
+18:00–18:53).
 
-Measured on the `test` slot (192.168.3.7, image digest 39f53c44… = verisim
-37c8d7d) on 2026-09-30: 09-21 (the seed day, whose hours 0…20 the backfill
-writes in one pass) held 24 `break_start` and 12 `break_end`; exactly the 12 at
-18:00–18:53 were unpaired, and they are the 12 employee-days the card lists.
-`generate_day_events()` already wrote breaks as a pair — these tests pin the
-realtime path to the same contract, and pin the repair of a legacy open break.
+Since t_ca6642e0 the model writes each employee's day from its shift plan, one
+instant at a time, and the closing tick needs nothing but the plan — so an hour
+that has no later branch can no longer orphan anything: every `break_end` comes
+due 30 minutes after its `break_start` and is written by the tick that reaches
+it. The two halves are deliberately *not* written as one atomic pair any more:
+the pair can only be written once its end is due, which would back-date the
+start 30 minutes below data-lab's `event_dt` ingest watermark, where no
+incremental read can reach it. See the model docstring.
 
-The fake below is an in-memory `timeclock.events`: it answers the dedup SELECT
-by date and absorbs the bulk INSERT, so a whole simulated day can be replayed
-without a database.
+These tests pin: the halves are 30 minutes apart and ordered, a day that has
+finished holds no unpaired event, a repeated tick inside one hour adds nothing,
+and a legacy open `break_start` is still closed.
 """
 from datetime import datetime, timedelta
 from unittest.mock import patch
-import random
 
 import grocery.generator.models.timeclock as timeclock
 
 SIM_DATE = datetime(2026, 9, 21)
-STORE_EMPLOYEES = 100          # → sample_size = 100 // 8 = 12, as on the slot
+STORE_EMPLOYEES = 100
 BREAK_TYPES = ("break_start", "break_end")
 PUNCH_TYPES = ("clock_in", "clock_out")
 
@@ -46,7 +53,7 @@ def _employees(n=STORE_EMPLOYEES):
 
 
 class _FakeCursor:
-    """Answers generate_events()' dedup SELECT from the in-memory rows."""
+    """Answers the model's reads from the in-memory rows."""
 
     def __init__(self, db):
         self._db = db
@@ -59,9 +66,20 @@ class _FakeCursor:
         return False
 
     def execute(self, sql, params=None):
-        if "FROM timeclock.events" in " ".join(sql.split()):
+        flat = " ".join(sql.split())
+        if "FROM timeclock.events" in flat:
             day = params[0]
-            self._rows = [(r[0], r[2]) for r in self._db.rows if r[3].date() == day]
+            rows = [r for r in self._db.rows if r[3].date() == day]
+            # answer the projection the caller asked for
+            if "event_dt" in flat.split("FROM")[0]:
+                self._rows = [(r[0], r[2], r[3]) for r in rows]
+            else:
+                self._rows = [(r[0], r[2]) for r in rows]
+        elif "FROM hr.employees" in flat:
+            # the closed-shift lookup: location of an employee who dropped off
+            # the active roster while their shift was still open
+            self._rows = [(eid, self._db.people[eid])
+                          for eid in params[0] if eid in self._db.people]
         else:
             self._rows = []
 
@@ -70,10 +88,14 @@ class _FakeCursor:
 
 
 class _FakeDB:
-    """In-memory timeclock.events — rows are the 5-tuples the models insert."""
+    """In-memory timeclock.events — rows are the 5-tuples the models insert.
 
-    def __init__(self, rows=None):
+    `people` is the hr.employees side (employee_id -> location_id).
+    """
+
+    def __init__(self, rows=None, people=None):
         self.rows = list(rows or [])
+        self.people = dict(people or {})
         self.commits = 0
 
     def cursor(self, *a, **k):
@@ -90,16 +112,21 @@ def _capture_into(db):
     return _execute_values
 
 
-def _replay(hours, db=None, employees=None, seed=1234):
-    """Replay generate_events() over the given hours of one simulated day."""
-    random.seed(seed)
+def _replay(hours, db=None, employees=None):
+    """Replay generate_events() at the end of each listed hour of one day.
+
+    Realtime (and the backfill's partial day) calls generate_events() once per
+    tick and writes each planned instant as the clock reaches it, so the tick
+    at the end of an hour is what writes that hour's events.
+    """
     db = db if db is not None else _FakeDB()
     employees = employees if employees is not None else _employees()
     with patch("grocery.generator.models.timeclock.execute_values",
                side_effect=_capture_into(db)):
         for hour in hours:
-            timeclock.generate_events(db, SIM_DATE.replace(hour=hour),
-                                      employees, LOCATIONS)
+            timeclock.generate_events(
+                db, SIM_DATE.replace(hour=hour, minute=59, second=59),
+                employees, LOCATIONS)
     return db
 
 
@@ -130,14 +157,13 @@ def _breaks_by_employee(rows):
 
 
 # ---------------------------------------------------------------------------
-# The reported failure: the backfill's partial day
+# The reported failures: the backfill's partial day, and the last break hour
 # ---------------------------------------------------------------------------
 
 def test_partial_backfill_day_leaves_no_open_break():
-    """The card's shape: the backfill writes today's hours 0…now.hour in one
-    pass, so hour 18 (the last hour with a break branch) is reached and its
-    break_starts are never closed."""
-    db = _replay(range(0, 21))             # 00:00 … 20:00, the reported run
+    """The card's shape (t_a24cfbc6): the backfill writes today's hours 0…now in
+    one pass through the same per-instant logic realtime uses."""
+    db = _replay(range(0, 21))             # 00:00 … 20:59, the reported run
     open_breaks = _open_breaks(db.rows)
     assert db.rows, "no timeclock events generated"
     assert not open_breaks, (
@@ -147,9 +173,10 @@ def test_partial_backfill_day_leaves_no_open_break():
 
 
 def test_the_last_break_hour_no_longer_orphans():
-    """Hour 18 specifically: old code wrote break_start-only there and had no
-    hour 19 to close it."""
-    db = _replay([0, 18])
+    """Hour 18 specifically: the old code wrote break_start-only there and had
+    no hour 19 to close it. The plan closes it 30 minutes later, and the check
+    is data-lab's — a *finished* day, so hour 19 is replayed too."""
+    db = _replay([0, 18, 19])
     starts = [r for r in db.rows if r[2] == "break_start"]
     ends = [r for r in db.rows if r[2] == "break_end"]
     assert starts, "hour 18 produced no break at all"
@@ -159,8 +186,9 @@ def test_the_last_break_hour_no_longer_orphans():
 
 
 def test_break_end_follows_its_break_start():
-    """A break is a real 30-minute pair, not two events in random order."""
-    db = _replay([0, 17, 18])
+    """A break is a real 30-minute pair, not two events in random order. Its
+    halves are written by different ticks, so the day has to play out first."""
+    db = _replay(range(0, 24))
     breaks = _breaks_by_employee(db.rows)
     assert breaks, "no breaks generated"
     for employee_id, ev in breaks.items():
@@ -180,7 +208,7 @@ def test_full_simulated_day_pairs_everything():
 
 
 def test_break_length_is_thirty_minutes():
-    db = _replay([0, 17, 18])
+    db = _replay(range(0, 24))
     breaks = _breaks_by_employee(db.rows)
     pairs = [(e, min(ev["break_start"]), min(ev["break_end"]))
              for e, ev in breaks.items()
@@ -194,7 +222,7 @@ def test_break_length_is_thirty_minutes():
 def test_no_break_outlives_its_day():
     """A break must start and end on the same simulated day — an end pushed past
     midnight would split the pair across two `event_date`s downstream."""
-    db = _replay([0, 17, 18])
+    db = _replay(range(0, 24))
     for employee_id, _location, event_type, event_dt, _notes in db.rows:
         if event_type in BREAK_TYPES:
             assert event_dt.date() == SIM_DATE.date(), (
@@ -221,7 +249,7 @@ def test_an_open_break_from_an_earlier_build_is_closed():
     """A slot that already holds an open break_start — the card's caveat — gets
     it closed by the next evening tick instead of keeping it forever."""
     db, employees = _clocker_in_db(open_break=True)
-    _replay([18], db=db, employees=employees, seed=7)
+    _replay([18], db=db, employees=employees)
     assert not _open_breaks(db.rows), (
         "the open break_start was not closed: %s" % _open_breaks(db.rows)
     )
@@ -230,7 +258,7 @@ def test_an_open_break_from_an_earlier_build_is_closed():
 def test_no_breaks_are_emitted_when_nobody_is_on_shift():
     """The repair must not invent a break_end for someone who never broke."""
     db, employees = _clocker_in_db(open_break=False)
-    _replay([18], db=db, employees=employees, seed=7)
+    _replay([18, 23], db=db, employees=employees)
     for employee_id, ev in _breaks_by_employee(db.rows).items():
         assert ev.get("break_start", []) and ev.get("break_end", []), (
             "%s got a %s with no counterpart" % (employee_id, sorted(ev))
@@ -241,7 +269,7 @@ def test_breaks_are_not_duplicated_by_repeated_ticks_in_one_hour():
     """The dedup map is what makes the extra break_end safe — repeated ticks in
     the same hour must not stack a second break on an employee."""
     db, employees = _clocker_in_db()
-    _replay([17, 17, 17, 17, 17], db=db, employees=employees, seed=11)
+    _replay([17, 17, 17, 17, 17, 23], db=db, employees=employees)
     breaks = _breaks_by_employee(db.rows)
     assert breaks, "no breaks generated"
     for employee_id, ev in breaks.items():
@@ -250,8 +278,8 @@ def test_breaks_are_not_duplicated_by_repeated_ticks_in_one_hour():
 
 
 def test_an_employee_takes_at_most_one_break_in_the_evening():
-    """Hours 17 and 18 both offer a break; the dedup must not hand one
-    employee two in the same day."""
+    """The plan gives each employee one break; the dedup must not hand anyone a
+    second one in the same day."""
     db = _replay([0, 17, 18])
     breaks = _breaks_by_employee(db.rows)
     assert breaks, "no breaks generated"
@@ -264,12 +292,11 @@ def test_an_employee_takes_at_most_one_break_in_the_evening():
 # ---------------------------------------------------------------------------
 
 def test_full_day_backfill_pairs_breaks_and_punches():
-    """The backfill's complete days go through generate_day_events(); its pairs
-    are the contract the realtime path now matches."""
+    """The backfill's complete days go through generate_day_events(); its four
+    events per working employee are the contract the realtime path matches."""
     db = _FakeDB()
     with patch("grocery.generator.models.timeclock.execute_values",
                side_effect=_capture_into(db)):
-        random.seed(3)
         timeclock.generate_day_events(db, SIM_DATE.date(), _employees())
     assert db.rows, "no events generated"
     assert not _open_breaks(db.rows), _open_breaks(db.rows)
