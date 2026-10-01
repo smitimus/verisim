@@ -413,23 +413,6 @@ def flush_sales(conn, allowance: 'StockAllowance', sim_dt,
     return len(stockout_records)
 
 
-def snapshot_on_hand(conn, location_ids: List[str],
-                     product_ids: List[str]) -> Dict[SkuKey, float]:
-    """On-hand quantity for a set of store-SKUs. One read."""
-    if not location_ids or not product_ids:
-        return {}
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT sl.location_id::text, sl.product_id::text,
-                   sl.quantity_on_hand::numeric
-            FROM inv.stock_levels sl
-            WHERE sl.location_id = ANY(%s::uuid[])
-              AND sl.product_id  = ANY(%s::uuid[])
-        """, (sorted({str(l) for l in location_ids}),
-              sorted({str(p) for p in product_ids})))
-        return {(str(loc), str(prod)): float(qty) for loc, prod, qty in cur.fetchall()}
-
-
 def deplete_inventory(conn, depletion_info: List[Dict]) -> None:
     """
     Reduce inv.stock_levels for items sold in a batch of POS transactions, from
@@ -437,9 +420,9 @@ def deplete_inventory(conn, depletion_info: List[Dict]) -> None:
 
     Kept as the "apply what was written" step for any caller that writes a sale
     directly; the POS and online paths now resolve stock first (see
-    `resolve_sales` / `commit_sales`) and deduct through the allowance. A caller
-    that skips the resolve step still gets the old flooring behaviour from here
-    rather than over-drawing the shelf.
+    `StockAllowance.take` / `flush_sales`) and deduct through the allowance. A
+    caller that skips the resolve step still gets the old flooring behaviour
+    from here rather than over-drawing the shelf.
     """
     if not depletion_info:
         return
