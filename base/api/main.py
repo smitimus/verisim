@@ -1131,13 +1131,29 @@ def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
 
 @app.get("/grocery/pos/combo-deals", tags=["Grocery — POS"])
 def pos_combo_deals(active_only: bool = True):
+    """Combo deals. `active_only=false` serves retired-but-referenced deals too.
+
+    `pos.transaction_items.deal_id` carries a real FK to this table, so every
+    deal a line item references is guaranteed to exist here — but `seed_combo_deals`
+    sets `is_active = FALSE` once `valid_until` passes (models/pos.py), and that
+    happens while the redemptions it earned are still on disk. An EDW that mirrors
+    only the active set therefore holds items whose `deal_id` it cannot resolve:
+    on CT107 2026-10-01, 4 of the 8 deals in use (56,036 items) had retired, so
+    `active_only=true` served 4 rows and left the other 4 dangling.
+
+    A consumer resolving an FK wants the full relation, not the active slice, so
+    it can pass `active_only=false`. `is_active` is in the projection (as on the
+    coupons route) so that consumer can still tell retired from current — without
+    it a full load is indistinguishable from an active one.
+    """
     filters, params = ["TRUE"], []
     if active_only:
         filters.append("cd.is_active = TRUE AND cd.valid_until >= CURRENT_DATE")
     where = " AND ".join(filters)
     return query(f"""
         SELECT cd.deal_id, cd.name, cd.description, cd.deal_type, cd.trigger_qty,
-               d.name AS trigger_department, cd.deal_price, cd.valid_from, cd.valid_until
+               d.name AS trigger_department, cd.deal_price, cd.valid_from, cd.valid_until,
+               cd.is_active
         FROM pos.combo_deals cd
         LEFT JOIN pos.departments d ON d.department_id = cd.trigger_department_id
         WHERE {where}
