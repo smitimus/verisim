@@ -48,12 +48,16 @@ enforce.
 - **`pos.products`** referenced by: `pos.price_history`, `pos.coupons`,
   `pos.combo_deals` (`trigger_product_id`), `pos.transaction_items`,
   `inv.products`, `inv.stock_levels`, `inv.receipt_items`,
-  `inv.shrinkage_events`, `ordering.store_order_items`, `fulfillment.items`,
-  `pricing.ad_items`.
+  `inv.shrinkage_events`, `inv.stockout_events`, `inv.sku_demand_daily`,
+  `ordering.store_order_items`, `fulfillment.items`, `pricing.ad_items`.
 - **`pos.loyalty_members`** referenced by: `pos.transactions` (`member_id`),
   `pos.loyalty_point_transactions` (`member_id`).
 - **`pos.transactions`** referenced by: `pos.transaction_items`,
-  `pos.loyalty_point_transactions`.
+  `pos.loyalty_point_transactions`, `inv.stockout_events`
+  (`pos_transaction_id`, when `channel = 'pos'`).
+- **`online.orders`** referenced by: `online.order_items`,
+  `online.order_events`, `inv.stockout_events` (`online_order_id`, when
+  `channel = 'online'`).
 - **`ordering.store_orders`** referenced by: `ordering.store_order_items`,
   `fulfillment.orders` (`store_order_id`), `transport.load_items`
   (`store_order_id`).
@@ -80,6 +84,37 @@ the highest-risk gaps and are asserted explicitly in the harness:
 | `transport.loads.driver_id` | employee with `department = 'transport'` at a `warehouse` location |
 | `fulfillment.orders.assigned_to` | employee with `department = 'warehouse'` at a `warehouse` location |
 | `ordering.store_orders.created_by` / `approved_by` | employee with `department = 'management'` |
+
+### Stockouts: the sales feed must not outrun the shelf (t_959cd040)
+
+Before t_959cd040, depletion floored at `GREATEST(0, on_hand - qty)` while the
+sale was written at the **full** requested quantity. The shortfall was absorbed
+silently, so the feed booked revenue for stock the store did not have — measured
+on the dev EDW as 249 of 1485 store-SKU rows (16.8%) pinned at zero with ~600k
+transactions still selling against them. `reorder_point`, `reorder_qty` and
+`restock_threshold_pct` were therefore decorative: a shortage could not be
+observed, so nothing could respond to one.
+
+The invariant now enforced, all of it cross-table and therefore **not** covered
+by any FK or CHECK:
+
+| Assertion | Rule |
+|---|---|
+| `SEMA-11` | `inv.stockout_events.channel` agrees with which parent is set — `pos` ⇔ `pos_transaction_id`, `online` ⇔ `online_order_id` |
+| `SEMA-12` | a POS stockout's parent line exists at exactly `fulfilled_quantity` — the till never rang up more than it could hand over |
+| `SEMA-13` | `inv.sku_demand_daily` reconciles: `requested_units = fulfilled_units + lost_units` |
+
+The per-line facts live in `inv.stockout_events` (one row per short line, priced
+at the price of record) and the per-store-SKU-day running total in
+`inv.sku_demand_daily`, which is what `ordering.check_and_create_orders` sizes a
+reorder from — lead-time demand plus `restock_threshold_pct` safety, clamped to
+`reorder_qty_max_multiple` × the seeded `reorder_qty`.
+
+Both channels resolve against ONE `inventory.StockAllowance` per tick, because
+POS and online draw on the same shelf; a line the shelf cannot cover at all is
+dropped rather than written at zero (`pos.transaction_items` and
+`online.order_items` both `CHECK (quantity > 0)`), and the shopper's lost
+demand is recorded instead.
 
 ### Promotion validity windows (temporal — also NOT FK-enforced)
 
@@ -138,6 +173,14 @@ No further serializer changes are required for #26–#31.
 | Inventory ↔ POS | `inventory/stock-levels`, `inventory/products` | `product_id`, `location_id` |
 | Inventory receipts ↔ Transport | `inventory/receipts` | `location_id`, `load_id` |
 | Inventory shrinkage | `grocery/inventory/shrinkage-events` | `product_id`, `location_id`, `reason`, `recorded_at` |
+
+> **API gap for t_959cd040:** `inv.stockout_events` and `inv.sku_demand_daily`
+> are **not yet exposed** by the API. data-lab cannot read the lost-sales feed
+> or the per-store-SKU-day demand ledger until a
+> `grocery/inventory/stockout-events` endpoint (and ideally
+> `.../sku-demand-daily`) lands. Tracked on the companion data-lab ticket
+> referenced by this card; the generator-side tables and their integrity
+> assertions are in place.
 
 > **API change made for #11:** `inventory/receipts` now returns `load_id`
 > (the receipt→transport.load FK), so data-lab can join

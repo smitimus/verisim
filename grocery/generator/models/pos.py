@@ -759,6 +759,7 @@ def generate_pos_transactions(
     coupons: List[Dict],
     deals: List[Dict],
     ad_prices: Optional[Dict[str, float]] = None,
+    stock_allowance=None,
 ) -> List[Dict]:
     """
     Generate `count` POS transactions. Returns depletion info for inventory.
@@ -768,6 +769,15 @@ def generate_pos_transactions(
     what makes an ad item sell through the price-elasticity curve instead of
     being decoration on a shelf nobody reorders (t_08deeddf); it defaults to
     None so an existing caller that has no ad context keeps working.
+
+    `stock_allowance` is the tick's shared `inventory.StockAllowance` (t_959cd040).
+    Every line is capped at what the shelf can actually cover and the shortfall
+    is recorded as a lost sale, so `pos.transaction_items.quantity` is what the
+    shopper actually got. main.py builds ONE allowance per tick and passes it to
+    both channels, because POS and online sell the same shelf. When it is None
+    (or cfg.inventory.enforce_stock_availability is false) nothing is capped and
+    this is the pre-t_959cd040 generator — the regression test uses that to
+    demonstrate the old behaviour rather than only asserting the new one.
     """
     if count <= 0 or not store_locations or not products:
         return []
@@ -806,6 +816,11 @@ def generate_pos_transactions(
     # loop would be both wasteful and a chance for the two to disagree.
     price_record = price_of_record(products, ad_prices or {})
 
+    # Stock-aware capping (t_959cd040). No allowance, or the config switch off,
+    # reproduces the old "sell whatever the basket asked for" behaviour.
+    enforce_stock = stock_allowance is not None and getattr(
+        cfg.inventory, 'enforce_stock_availability', True)
+
     for _ in range(count):
         loc = random.choice(store_locations)
         loc_cashiers = [e for e in cashiers if e['location_id'] == loc['location_id']]
@@ -829,33 +844,73 @@ def generate_pos_transactions(
         cart = draw_cart(products, num_items, cfg, ad_prices)
 
         txn_id = str(uuid4())
-        txn_items = []
         item_recs = []
+
+        # The demand this basket represents, before the shelf has its say.
+        # `line_id` only has to be unique within the batch; txn_id already is,
+        # so the position in the basket disambiguates a repeated product.
+        demand_lines = [
+            {
+                'line_id': f'{txn_id}:{position}',
+                'location_id': loc['location_id'],
+                'product_id': product['product_id'],
+                'parent_id': txn_id,
+                'quantity': (
+                    round(random.uniform(0.2, 3.5), 3)
+                    if product['uom'] == 'lb'
+                    else random.choices([1, 2, 3], weights=[78, 17, 5])[0]
+                ),
+                'unit_price': price_record.get(product['product_id'], product['price']),
+                'department': product['department'],
+            }
+            for position, product in enumerate(cart)
+        ]
+
+        # Resolve the basket against the shelf. Everything downstream —
+        # subtotal, tax, the coupon/deal caps, loyalty points — prices what the
+        # shopper actually got, so revenue, stock and the loss record all
+        # describe the same transaction (t_959cd040).
+        if enforce_stock:
+            granted = stock_allowance.take(demand_lines)
+            keep = [line for line in demand_lines
+                    if granted.get(line['line_id'], 0.0) > 0]
+            # Narrow `cart` to the lines that survived, preserving order and
+            # duplicates, so the promo-scoping helpers below still see the
+            # basket as it will be written.
+            surviving = {line['line_id'] for line in keep}
+            demand_lines = [
+                {**line, 'quantity': granted[line['line_id']]}
+                for line in demand_lines if line['line_id'] in surviving
+            ]
+            cart = [
+                product for position, product in enumerate(cart)
+                if f'{txn_id}:{position}' in surviving
+            ]
+
+        if not demand_lines:
+            # Every line was out of stock: the shopper leaves with nothing, so
+            # there is no transaction to write. The loss is recorded against the
+            # tick by main.commit_sales from the uncapped lines.
+            continue
+
         subtotal = 0.0
-
-        for product in cart:
-            # Quantity: lb-based products get fractional qty
-            if product['uom'] == 'lb':
-                qty = round(random.uniform(0.2, 3.5), 3)
-            else:
-                qty = random.choices([1, 2, 3], weights=[78, 17, 5])[0]
-
-            unit_price = price_record.get(product['product_id'], product['price'])
+        for line in demand_lines:
+            qty = line['quantity']
+            unit_price = line['unit_price']
             discount = 0.0
             coupon_id = None
             deal_id = None
 
             # Promotional discount
-            if product['department'] in promo_dept_discount:
-                discount += round(unit_price * promo_dept_discount[product['department']], 2)
+            if line['department'] in promo_dept_discount:
+                discount += round(unit_price * promo_dept_discount[line['department']], 2)
 
             effective_price = max(0.01, unit_price - discount)
             line_total = round(effective_price * qty, 2)
             subtotal += line_total
 
-            item_recs.append((txn_id, product['product_id'], qty,
+            item_recs.append((txn_id, line['product_id'], qty,
                                unit_price, discount, coupon_id, deal_id, line_total))
-            txn_items.append({'product_id': product['product_id'], 'quantity': qty})
 
         # Apply a coupon to the whole transaction (loyalty members only)
         coupon_savings = 0.0
@@ -946,7 +1001,11 @@ def generate_pos_transactions(
         ))
         # Update item_recs with txn_id (already has it in first position)
         item_records.extend(item_recs)
-        depletion_info.append({'transaction_id': txn_id, 'items': txn_items})
+        depletion_info.append({
+            'transaction_id': txn_id,
+            'items': [{'product_id': line['product_id'],
+                       'quantity': line['quantity']} for line in demand_lines],
+        })
 
         if random.random() < cfg.loyalty.signup_rate:
             first, last = fake.first_name(), fake.last_name()

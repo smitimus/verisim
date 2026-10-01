@@ -132,6 +132,33 @@ def _products_has_elasticity_columns(industry: str) -> bool:
     return present
 
 
+# Cache of the inv.stockout_events / inv.sku_demand_daily presence probe, keyed
+# by industry. Same reason as the elasticity probe above: a `schema.sql` change
+# only reaches a fresh bootstrap, so a slot on an older image (or a data dir
+# generated before t_959cd040) has neither table and the lost-sales routes must
+# degrade to an empty result instead of 500ing.
+_STOCKOUT_TABLES_PRESENT: Dict[str, bool] = {}
+
+
+def _has_stockout_tables(industry: str) -> bool:
+    """True when this data dir carries the t_959cd040 inventory tables."""
+    cached = _STOCKOUT_TABLES_PRESENT.get(industry)
+    if cached is not None:
+        return cached
+    try:
+        rows = query("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'inv'
+              AND table_name IN ('stockout_events', 'sku_demand_daily')
+        """, [], industry)
+        found = {r['table_name'] for r in rows}
+        present = {'stockout_events', 'sku_demand_daily'} <= found
+    except Exception:
+        present = False
+    _STOCKOUT_TABLES_PRESENT[industry] = present
+    return present
+
+
 def query_write(sql: str, params, industry: str) -> List[Dict]:
     """Execute a write statement with RETURNING and commit."""
     pool = pool_for(industry)
@@ -1377,6 +1404,122 @@ def inventory_stock_levels(
         ORDER BY sl.quantity_on_hand ASC, sl.stock_id LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/{industry}/inventory/stockout-events", tags=["Inventory"])
+def inventory_stockout_events(
+    industry: str,
+    location_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    channel: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """Sale lines the shelf could not cover (t_959cd040) — the lost-sales feed.
+
+    `requested_quantity` is what the shopper asked for, `fulfilled_quantity`
+    what the till could ring up (and is exactly the quantity on the matching
+    pos.transaction_items / online.order_items line), and `lost_quantity` /
+    `lost_value` the gap priced at the price of record.
+
+    Degrades to an empty result on a data dir generated before t_959cd040: a
+    schema.sql change only reaches a fresh bootstrap, and a 500 here would take
+    the whole inventory section down for data-lab.
+    """
+    pool_for(industry)
+    if not _has_stockout_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if location_id:
+        filters.append("se.location_id = %s::uuid")
+        params.append(location_id)
+    if product_id:
+        filters.append("se.product_id = %s::uuid")
+        params.append(product_id)
+    if channel:
+        filters.append("se.channel = %s")
+        params.append(channel)
+    if start_dt:
+        filters.append("se.event_dt >= %s")
+        params.append(start_dt)
+    if end_dt:
+        filters.append("se.event_dt <= %s")
+        params.append(end_dt)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM inv.stockout_events se "
+                  f"WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT se.stockout_id, se.channel, se.pos_transaction_id,
+               se.online_order_id, se.product_id, p.name AS product_name,
+               p.category, se.location_id, l.name AS location_name,
+               se.requested_quantity, se.fulfilled_quantity, se.lost_quantity,
+               se.unit_price, se.lost_value, se.event_dt, se.scenario_tag
+        FROM inv.stockout_events se
+        JOIN pos.products p ON p.product_id = se.product_id
+        JOIN hr.locations l ON l.location_id = se.location_id
+        WHERE {where}
+        ORDER BY se.event_dt DESC, se.stockout_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/sku-demand-daily", tags=["Inventory"])
+def inventory_sku_demand_daily(
+    industry: str,
+    location_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """Per store-SKU-day requested / fulfilled / lost totals (t_959cd040).
+
+    The replenishment input: `ordering.check_and_create_orders` sizes a reorder
+    from `requested_units` over the configured window plus the safety fraction,
+    which is what finally gives `restock_threshold_pct` an effect.
+
+    `requested_units = fulfilled_units + lost_units` by construction (enforced by
+    a CHECK on the table and asserted by harness check SEMA-13).
+    """
+    pool_for(industry)
+    if not _has_stockout_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if location_id:
+        filters.append("sd.location_id = %s::uuid")
+        params.append(location_id)
+    if product_id:
+        filters.append("sd.product_id = %s::uuid")
+        params.append(product_id)
+    if start_date:
+        filters.append("sd.demand_date >= %s")
+        params.append(start_date)
+    if end_date:
+        filters.append("sd.demand_date <= %s")
+        params.append(end_date)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM inv.sku_demand_daily sd "
+                  f"WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT sd.location_id, l.name AS location_name, sd.product_id,
+               p.name AS product_name, p.category, sd.demand_date,
+               sd.requested_units, sd.fulfilled_units, sd.lost_units,
+               sd.lost_value, sd.line_count, sd.last_updated
+        FROM inv.sku_demand_daily sd
+        JOIN pos.products p ON p.product_id = sd.product_id
+        JOIN hr.locations l ON l.location_id = sd.location_id
+        WHERE {where}
+        ORDER BY sd.demand_date DESC, sd.location_id, sd.product_id
+        LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
 
 
 @app.get("/{industry}/inventory/receipts", tags=["Inventory"])

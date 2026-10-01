@@ -520,26 +520,49 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     # shared by both channels — the same law must see the same prices.
     ad_prices = get_ad_product_prices(conn, sim_date)
 
+    # Stock-aware capping (t_959cd040). ONE allowance for the whole tick, shared
+    # by both channels: POS and online sell the same shelf, so they must draw
+    # from one budget or each would be told it could have the last unit. Built
+    # before either channel runs, and flushed once both are done — that single
+    # flush is what writes inv.stockout_events (the lost sales), decrements
+    # inv.stock_levels, and accumulates inv.sku_demand_daily. Without it,
+    # depletion floors at zero and the sale books full-quantity revenue for
+    # stock that is not there, and reorder_point / restock_threshold_pct never
+    # affect anything.
+    stock_allowance = inventory.StockAllowance.from_lines(conn, [
+        {'location_id': loc['location_id'], 'product_id': product['product_id']}
+        for loc in locations['stores']
+        for product in products
+    ])
+
     # POS transactions
     depletion = pos.generate_pos_transactions(
         conn, cfg, sim_dt, pos_count, scenario,
         locations['stores'], products, employees, members, coupons, deals,
         ad_prices=ad_prices,
+        stock_allowance=stock_allowance,
     )
-    if depletion:
-        inventory.deplete_inventory(conn, depletion)
 
     # Timeclock events
     tc_count = timeclock.generate_events(conn, sim_dt, employees, locations)
 
     # Online orders (e-commerce pickup + delivery) — same shelves as POS, same
-    # volume law, its own configured band (`online.orders_per_day`).
+    # volume law, its own configured band (`online.orders_per_day`), and the
+    # same stock allowance: an online order is filled from the same shelf a POS
+    # sale just drew on.
     online_depletion = online.generate_online_orders(
         conn, cfg, sim_dt, online_count, scenario, locations['stores'], products,
-        members, ad_prices=ad_prices)
-    if online_depletion:
-        inventory.deplete_online_inventory(conn, online_depletion)
+        members, ad_prices=ad_prices, stock_allowance=stock_allowance)
     online.advance_online_lifecycle(conn, cfg, sim_dt)
+
+    # Persist the tick's stock outcome: decrement, stockout rows, daily ledger.
+    # The written transaction/order ids are passed so a stockout only points at
+    # a sale that exists — a basket the shelf could not cover at all writes no
+    # sale row, and its walk-away is recorded with no parent.
+    stockouts = inventory.flush_sales(
+        conn, stock_allowance, sim_dt, scenario.scenario_tag,
+        fulfilled_parents=[d['transaction_id'] for d in depletion]
+                          + [d['transaction_id'] for d in online_depletion])
 
     # Probabilistic events
     pos.maybe_update_product_prices(conn, cfg, products, scenario)
@@ -554,7 +577,8 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         managers = [e for e in employees if e['department'] == 'management']
 
         order_ids = ordering.check_and_create_orders(
-            conn, locations['stores'], locations['warehouses'], managers, sim_dt, scenario)
+            conn, locations['stores'], locations['warehouses'], managers, sim_dt,
+            scenario, inventory_cfg=cfg.inventory)
         orders_count = len(order_ids)
 
         fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees, sim_dt)
@@ -598,9 +622,9 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     elapsed_ms = round((time.monotonic() - tick_start) * 1000)
     record_stats(conn, pos_count, tc_count, orders_count,
                  scenario.scenario_tag, sim_dt, elapsed_ms)
-    log.info("Tick done %dms | POS: %d | Online: %d | TC: %d | Orders: %d | Scenario: %s",
+    log.info("Tick done %dms | POS: %d | Online: %d | TC: %d | Orders: %d | Stockouts: %d | Scenario: %s",
              elapsed_ms, pos_count, online_count, tc_count, orders_count,
-             scenario.scenario_tag)
+             stockouts, scenario.scenario_tag)
 
 
 # ---------------------------------------------------------------------------
@@ -701,22 +725,36 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # the ad signal lands on the wrong dates (t_08deeddf).
             ad_prices = get_ad_product_prices(conn, cur_date)
 
+            # Same one-allowance-per-tick rule as the realtime path: the whole
+            # simulated hour's POS + online demand is resolved against one
+            # snapshot of the shelf, then flushed together (t_959cd040).
+            stock_allowance = inventory.StockAllowance.from_lines(conn, [
+                {'location_id': loc['location_id'],
+                 'product_id': product['product_id']}
+                for loc in locations['stores']
+                for product in products
+            ])
+
             depletion = pos.generate_pos_transactions(
                 conn, cfg, sim_dt, pos_count, scenario,
                 locations['stores'], products, employees, members, coupons, deals,
                 ad_prices=ad_prices,
+                stock_allowance=stock_allowance,
             )
-            if depletion:
-                inventory.deplete_inventory(conn, depletion)
 
             # Online orders for this hour (placed + lifecycle advanced in
             # time order so statuses converge realistically).
             online_depletion = online.generate_online_orders(
                 conn, cfg, sim_dt, online_count, scenario, locations['stores'],
-                products, members, ad_prices=ad_prices)
-            if online_depletion:
-                inventory.deplete_online_inventory(conn, online_depletion)
+                products, members, ad_prices=ad_prices,
+                stock_allowance=stock_allowance)
             online.advance_online_lifecycle(conn, cfg, sim_dt)
+
+            # Decrement the shelf, write the lost sales, update the ledger.
+            inventory.flush_sales(
+                conn, stock_allowance, sim_dt, scenario.scenario_tag,
+                fulfilled_parents=[d['transaction_id'] for d in depletion]
+                                  + [d['transaction_id'] for d in online_depletion])
 
             # Partial day: generate timeclock events per-hour using the same
             # idempotent realtime logic (checks existing events before inserting).
@@ -740,7 +778,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             order_ids = ordering.check_and_create_orders(
                 conn, locations['stores'], locations['warehouses'], managers,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 22, 0),
-                eod_scenario)
+                eod_scenario, inventory_cfg=cfg.inventory)
             fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 23, 0))
             if fulfilled and locations['warehouses'] and trucks:

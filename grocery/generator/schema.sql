@@ -618,3 +618,104 @@ CREATE INDEX idx_online_events_order    ON online.order_events (order_id, event_
 
 CREATE INDEX idx_hr_emp_location      ON hr.employees (location_id, status);
 CREATE INDEX idx_control_stats        ON control.generation_stats (recorded_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Stockouts / lost sales (t_959cd040)
+-- ---------------------------------------------------------------------------
+-- One row per line a shopper asked for that the shelf could not cover. Before
+-- this table a shortage was absorbed silently: depletion floored at
+-- GREATEST(0, on_hand - qty) while the sale was written at FULL requested
+-- quantity, so the feed showed revenue for items that were not on the shelf
+-- and 16.8% of store-SKU rows sat pinned at zero with sales still running
+-- against them (t_959cd040, measured on the dev DB).
+--
+-- The sale itself is now capped at what was on hand, so
+-- pos.transaction_items.quantity is the quantity actually rung up and
+-- lost_quantity is demand the store refused. lost_value is priced at the
+-- price of record (the same unit_price the fulfilled line would have used),
+-- which is what "lost sales" means for a safety-stock analyst.
+--
+-- Declared AFTER online.orders because a stockout references either a POS
+-- transaction or an online order, and exactly one of the two.
+CREATE TABLE inv.stockout_events (
+    stockout_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id         UUID         NOT NULL REFERENCES pos.products(product_id),
+    location_id        UUID         NOT NULL REFERENCES hr.locations(location_id),
+    channel            VARCHAR(10)  NOT NULL
+                          CHECK (channel IN ('pos','online')),
+    pos_transaction_id UUID         REFERENCES pos.transactions(transaction_id),
+    online_order_id    UUID         REFERENCES online.orders(order_id),
+    requested_quantity NUMERIC(8,3) NOT NULL CHECK (requested_quantity > 0),
+    fulfilled_quantity NUMERIC(8,3) NOT NULL CHECK (fulfilled_quantity >= 0),
+    lost_quantity      NUMERIC(8,3) NOT NULL CHECK (lost_quantity > 0),
+    unit_price         NUMERIC(8,2) NOT NULL,
+    lost_value         NUMERIC(10,2) NOT NULL,
+    event_dt           TIMESTAMPTZ  NOT NULL,
+    scenario_tag       VARCHAR(50),
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    -- Exactly one sale parent, or neither. A POS line and an online line are
+    -- different sales, so both can never be set. Neither is legitimate and is
+    -- NOT an oversight: when a shopper's whole basket was out of stock the
+    -- model writes no sale row at all (pos.transaction_items carries
+    -- CHECK (quantity > 0), so an empty basket is unwritable), yet the demand
+    -- is still a lost sale worth recording. Those rows carry no parent, and the
+    -- walk-away is exactly the signal a safety-stock analyst wants: the basket
+    -- was abandoned because the shelf was empty.
+    CONSTRAINT stockout_single_parent CHECK (
+        NOT (pos_transaction_id IS NOT NULL AND online_order_id IS NOT NULL)
+    ),
+    -- The whole point of the table: the split must reconcile to the request.
+    CONSTRAINT stockout_quantities_balance CHECK (
+        lost_quantity = requested_quantity - fulfilled_quantity
+    )
+);
+
+CREATE INDEX idx_stockout_location_product ON inv.stockout_events (location_id, product_id, event_dt);
+CREATE INDEX idx_stockout_event_dt        ON inv.stockout_events (event_dt);
+CREATE INDEX idx_stockout_product         ON inv.stockout_events (product_id, event_dt);
+CREATE INDEX idx_stockout_pos_txn         ON inv.stockout_events (pos_transaction_id);
+CREATE INDEX idx_stockout_online_order    ON inv.stockout_events (online_order_id);
+
+-- ---------------------------------------------------------------------------
+-- Per-store-SKU daily demand ledger (t_959cd040)
+-- ---------------------------------------------------------------------------
+-- The replenishment input. `ordering.check_and_create_orders` used a seeded
+-- reorder_qty that never moved, which was harmless while depletion floored at
+-- zero and sales ran regardless of the shelf. Once a sale is capped at what is
+-- on hand, a fixed reorder_qty against measured demand is what would let a
+-- fast SKU sit at zero forever — the sim would degenerate into an empty shop.
+-- So the generator records what was ASKED FOR, every tick, accumulated per
+-- store-SKU-day:
+--
+--   requested_units = what shoppers wanted (POS + online)
+--   fulfilled_units = what the shelves could cover
+--   lost_units      = the difference; the per-tick detail is inv.stockout_events
+--   lost_value      = those units priced at the price of record
+--
+-- One row per (location, product, day), upserted by the tick, so ordering can
+-- size a reorder off real demand: lead-time demand plus the configured safety
+-- fraction (inventory.restock_threshold_pct), which is what makes the seeded
+-- reorder_point/reorder_qty tunable rather than decorative.
+CREATE TABLE inv.sku_demand_daily (
+    location_id     UUID         NOT NULL REFERENCES hr.locations(location_id),
+    product_id      UUID         NOT NULL REFERENCES pos.products(product_id),
+    demand_date     DATE         NOT NULL,
+    requested_units NUMERIC(12,3) NOT NULL DEFAULT 0,
+    fulfilled_units NUMERIC(12,3) NOT NULL DEFAULT 0,
+    lost_units      NUMERIC(12,3) NOT NULL DEFAULT 0,
+    lost_value      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    line_count      INTEGER      NOT NULL DEFAULT 0,
+    last_updated    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (location_id, product_id, demand_date),
+    -- The ledger must reconcile: you cannot lose more than was asked for.
+    CONSTRAINT sku_demand_quantities_balance CHECK (
+        requested_units >= fulfilled_units
+        AND lost_units = requested_units - fulfilled_units
+    ),
+    CONSTRAINT sku_demand_nonneg CHECK (
+        requested_units >= 0 AND fulfilled_units >= 0 AND lost_units >= 0
+    )
+);
+
+CREATE INDEX idx_sku_demand_date     ON inv.sku_demand_daily (demand_date);
+CREATE INDEX idx_sku_demand_product  ON inv.sku_demand_daily (product_id, demand_date);

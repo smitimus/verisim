@@ -339,6 +339,82 @@ ASSERTIONS: List[AssertionSpec] = [
                 SELECT 1 FROM pos.products p WHERE p.product_id = ai.product_id)
         """,
     ),
+    AssertionSpec(
+        id="HARD-23",
+        dimension="hard_fk",
+        title="inv.stockout_events.product_id → pos.products",
+        sql="""
+            SELECT se.stockout_id, se.product_id
+            FROM inv.stockout_events se
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pos.products p WHERE p.product_id = se.product_id)
+              AND se.event_dt::date < CURRENT_DATE
+        """,
+    ),
+    AssertionSpec(
+        id="HARD-24",
+        dimension="hard_fk",
+        title="inv.stockout_events.location_id → hr.locations",
+        sql="""
+            SELECT se.stockout_id, se.location_id
+            FROM inv.stockout_events se
+            WHERE NOT EXISTS (
+                SELECT 1 FROM hr.locations l WHERE l.location_id = se.location_id)
+              AND se.event_dt::date < CURRENT_DATE
+        """,
+    ),
+    AssertionSpec(
+        id="HARD-25",
+        dimension="hard_fk",
+        title="inv.stockout_events.pos_transaction_id → pos.transactions (when channel='pos')",
+        sql="""
+            SELECT se.stockout_id, se.pos_transaction_id
+            FROM inv.stockout_events se
+            WHERE se.channel = 'pos'
+              AND se.pos_transaction_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM pos.transactions t
+                WHERE t.transaction_id = se.pos_transaction_id)
+              AND se.event_dt::date < CURRENT_DATE
+        """,
+    ),
+    AssertionSpec(
+        id="HARD-26",
+        dimension="hard_fk",
+        title="inv.stockout_events.online_order_id → online.orders (when channel='online')",
+        sql="""
+            SELECT se.stockout_id, se.online_order_id
+            FROM inv.stockout_events se
+            WHERE se.channel = 'online'
+              AND se.online_order_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM online.orders o
+                WHERE o.order_id = se.online_order_id)
+              AND se.event_dt::date < CURRENT_DATE
+        """,
+    ),
+    AssertionSpec(
+        id="HARD-27",
+        dimension="hard_fk",
+        title="inv.sku_demand_daily.product_id → pos.products",
+        sql="""
+            SELECT sd.product_id, sd.demand_date
+            FROM inv.sku_demand_daily sd
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pos.products p WHERE p.product_id = sd.product_id)
+        """,
+    ),
+    AssertionSpec(
+        id="HARD-28",
+        dimension="hard_fk",
+        title="inv.sku_demand_daily.location_id → hr.locations",
+        sql="""
+            SELECT sd.location_id, sd.demand_date
+            FROM inv.sku_demand_daily sd
+            WHERE NOT EXISTS (
+                SELECT 1 FROM hr.locations l WHERE l.location_id = sd.location_id)
+        """,
+    ),
 
     # ---- SEMANTIC TYPE MISMATCHES (NOT FK-enforced) ----------------------
     AssertionSpec(
@@ -464,6 +540,63 @@ ASSERTIONS: List[AssertionSpec] = [
               AND NOT EXISTS (
                 SELECT 1 FROM fulfillment.items fi
                 WHERE fi.fulfillment_id = li.fulfillment_id)
+        """,
+    ),
+    # ---- STOCKOUT / LOST-SALE SEMANTICS (t_959cd040) ----------------------
+    # The FK on stockout_events.*_id already guarantees the parent row exists,
+    # and the table's CHECK constraints already enforce the quantity arithmetic
+    # and the single-parent rule. What none of those can check is the
+    # cross-table invariant that matters to a safety-stock analyst: the sales
+    # feed must not book more units of an item than the store actually had.
+    AssertionSpec(
+        id="SEMA-11",
+        dimension="semantic_type",
+        title="inv.stockout_events: a POS row must not also carry an online_order_id (and vice versa)",
+        sql="""
+            SELECT se.stockout_id, se.channel, se.pos_transaction_id,
+                   se.online_order_id
+            FROM inv.stockout_events se
+            WHERE se.event_dt::date < CURRENT_DATE
+              AND ((se.channel = 'pos'     AND se.online_order_id IS NOT NULL)
+                OR (se.channel = 'online' AND se.pos_transaction_id IS NOT NULL))
+        """,
+    ),
+    AssertionSpec(
+        id="SEMA-12",
+        dimension="semantic_type",
+        title="a parented POS stockout's product must have a rung-up line at exactly fulfilled_quantity",
+        sql="""
+            SELECT se.stockout_id, se.pos_transaction_id, se.fulfilled_quantity
+            FROM inv.stockout_events se
+            WHERE se.channel = 'pos'
+              AND se.pos_transaction_id IS NOT NULL
+              AND se.event_dt::date < CURRENT_DATE
+              -- Only rows that were actually PART of the sale are checked. A
+              -- basket can be partly fulfilled: the short product's line is
+              -- dropped (quantity would be 0, which transaction_items forbids)
+              -- while the parent's other lines are written normally. That is
+              -- correct behaviour, so a stockout with fulfilled_quantity = 0
+              -- legitimately has no matching line — and demanding one would
+              -- assert the defect back into the model.
+              AND se.fulfilled_quantity > 0
+              AND NOT EXISTS (
+                SELECT 1
+                FROM pos.transaction_items ti
+                WHERE ti.transaction_id = se.pos_transaction_id
+                  AND ti.product_id = se.product_id
+                  AND ti.quantity = se.fulfilled_quantity)
+        """,
+    ),
+    AssertionSpec(
+        id="SEMA-13",
+        dimension="semantic_type",
+        title="the daily demand ledger must reconcile (requested = fulfilled + lost) for every row",
+        sql="""
+            SELECT sd.location_id, sd.product_id, sd.demand_date,
+                   sd.requested_units, sd.fulfilled_units, sd.lost_units
+            FROM inv.sku_demand_daily sd
+            WHERE sd.lost_units <> sd.requested_units - sd.fulfilled_units
+               OR sd.requested_units < sd.fulfilled_units
         """,
     ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------

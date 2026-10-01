@@ -188,7 +188,25 @@ pricing:
 inventory:
   initial_stock_per_product: 200
   restock_check_frequency_hours: 24
+  # Safety margin on a reorder, as a fraction of the demand it covers while
+  # the order is in transit. Read by ordering.check_and_create_orders since
+  # t_959cd040: before, a sale was written at full requested quantity and
+  # depletion floored at zero, so this number (and reorder_point/reorder_qty)
+  # never influenced anything a shopper saw. Reorders are now sized from the
+  # measured demand in inv.sku_demand_daily.
   restock_threshold_pct: 0.25
+  # Days of measured demand a reorder covers. 1.0 = "cover tomorrow at today's
+  # rate"; raise it to carry more stock per delivery.
+  reorder_demand_window_days: 1
+  # A computed reorder line is capped at this multiple of the seeded
+  # reorder_qty, so one hot SKU (or a SKU with no ledger history yet) cannot
+  # produce an unbounded order.
+  reorder_qty_max_multiple: 4.0
+  # Cap a sale at the stock the shelf actually has and record the difference as
+  # a lost sale in inv.stockout_events. Leave this on: turning it off restores
+  # the pre-t_959cd040 behaviour, where the feed books revenue for items the
+  # store did not have.
+  enforce_stock_availability: true
 
 coupons:
   active_at_any_time: 8            # how many coupons are active at once

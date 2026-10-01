@@ -39,6 +39,7 @@ from psycopg2.extras import execute_values
 
 from config import Config
 from elasticity import choose_products
+from models import inventory
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,8 @@ BASKET_WEIGHTS = [10, 12, 14, 13, 11, 9, 7, 6, 5]   # sizes 8..16+ (compressed)
 def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
                            store_locations: List[Dict], products: List[Dict],
                            members: List[Dict],
-                           ad_prices: Optional[Dict[str, float]] = None
+                           ad_prices: Optional[Dict[str, float]] = None,
+                           stock_allowance=None,
                            ) -> List[Dict]:
     """Create `count` placed orders (status='placed', 'placed' event).
 
@@ -56,11 +58,20 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
     (product_id -> promoted_price for this date), so both channels read one
     price of record per tick (t_08deeddf).
 
+    `stock_allowance` is the SAME `inventory.StockAllowance` the POS pass just
+    used this tick (t_959cd040): both channels sell the same shelf, so they must
+    share one allowance or each would be told it could have the last unit. Lines
+    are capped at on-hand before subtotal/fee/tax are computed, so an order that
+    could only be partly filled is priced as partly filled.
+
     Returns depletion info.
     """
     n = max(0, int(count))
     if n <= 0 or not store_locations or not products:
         return []
+
+    enforce_stock = stock_allowance is not None and getattr(
+        cfg.inventory, 'enforce_stock_availability', True)
 
     order_records = []
     item_records = []
@@ -92,20 +103,46 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
         cart = choose_products(products, num_items, ad_prices, cfg)
 
         order_id = str(uuid.uuid4())
+        demand_lines = []
+        for position, product in enumerate(cart):
+            qty = (
+                round(random.uniform(0.5, 2.0), 3)
+                if product['uom'] == 'lb'
+                else random.choices([1, 2, 3, 4], weights=[60, 22, 12, 6])[0]
+            )
+            demand_lines.append({
+                'line_id': f'{order_id}:{position}',
+                'location_id': loc['location_id'],
+                'product_id': product['product_id'],
+                'parent_id': order_id,
+                'quantity': qty,
+                'unit_price': price_record.get(str(product.get('product_id'))) or product['price'],
+            })
+
+        # Same shared allowance the POS pass used: an online order cannot be
+        # filled with stock the in-store shopper already bought this tick.
+        # Capped BEFORE the money is computed, so subtotal/fee/tax describe the
+        # order as actually filled (t_959cd040).
+        if enforce_stock:
+            granted = stock_allowance.take(demand_lines, inventory.CHANNEL_ONLINE)
+            demand_lines = [
+                {**line, 'quantity': granted[line['line_id']]}
+                for line in demand_lines
+                if granted.get(line['line_id'], 0.0) > 0
+            ]
+
+        if not demand_lines:
+            # Nothing on the shelf: the order cannot be placed at all. The loss
+            # is journalled on the allowance and flushed by main.
+            continue
+
         subtotal = 0.0
-        txn_items = []
         item_recs = []
-        for product in cart:
-            if product['uom'] == 'lb':
-                qty = round(random.uniform(0.5, 2.0), 3)
-            else:
-                qty = random.choices([1, 2, 3, 4], weights=[60, 22, 12, 6])[0]
-            unit_price = price_record.get(str(product.get('product_id'))) or product['price']
-            line_total = round(unit_price * qty, 2)
+        for line in demand_lines:
+            line_total = round(line['unit_price'] * line['quantity'], 2)
             subtotal += line_total
-            item_recs.append((order_id, product['product_id'], qty,
-                              unit_price, line_total))
-            txn_items.append({'product_id': product['product_id'], 'quantity': qty})
+            item_recs.append((order_id, line['product_id'], line['quantity'],
+                              line['unit_price'], line_total))
 
         subtotal = round(subtotal, 2)
         service_fee = 0.0 if ftype == 'pickup' else cfg.online.service_fee_delivery
@@ -133,7 +170,11 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
         item_records.extend(item_recs)
         event_records.append((order_id, 'placed', sim_dt,
                               f"Order placed via web/app — {ftype}"))
-        depletion_info.append({'transaction_id': order_id, 'items': txn_items})
+        depletion_info.append({
+            'transaction_id': order_id,
+            'items': [{'product_id': line['product_id'],
+                       'quantity': line['quantity']} for line in demand_lines],
+        })
 
     with conn.cursor() as cur:
         execute_values(cur, """

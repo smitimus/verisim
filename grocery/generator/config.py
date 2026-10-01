@@ -81,7 +81,27 @@ class PricingConfig:
 class InventoryConfig:
     initial_stock_per_product: int = 200
     restock_check_frequency_hours: int = 24
+    # Safety fraction: the slack a reorder carries on top of the demand it
+    # expects to cover while the order is in transit. Was decorative until
+    # t_959cd040 — nothing read it, while depletion floored at zero and sales
+    # ignored the shelf, so a "shortage" could never even be observed. Now it
+    # is the safety margin on a reorder sized from measured demand
+    # (ordering.check_and_create_orders).
     restock_threshold_pct: float = 0.25
+    # Days of measured demand a reorder is sized against. 1.0 means "cover
+    # tomorrow at today's rate", which is the classic (q, r) lot-sizing view;
+    # higher covers a longer stretch at the cost of more inventory and more
+    # shrinkage exposure on perishables.
+    reorder_demand_window_days: int = 1
+    # Cap on a single computed reorder quantity, as a multiple of the seeded
+    # reorder_qty. A SKU whose measured demand is enormous (or whose ledger has
+    # no history yet) must not turn into an unbounded order line.
+    reorder_qty_max_multiple: float = 4.0
+    # Whether a sale is capped at on-hand. Always True in production: with it
+    # off, the generator is the pre-t_959cd040 generator that sells stock it
+    # does not have. It exists so the regression test can demonstrate the old
+    # behaviour on demand, rather than only asserting the new one.
+    enforce_stock_availability: bool = True
 
 
 @dataclass
@@ -267,6 +287,14 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.inventory.initial_stock_per_product = int(inv['initial_stock_per_product'])
     if 'restock_threshold_pct' in inv:
         cfg.inventory.restock_threshold_pct = float(inv['restock_threshold_pct'])
+    for key in ('reorder_demand_window_days', 'restock_check_frequency_hours'):
+        if key in inv:
+            setattr(cfg.inventory, key, int(inv[key]))
+    for key in ('reorder_qty_max_multiple',):
+        if key in inv:
+            setattr(cfg.inventory, key, float(inv[key]))
+    if 'enforce_stock_availability' in inv:
+        cfg.inventory.enforce_stock_availability = bool(inv['enforce_stock_availability'])
 
     cpn = data.get('coupons', {})
     if 'active_at_any_time' in cpn:
