@@ -26,6 +26,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta, date
+from typing import Dict
 
 import psycopg2
 import psycopg2.extras
@@ -33,6 +34,7 @@ import psycopg2.extras
 from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
 from models import shrinkage, promotions, scheduling, returns, online
+from elasticity import seed_elasticity_columns
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
 logging.basicConfig(
@@ -300,6 +302,12 @@ def _unbiased_count(expected) -> int:
 
 def seed_all(conn, cfg):
     log.info("Running seed checks...")
+    # First: make sure an OLD data dir has the elasticity columns. A
+    # schema.sql change only reaches a *fresh* bootstrap (the same trap the
+    # AGENTS.md documents for the PG16->PG18 rebuild and for `pos.returns`), so
+    # an install generated before t_08deeddf keeps its old `pos.products` and
+    # the demand curve has nothing to key on. Idempotent and additive.
+    seed_elasticity_columns(conn, cfg)
     locations = hr.seed_locations(conn, cfg)
     employees = hr.seed_employees(conn, cfg, locations)
     departments = pos.seed_departments(conn, cfg)
@@ -463,6 +471,28 @@ def _ensure_realtime(conn):
 # Main tick (realtime)
 # ---------------------------------------------------------------------------
 
+def get_ad_product_prices(conn, sim_date: date) -> Dict[str, float]:
+    """product_id -> `promoted_price` for every item on this week's ad.
+
+    The price OF RECORD for an ad item this week: what the shopper actually
+    pays, which is what the demand curve must be keyed on. Before
+    t_08deeddf this was never read during generation — `ensure_current_ad`
+    returned the ad and nobody used it, so a 30%-off item sat at the same
+    odds of reaching a basket as a full-price one and the whole weekly-ad
+    signal in `mart_promotion_effectiveness` was decoration.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ai.product_id::text, ai.promoted_price
+            FROM pricing.ad_items ai
+            JOIN pricing.weekly_ads a ON a.ad_id = ai.ad_id
+            WHERE a.start_date <= %s AND a.end_date >= %s
+              AND ai.promoted_price IS NOT NULL
+              AND ai.promoted_price > 0
+        """, (sim_date, sim_date))
+        return {r[0]: float(r[1]) for r in cur.fetchall()}
+
+
 def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
              products, trucks, members, coupons, deals):
     scenario_names = get_active_scenario_names(conn, sim_dt)
@@ -485,10 +515,16 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     online_count = compute_online_count(cfg, scenario, tick_seconds, sim_date)
     tick_start = time.monotonic()
 
+    # This week's ad prices: the price of record for ad items, and therefore
+    # the key of the demand curve for them (t_08deeddf). One read per tick,
+    # shared by both channels — the same law must see the same prices.
+    ad_prices = get_ad_product_prices(conn, sim_date)
+
     # POS transactions
     depletion = pos.generate_pos_transactions(
         conn, cfg, sim_dt, pos_count, scenario,
-        locations['stores'], products, employees, members, coupons, deals
+        locations['stores'], products, employees, members, coupons, deals,
+        ad_prices=ad_prices,
     )
     if depletion:
         inventory.deplete_inventory(conn, depletion)
@@ -499,7 +535,8 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     # Online orders (e-commerce pickup + delivery) — same shelves as POS, same
     # volume law, its own configured band (`online.orders_per_day`).
     online_depletion = online.generate_online_orders(
-        conn, cfg, sim_dt, online_count, scenario, locations['stores'], products, members)
+        conn, cfg, sim_dt, online_count, scenario, locations['stores'], products,
+        members, ad_prices=ad_prices)
     if online_depletion:
         inventory.deplete_online_inventory(conn, online_depletion)
     online.advance_online_lifecycle(conn, cfg, sim_dt)
@@ -659,10 +696,15 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # same day at the same volume (t_94bbf1ce, t_eb31c99f).
             pos_count = compute_pos_count(cfg, scenario, SIM_HOUR_SECONDS, cur_date)
             online_count = compute_online_count(cfg, scenario, SIM_HOUR_SECONDS, cur_date)
+            # The ad in force for the BACKFILLED date, not today's: a backfill
+            # hour must see the price of record of the day it is writing, or
+            # the ad signal lands on the wrong dates (t_08deeddf).
+            ad_prices = get_ad_product_prices(conn, cur_date)
 
             depletion = pos.generate_pos_transactions(
                 conn, cfg, sim_dt, pos_count, scenario,
-                locations['stores'], products, employees, members, coupons, deals
+                locations['stores'], products, employees, members, coupons, deals,
+                ad_prices=ad_prices,
             )
             if depletion:
                 inventory.deplete_inventory(conn, depletion)
@@ -671,7 +713,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # time order so statuses converge realistically).
             online_depletion = online.generate_online_orders(
                 conn, cfg, sim_dt, online_count, scenario, locations['stores'],
-                products, members)
+                products, members, ad_prices=ad_prices)
             if online_depletion:
                 inventory.deplete_online_inventory(conn, online_depletion)
             online.advance_online_lifecycle(conn, cfg, sim_dt)

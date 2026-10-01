@@ -2,6 +2,7 @@
 POS model — seeds departments, products, coupons, combo deals, loyalty members;
 generates store transactions with coupon/deal application.
 """
+import os
 import random
 import logging
 from datetime import datetime, date, timedelta
@@ -13,9 +14,27 @@ from psycopg2.extras import execute_values
 
 from config import Config
 from scenarios.scenario_engine import ScenarioContext
+from elasticity import (
+    choose_products,
+    demand_weight,
+    sample_price_paths,
+    seed_elasticity_columns,
+)
 
 log = logging.getLogger(__name__)
 fake = Faker('en_US')
+
+
+def read_schema_sql() -> str:
+    """The generator's own `schema.sql`, for tests that check the DDL.
+
+    Read lazily rather than at import: a model module should not do file I/O
+    as a side effect of being imported, and a test that needs the DDL should
+    fail loudly when it is missing rather than get an empty string.
+    """
+    path = os.path.join(os.path.dirname(__file__), '..', 'schema.sql')
+    with open(path, 'r') as f:
+        return f.read()
 
 PAYMENT_METHODS = ['cash', 'credit', 'debit', 'ebt', 'mobile_pay', 'loyalty_points']
 PAYMENT_WEIGHTS = [0.12, 0.38, 0.28, 0.08, 0.10, 0.04]
@@ -147,6 +166,12 @@ def seed_products(conn, cfg: Config, departments: List[Dict]) -> List[Dict]:
 
             cost = round(random.uniform(0.30, 12.00), 4)
             price = round(cost * random.uniform(1.25, 2.20), 2)
+            # Every SKU starts AT its reference price, so a fresh catalogue
+            # has no price signal of its own — the signal arrives from the
+            # seeded price_history walk and from weekly ads, both measured
+            # against this reference (t_08deeddf).
+            reference_price = price
+            price_elasticity = _draw_elasticity(cfg)
             sku = f"{dept_cfg['code']}-{fake.bothify('??####').upper()}"
             upc = fake.numerify('##############')
             brand = fake.company().split()[0]
@@ -158,6 +183,7 @@ def seed_products(conn, cfg: Config, departments: List[Dict]) -> List[Dict]:
 
             records.append((sku, upc, name, brand, dept_id, cat, subcat,
                              unit_size or None, uom, cost, price,
+                             reference_price, price_elasticity,
                              is_organic, is_local, True))
 
     with conn.cursor() as cur:
@@ -165,12 +191,28 @@ def seed_products(conn, cfg: Config, departments: List[Dict]) -> List[Dict]:
             INSERT INTO pos.products
                 (sku, upc, name, brand, department_id, category, subcategory,
                  unit_size, unit_of_measure, cost, current_price,
+                 reference_price, price_elasticity,
                  is_organic, is_local, is_active)
             VALUES %s ON CONFLICT (sku) DO NOTHING
         """, records)
         conn.commit()
         log.info("Seeded %d products", len(records))
         return _fetch_active_products(cur)
+
+
+def _draw_elasticity(cfg: Config) -> float:
+    """One SKU's own price sensitivity, drawn around the configured default.
+
+    Real catalogues are not homogeneous — a staple's volume barely notices a
+    price rise while a discretionary treat's collapses — so the spread is a
+    configured fraction of the default (`pricing.elasticity_jitter`), not a
+    hardcoded constant. A jitter of 0 gives every SKU the default exactly.
+    """
+    default = cfg.pricing.default_price_elasticity
+    jitter = max(0.0, cfg.pricing.elasticity_jitter)
+    if not jitter:
+        return round(default, 3)
+    return round(default * (1.0 + random.uniform(-jitter, jitter)), 3)
 
 
 def _pick_uom(dept_name: str) -> str:
@@ -182,7 +224,8 @@ def _pick_uom(dept_name: str) -> str:
 def _fetch_active_products(cur) -> List[Dict]:
     cur.execute("""
         SELECT p.product_id, p.sku, p.name, p.category, p.current_price,
-               p.unit_of_measure, d.department_id, d.name as dept_name
+               p.unit_of_measure, d.department_id, d.name as dept_name,
+               p.reference_price, p.price_elasticity
         FROM pos.products p
         JOIN pos.departments d ON d.department_id = p.department_id
         WHERE p.is_active = TRUE
@@ -199,6 +242,12 @@ def _fetch_active_products(cur) -> List[Dict]:
             'department_id': str(r[6]),
             'department':    r[7],
             'department_name': r[7],        # alias used by promotions module
+            # The elasticity curve's pivot and slope (t_08deeddf). A NULL
+            # here is a product row seeded before the columns existed;
+            # `elasticity.demand_weight` resolves it to the live price and
+            # the configured default rather than failing.
+            'reference_price': float(r[8]) if r[8] is not None else None,
+            'price_elasticity': float(r[9]) if r[9] is not None else None,
         }
         for r in cur.fetchall()
     ]
@@ -412,6 +461,58 @@ def fetch_active_deals(conn) -> List[Dict]:
         return _fetch_active_deals(cur)
 
 
+# ---------------------------------------------------------------------------
+# The price of record (t_08deeddf)
+# ---------------------------------------------------------------------------
+
+def price_of_record(products: List[Dict], ad_prices: Dict[str, float]) -> Dict[str, float]:
+    """Map product_id -> the price a shopper faces today.
+
+    For a weekly-ad item that is `promoted_price`; for everything else it is
+    `current_price`. The demand curve is keyed on this, so a discount works
+    through the same law as any other price move instead of needing a special
+    case — and the price actually charged is recorded in
+    `transaction_items.unit_price` as before, so `assert_line_totals_balance`
+    (`line_total = (unit_price - discount) * quantity`) is untouched.
+    """
+    prices: Dict[str, float] = {}
+    for product in products:
+        product_id = product.get('product_id')
+        if product_id is None:
+            continue
+        price = product.get('price')
+        if price is None:
+            price = product.get('current_price')
+        if price is not None:
+            prices[product_id] = float(price)
+    for product_id, promoted in (ad_prices or {}).items():
+        if promoted is not None:
+            prices[product_id] = promoted
+    return prices
+
+
+def _price_of(product: Dict, price_record: Dict[str, float]) -> float:
+    """The price this product is being sold at, from the tick's price record."""
+    price = price_record.get(str(product.get('product_id')))
+    if price is None:
+        price = product.get('price', product.get('current_price'))
+    return float(price) if price is not None else 0.0
+
+
+def draw_cart(products: List[Dict], num_items: int, cfg: Config,
+              ad_prices: Optional[Dict[str, float]] = None) -> List[Dict]:
+    """Pick `num_items` products, weighted by price elasticity.
+
+    The fix for t_08deeddf: this used to be `random.choices(products,
+    k=num_items)`, which treats a cents item and a ten-dollar item as equally
+    likely and ignored the weekly ad entirely — so `price_history` could not
+    explain any of the demand it was seeded for. Basket SIZE is still the
+    pre-existing distribution: customers do not buy fewer things because one
+    of them got dearer, and the POS volume contract (t_94bbf1ce) must not move.
+    """
+    return choose_products(products, num_items, ad_prices, cfg)
+
+
 def reconcile_promotions(conn) -> Dict[str, int]:
     """Make the promotion rows agree with the history that references them.
 
@@ -613,28 +714,21 @@ def seed_price_history(conn, cfg: Config, products: List[Dict]) -> None:
              cfg.pricing.price_history_backfill_days, len(products))
     today = date.today()
     n_days = cfg.pricing.price_history_backfill_days
-    step_days = max(1, n_days // 12)  # ~12 price points spread across the window
+    steps = 12  # ~12 price points spread across the window
 
+    # The walk itself lives in `elasticity.sample_price_paths` so the history
+    # written here and the curve that reads it cannot drift apart. What
+    # changed at t_08deeddf is the shape of the walk, not its destination: it
+    # is still `price_history` for elasticity analysis, but it now carries a
+    # store-wide market factor, so a product's own price move is separable
+    # from the market's. Under the old independent-per-product walk the two
+    # were the same thing, which is exactly why the elasticity downstream came
+    # out coincidental.
+    skus = [(str(p['product_id']), float(p['price'])) for p in products]
     records = []
-    for p in products:
-        price = float(p['price'])
-        days = list(range(n_days, 0, -step_days))
-        if days[-1] != 0:
-            days.append(0)
-        num_pts = len(days)
-
-        # Walk backward from a plausible start price to today's current price.
-        start = round(price * random.uniform(0.80, 1.20), 2)
-        prices_seq = [start]
-        for _ in range(num_pts - 2):
-            prev = prices_seq[-1]
-            prices_seq.append(round(max(0.10, prev * random.uniform(0.97, 1.05)), 2))
-        prices_seq.append(price)  # final point == live current_price (continuity)
-
-        for i, d in enumerate(days):
-            ts = datetime(today.year, today.month, today.day) - timedelta(days=d)
-            old_price = prices_seq[i - 1] if i > 0 else prices_seq[i]
-            records.append((str(p['product_id']), old_price, prices_seq[i], ts))
+    for point in sample_price_paths(skus, n_days, steps, cfg):
+        ts = datetime(today.year, today.month, today.day) - timedelta(days=point['days_ago'])
+        records.append((point['product_id'], point['old_price'], point['price'], ts))
 
     if records:
         # NOTE: the read cursor from the idempotency check above is closed
@@ -664,9 +758,16 @@ def generate_pos_transactions(
     members: List[Dict],
     coupons: List[Dict],
     deals: List[Dict],
+    ad_prices: Optional[Dict[str, float]] = None,
 ) -> List[Dict]:
     """
     Generate `count` POS transactions. Returns depletion info for inventory.
+
+    `ad_prices` maps product_id -> the weekly-ad `promoted_price` for the
+    simulated date, i.e. the price of record for that SKU this tick. It is
+    what makes an ad item sell through the price-elasticity curve instead of
+    being decoration on a shelf nobody reorders (t_08deeddf); it defaults to
+    None so an existing caller that has no ad context keeps working.
     """
     if count <= 0 or not store_locations or not products:
         return []
@@ -699,6 +800,12 @@ def generate_pos_transactions(
     # going stale between reconcile passes.
     coupon_uses: Dict[str, int] = {}
 
+    # The price each SKU is being sold at today: the weekly-ad promoted price
+    # where one applies, the shelf price otherwise. Computed ONCE per tick, not
+    # per line — it is a property of the date, and recomputing it inside the
+    # loop would be both wasteful and a chance for the two to disagree.
+    price_record = price_of_record(products, ad_prices or {})
+
     for _ in range(count):
         loc = random.choice(store_locations)
         loc_cashiers = [e for e in cashiers if e['location_id'] == loc['location_id']]
@@ -714,7 +821,12 @@ def generate_pos_transactions(
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15],
             weights=[5, 8, 12, 14, 13, 12, 10, 8, 6, 5, 4, 3]
         )[0]
-        cart = random.choices(products, k=num_items)
+        # WHICH products — the elasticity loop (t_08deeddf). Was
+        # `random.choices(products, k=num_items)`, i.e. uniform: a 97%-off item
+        # and a full-price item were exactly as likely to reach the basket,
+        # which is why the 90-day price_history backfill could not explain any
+        # demand. The ad price is also what makes an ad item actually sell.
+        cart = draw_cart(products, num_items, cfg, ad_prices)
 
         txn_id = str(uuid4())
         txn_items = []
@@ -728,7 +840,7 @@ def generate_pos_transactions(
             else:
                 qty = random.choices([1, 2, 3], weights=[78, 17, 5])[0]
 
-            unit_price = product['price']
+            unit_price = price_record.get(product['product_id'], product['price'])
             discount = 0.0
             coupon_id = None
             deal_id = None
@@ -765,9 +877,15 @@ def generate_pos_transactions(
                                    if deal['trigger_department_id'] is None
                                    or _dept_id_for_product(p) == deal['trigger_department_id']]
             if len(deal_dept_products) >= deal['trigger_qty']:
-                # Saving = sum of trigger_qty items minus deal_price
-                trigger_items = sorted(deal_dept_products, key=lambda p: p['price'], reverse=True)[:deal['trigger_qty']]
-                original = sum(p['price'] for p in trigger_items)
+                # Saving = sum of trigger_qty items minus deal_price. Priced
+                # off the price OF RECORD (t_08deeddf): comparing a deal
+                # against the pre-ad shelf price would book a saving the
+                # customer never received, and `mart_promotion_effectiveness`
+                # would credit the deal for the weekly ad's discount.
+                trigger_items = sorted(deal_dept_products,
+                                       key=lambda p: _price_of(p, price_record),
+                                       reverse=True)[:deal['trigger_qty']]
+                original = sum(_price_of(p, price_record) for p in trigger_items)
                 deal_savings = max(0.0, round(original - deal['deal_price'], 2))
 
         subtotal = round(subtotal, 2)

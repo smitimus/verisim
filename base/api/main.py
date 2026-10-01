@@ -100,6 +100,38 @@ def query(sql: str, params, industry: str) -> List[Dict]:
         pool.putconn(conn)
 
 
+# Cache of the pos.products column probe, keyed by industry. Populated on
+# first use; the schema of a data dir does not change under a running API
+# process, so one lookup per process is enough.
+_PRODUCTS_ELASTICITY_COLUMNS: Dict[str, bool] = {}
+
+
+def _products_has_elasticity_columns(industry: str) -> bool:
+    """True when `pos.products` carries the t_08deeddf elasticity columns.
+
+    Guards the products route against a data dir generated before those
+    columns existed: a `schema.sql` change only reaches a fresh bootstrap, so
+    a slot on an older image would 500 on a bare `p.reference_price` — and
+    that route backs the data-lab `raw_pos.products` ingest.
+    """
+    cached = _PRODUCTS_ELASTICITY_COLUMNS.get(industry)
+    if cached is not None:
+        return cached
+    try:
+        rows = query("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'pos' AND table_name = 'products'
+              AND column_name IN ('reference_price', 'price_elasticity')
+        """, [], industry)
+        found = {r['column_name'] for r in rows}
+        present = {'reference_price', 'price_elasticity'} <= found
+    except Exception:
+        # A probe that cannot answer must not take the route down with it.
+        present = False
+    _PRODUCTS_ELASTICITY_COLUMNS[industry] = present
+    return present
+
+
 def query_write(sql: str, params, industry: str) -> List[Dict]:
     """Execute a write statement with RETURNING and commit."""
     pool = pool_for(industry)
@@ -836,10 +868,27 @@ def pos_products(
             JOIN pos.departments d ON d.department_id = p.department_id
             WHERE {where}
         """, params, industry)[0]["n"]
+        # `reference_price` / `price_elasticity` are the demand curve's pivot
+        # and slope (t_08deeddf), and they are what makes a price change
+        # explainable downstream.
+        #
+        # Selected only once the columns actually EXIST. A `schema.sql` change
+        # reaches a fresh bootstrap only, so a slot still running an older
+        # image has a `pos.products` without them, and naming them bare would
+        # make this route a 500 — taking the products page and the data-lab
+        # `raw_pos.products` ingest that reads it down with it. The probe is
+        # cached per process: one information_schema lookup, not one per page.
+        # When the column is absent the payload simply omits the key, which is
+        # the pre-t_08deeddf shape and is what a consumer sees today.
+        extra = ""
+        if _products_has_elasticity_columns(industry):
+            extra = (", COALESCE(p.reference_price, NULLIF(p.current_price, 0))"
+                     " AS reference_price, p.price_elasticity")
         rows = query(f"""
             SELECT p.product_id, p.sku, p.upc, p.name, p.brand,
                    d.name AS department, p.category, p.subcategory,
-                   p.unit_size, p.unit_of_measure, p.cost, p.current_price,
+                   p.unit_size, p.unit_of_measure, p.cost, p.current_price
+                   {extra},
                    p.is_organic, p.is_local, p.is_active
             FROM pos.products p
             JOIN pos.departments d ON d.department_id = p.department_id

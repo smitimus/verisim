@@ -21,16 +21,24 @@ and from the date (`online.orders_per_day`) — see `main.per_tick_volume_expect
 Until t_eb31c99f this module carried its own private law that both ignored the
 tick length and applied the hour weight a second time, which ran realtime online
 days ~120x their configured volume.
+
+WHICH products go in the basket is likewise no longer a private decision: the
+draw goes through `elasticity.choose_products`, the same price-elasticity law
+POS uses (t_08deeddf), so a weekly-ad price moves online demand the same way it
+moves in-store demand. Two channels each owning a copy of the law is how the
+volume defects above happened in the first place; this one is imported, not
+reimplemented.
 """
 import random
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from psycopg2.extras import execute_values
 
 from config import Config
+from elasticity import choose_products
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +47,14 @@ BASKET_WEIGHTS = [10, 12, 14, 13, 11, 9, 7, 6, 5]   # sizes 8..16+ (compressed)
 
 def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
                            store_locations: List[Dict], products: List[Dict],
-                           members: List[Dict]) -> List[Dict]:
+                           members: List[Dict],
+                           ad_prices: Optional[Dict[str, float]] = None
+                           ) -> List[Dict]:
     """Create `count` placed orders (status='placed', 'placed' event).
+
+    `ad_prices` is the same weekly-ad price-of-record map POS receives
+    (product_id -> promoted_price for this date), so both channels read one
+    price of record per tick (t_08deeddf).
 
     Returns depletion info.
     """
@@ -54,14 +68,28 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
     event_records = []
 
     member_ids = [m['member_id'] for m in members]
+    # The price each SKU is being sold at today (ad price where one applies).
+    # A product dict with no usable price falls back to 0.01 rather than
+    # propagating None into `unit_price * qty` — the insert is NOT NULL and
+    # a None would raise inside the tick.
+    price_record: Dict[str, float] = {}
+    for product in products:
+        price = product.get('price')
+        if price is None:
+            price = product.get('current_price')
+        price_record[str(product.get('product_id'))] = float(price) if price is not None else 0.01
+    for product_id, promoted in (ad_prices or {}).items():
+        if promoted is not None:
+            price_record[product_id] = float(promoted)
 
     for _ in range(n):
         loc = random.choice(store_locations)
         ftype = 'pickup' if random.random() < cfg.online.pickup_share else 'delivery'
 
-        # weekly-haul basket: 8-30 lines, mostly whole units
+        # weekly-haul basket: 8-30 lines, mostly whole units. The mix is
+        # price-elasticity weighted (t_08deeddf) — same law as POS.
         num_items = min(len(products), random.randint(8, 30))
-        cart = random.choices(products, k=num_items)
+        cart = choose_products(products, num_items, ad_prices, cfg)
 
         order_id = str(uuid.uuid4())
         subtotal = 0.0
@@ -72,7 +100,7 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
                 qty = round(random.uniform(0.5, 2.0), 3)
             else:
                 qty = random.choices([1, 2, 3, 4], weights=[60, 22, 12, 6])[0]
-            unit_price = product['price']
+            unit_price = price_record.get(str(product.get('product_id'))) or product['price']
             line_total = round(unit_price * qty, 2)
             subtotal += line_total
             item_recs.append((order_id, product['product_id'], qty,

@@ -87,6 +87,15 @@ CREATE TABLE pos.products (
                         CHECK (unit_of_measure IN ('each', 'lb', 'oz', 'kg', 'pack', 'case')),
     cost            NUMERIC(8,4) NOT NULL,
     current_price   NUMERIC(8,2) NOT NULL,
+    -- The price this SKU is normally sold at: the pivot of its demand curve.
+    -- current_price is the price of record, which may be a weekly-ad
+    -- promoted price; reference_price is the unshelved everyday price. NULL
+    -- on a row that predates t_08deeddf means "same as current_price".
+    reference_price NUMERIC(8,2),
+    -- This SKU's own price sensitivity: units ~ (price/reference_price) **
+    -- price_elasticity. Negative = ordinary retail demand (raise the price,
+    -- sell fewer). NULL falls back to pricing.default_price_elasticity.
+    price_elasticity NUMERIC(4,3),
     is_organic      BOOLEAN      NOT NULL DEFAULT FALSE,
     is_local        BOOLEAN      NOT NULL DEFAULT FALSE,
     is_active       BOOLEAN      NOT NULL DEFAULT TRUE,

@@ -47,6 +47,35 @@ class PricingConfig:
     tax_rate: float = 0.07
     price_history_backfill_days: int = 90
 
+    # --- Price -> demand elasticity (t_08deeddf) ---------------------------
+    # Demand for a SKU responds to its own price relative to a reference
+    # price:  units ~ (price / reference_price) ** default_price_elasticity
+    # A negative elasticity is ordinary retail behaviour — raise the price,
+    # sell fewer. -0.5 means a 10% price rise costs ~5% of units.
+    default_price_elasticity: float = -0.5
+
+    # Per-SKU spread around that default, drawn once at seed time. Real
+    # catalogues are not homogeneous: nobody responds identically to a
+    # cigarette price rise and an ice-cream price rise. 0 disables the spread
+    # and makes every SKU share the default.
+    elasticity_jitter: float = 0.15
+
+    # Floor on a price relative to its reference, for the walk that seeds
+    # price_history and for the demand curve alike: a price of zero (or below)
+    # makes the ratio, and therefore the weight, undefined — and a real
+    # grocer does not sell below cost forever either.
+    price_min_ratio: float = 0.05
+
+    # How much of a seeded price change is a market-wide move rather than a
+    # SKU's own decision (0..1). A walk with no shared factor gives every
+    # product an independent price path, so a product's own price change and
+    # the market's move together 1:1 and a per-product elasticity regression
+    # cannot separate them — the coincidental-elasticity trap t_08deeddf was
+    # raised for. 0.65 leaves a real idiosyncratic component (0.35) for the
+    # regression to key on. 1.0 would leave none and 0 would scale nothing;
+    # neither is a working configuration, and the tests pin both ends.
+    price_market_factor_weight: float = 0.65
+
 
 @dataclass
 class InventoryConfig:
@@ -228,6 +257,10 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.pricing.tax_rate = float(pri['tax_rate'])
     if 'price_history_backfill_days' in pri:
         cfg.pricing.price_history_backfill_days = int(pri['price_history_backfill_days'])
+    for key in ('default_price_elasticity', 'elasticity_jitter',
+                'price_min_ratio', 'price_market_factor_weight'):
+        if key in pri:
+            setattr(cfg.pricing, key, float(pri[key]))
 
     inv = data.get('inventory', {})
     if 'initial_stock_per_product' in inv:

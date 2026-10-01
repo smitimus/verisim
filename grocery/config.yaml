@@ -168,6 +168,23 @@ pricing:
   tax_rate: 0.07                            # most groceries taxed lower / exempt
   price_history_backfill_days: 90           # seed this many days of price_history at startup (price-elasticity)
 
+  # --- Price -> demand elasticity (t_08deeddf) ---------------------------
+  # A SKU's pull on a basket follows its own price relative to its reference
+  # price: weight = (paid / reference) ** elasticity. These four keys are the
+  # whole loop; with them at their defaults the 90-day price_history backfill
+  # above finally explains the demand it was seeded for, and
+  # mart_product_price_elasticity measures ~-0.5 instead of noise.
+  default_price_elasticity: -0.5   # -0.5 = a 10% price rise costs ~5% of units
+  elasticity_jitter: 0.15          # per-SKU spread around the default (+/-15%);
+                                  # 0 makes every SKU identical
+  price_min_ratio: 0.05            # floor on price/reference — a zero price makes
+                                  # the ratio, and the curve, undefined
+  price_market_factor_weight: 0.65 # how much of a seeded price change is a
+                                  # store-wide inflation move (the rest is the
+                                  # SKU's own decision, which is the part an
+                                  # elasticity regression must be able to see).
+                                  # 1.0 leaves nothing to identify; keep < 1.0.
+
 inventory:
   initial_stock_per_product: 200
   restock_check_frequency_hours: 24
