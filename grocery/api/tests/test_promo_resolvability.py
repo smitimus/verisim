@@ -34,19 +34,42 @@ import pytest
 
 @pytest.mark.usefixtures("ensure_api_reachable")
 def test_combo_deals_full_relation_resolves_referenced_deals(api_base_url):
-    """`active_only=false` returns every deal, retired ones included.
+    """`active_only=false` resolves every deal the line items reference.
 
-    The anti-vacuity half of the contract: this passes trivially on a dataset
-    where no deal has retired yet, so it is asserted *against the items* below
-    rather than on its own row count.
+    This is the invariant the EDW needed and the defect denied it: an active-only
+    mirror leaves 4 of 8 referenced deals unresolvable (56,036 items on CT107
+    2026-10-01). Asserted against the *item side* rather than the route's own row
+    count, because "the route returned some rows" is exactly the check that passes
+    while the EDW is still broken — the active slice is non-empty too.
     """
-    resp = httpx.get(f"{api_base_url}/grocery/pos/combo-deals",
-                     params={"active_only": False}, timeout=30.0)
-    assert resp.status_code == 200, f"combo-deals returned {resp.status_code}"
-    deals = resp.json()
+    base = f"{api_base_url}/grocery/pos/combo-deals"
+    full = httpx.get(base, params={"active_only": False}, timeout=30.0)
+    assert full.status_code == 200, f"combo-deals returned {full.status_code}"
+    deals = full.json()
     assert isinstance(deals, list), "combo-deals payload should be a list"
-    assert deals, "combo-deals returned no rows at all"
-    return deals
+    if not deals:
+        pytest.skip("no combo deals on this dataset")
+
+    # Pull the referenced ids out of the items the API itself serves, so this
+    # needs no database access and holds wherever the suite is pointed.
+    items = httpx.get(f"{api_base_url}/grocery/pos/transaction-items",
+                      params={"limit": 5000}, timeout=60.0)
+    if items.status_code != 200:
+        pytest.skip(f"transaction-items route returned {items.status_code}")
+
+    referenced = {i["deal_id"] for i in items.json().get("data", [])
+                  if i.get("deal_id")}
+    if not referenced:
+        pytest.skip("no deal-tagged items on this dataset")
+
+    served = {d["deal_id"] for d in deals}
+    unresolvable = referenced - served
+    assert not unresolvable, (
+        f"{len(unresolvable)} of {len(referenced)} deals referenced by "
+        "transaction_items are not served by active_only=false: "
+        f"{sorted(unresolvable)[:5]}. A consumer mirroring this relation cannot "
+        "resolve its own foreign keys."
+    )
 
 
 @pytest.mark.usefixtures("ensure_api_reachable")
