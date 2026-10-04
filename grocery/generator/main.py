@@ -33,7 +33,8 @@ import psycopg2.extras
 
 from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
-from models import shrinkage, promotions, scheduling, returns, online, weather, customers
+from models import shrinkage, promotions, scheduling, returns, online
+from models import weather, customers, suppliers
 import schema_reconcile as reconcile
 from elasticity import seed_elasticity_columns
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
@@ -430,7 +431,14 @@ def seed_all(conn, cfg):
     departments = pos.seed_departments(conn, cfg)
     products = pos.seed_products(conn, cfg, departments)
     pos.seed_price_history(conn, cfg, products)
+    # Vendors (t_57b1a1ab) must exist BEFORE inv.products is seeded, because
+    # inv.products.supplier_id is a foreign key into it. The assignment pass
+    # runs AFTER inventory.seed_inventory, which is what writes the inv.products
+    # rows in the first place.
+    vendors = suppliers.seed_suppliers(conn, cfg)
+    suppliers.seed_dsd_schedules(conn, cfg, vendors, locations['stores'])
     inventory.seed_inventory(conn, cfg, products, locations['stores'])
+    suppliers.seed_supplier_assignments(conn, cfg, vendors, products)
     trucks = transport.seed_trucks(conn, truck_count=4)
     # Promotions are seeded with a window that reaches back over the backfill
     # horizon: the back-dated transactions reference them, so a window opening
@@ -448,10 +456,10 @@ def seed_all(conn, cfg):
     shrinkage.mark_perishable_products(conn)
     # Ensure a current weekly ad exists at startup
     promotions.ensure_current_ad(conn, date.today(), products)
-    log.info("Seed complete: %d stores, %d warehouses, %d employees, %d products, %d trucks",
+    log.info("Seed complete: %d stores, %d warehouses, %d employees, %d products, %d trucks, %d vendors",
              len(locations['stores']), len(locations['warehouses']),
-             len(employees), len(products), len(trucks))
-    return locations, employees, departments, products, trucks
+             len(employees), len(products), len(trucks), len(vendors))
+    return locations, employees, departments, products, trucks, vendors
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +594,63 @@ def _ensure_realtime(conn):
         if row and row[0] == 'backfill' and row[1]:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Vendor phase (t_57b1a1ab)
+# ---------------------------------------------------------------------------
+# One function, called from BOTH the realtime midnight block and the backfill
+# day's end-of-day block. Those two blocks are otherwise near-copies of each
+# other, and two copies of a supplier lifecycle is exactly how the ordering /
+# fulfillment / transport / receipt chain came to have a step in one path and
+# not the other in the first place. Here the divergence would be a claim that
+# advances in realtime but never in a backfill — visible only on a fresh seed.
+
+def _run_vendor_phase(conn, cfg, sim_dt, locations, products, scenario):
+    """
+    DSD deliveries, then the credit-memo lifecycle. Never raises.
+
+    Order matters and is the reason this is one function rather than two
+    calls at each call site:
+
+      1. DSD drops stock the shelf and record their own short-ships, opening a
+         memo per creditable shortfall.
+      2. The memo pass submits, chases, pays or disputes what is already in
+         flight — which now includes the memos step 1 just opened.
+
+    A step-1 memo therefore cannot be submitted in the same pass it is opened,
+    because step 2's own SQL looks for `memo_status = 'open'` rows and the
+    freshly inserted one is open... which would claim it on the spot. To keep
+    the lifecycle honest, step 2 is called with the memo's OWN clock: the
+    advance only resolves rows whose `submitted_dt` is already at least
+    `credit_chase_after_days` old, and a just-opened memo has no `submitted_dt`
+    at all, so it simply cannot be touched. The ordering is documented rather
+    than relied on, because that is the whole invariant.
+
+    Returns the two result dicts, or empty ones if the vendor tables are not
+    there — a data dir generated before t_57b1a1ab keeps generating instead of
+    crashing on every midnight.
+    """
+    empty = {'deliveries': 0, 'lines': 0, 'short_lines': 0}
+    empty_memos = {'submitted': 0, 'paid': 0, 'rejected': 0, 'expired': 0}
+    try:
+        vendors = suppliers.fetch_suppliers(conn)
+        if vendors:
+            suppliers.generate_dsd_deliveries(
+                conn, cfg, sim_dt, vendors, locations['stores'], products,
+                scenario)
+        else:
+            log.info("No vendors on disk — skipping the vendor phase "
+                     "(pre-t_57b1a1ab data dir?)")
+            return empty, empty_memos
+        memos = suppliers.advance_credit_memos(conn, cfg, sim_dt, scenario)
+        return empty, memos
+    except Exception:
+        # A tick must not die because of the vendor paperwork. The receiving
+        # path above it has already committed the goods.
+        conn.rollback()
+        log.exception("Vendor phase failed at %s — continuing", sim_dt)
+        return empty, empty_memos
 
 
 # ---------------------------------------------------------------------------
@@ -742,13 +807,16 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
             scenario, inventory_cfg=cfg.inventory)
         orders_count = len(order_ids)
 
-        fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees, sim_dt)
+        fulfilled = fulfillment.process_pending_orders(
+            conn, warehouse_employees, sim_dt,
+            vendor_cfg=cfg.vendors, scenario=scenario)
 
         if fulfilled and locations['warehouses'] and trucks:
             wh_loc_id = locations['warehouses'][0]['location_id']
             transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id, sim_dt, scenario)
 
-        transport.receive_delivered_loads(conn, sim_dt, scenario)
+        transport.receive_delivered_loads(conn, sim_dt, scenario,
+                                          vendor_cfg=cfg.vendors)
 
         # Phase 2: perishable expiry dates + shrinkage
         shrinkage.set_expiry_dates(conn, sim_dt)
@@ -797,6 +865,16 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         restock = returns.generate_returns(conn, cfg, sim_dt, scenario)
         if restock:
             returns.restock_returns(conn, restock)
+
+        # Phase 7: the vendor layer (t_57b1a1ab).
+        #
+        # DSD drops FIRST: a DSD line's short-ship is detected at the moment of
+        # delivery, and its credit memo is opened from there. The memo ADVANCE
+        # runs last, so a memo opened tonight is submitted on the next simulated
+        # midnight rather than in the same pass — a claim lifecycle measured in
+        # ticks would resolve a 10-day settlement inside 10 ticks and make
+        # "days to pay" meaningless.
+        _run_vendor_phase(conn, cfg, sim_dt, locations, products, scenario)
 
     elapsed_ms = round((time.monotonic() - tick_start) * 1000)
     record_stats(conn, pos_count, tc_count, orders_count,
@@ -995,7 +1073,8 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 22, 0),
                 eod_scenario, inventory_cfg=cfg.inventory)
             fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees,
-                datetime(cur_date.year, cur_date.month, cur_date.day, 23, 0))
+                datetime(cur_date.year, cur_date.month, cur_date.day, 23, 0),
+                vendor_cfg=cfg.vendors, scenario=eod_scenario)
             if fulfilled and locations['warehouses'] and trucks:
                 wh_loc_id = locations['warehouses'][0]['location_id']
                 transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id,
@@ -1003,7 +1082,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                     eod_scenario)
             transport.receive_delivered_loads(conn,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59),
-                eod_scenario)
+                eod_scenario, vendor_cfg=cfg.vendors)
 
             pos.maybe_update_product_prices(conn, cfg, products, eod_scenario)
 
@@ -1040,6 +1119,15 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 eod_scenario)
             if restock:
                 returns.restock_returns(conn, restock)
+
+            # Vendor layer — same call as the realtime path, so a fresh 30-day
+            # backfill ends up with the same DSD drops and the same credit-memo
+            # lifecycle a live install would have (t_57b1a1ab). Without this the
+            # whole vendor story would exist only after the first realtime
+            # midnight, i.e. never on a freshly seeded database.
+            _run_vendor_phase(conn, cfg,
+                              datetime(cur_date.year, cur_date.month, cur_date.day, 23, 30),
+                              locations, products, eod_scenario)
 
         with conn.cursor() as cur:
             cur.execute("""
@@ -1092,7 +1180,7 @@ def main():
     conn = get_connection(cfg)
     psycopg2.extras.register_uuid()
 
-    locations, employees, departments, products, trucks = seed_all(conn, cfg)
+    locations, employees, departments, products, trucks, vendors = seed_all(conn, cfg)
 
     # Auto-start a 30-day backfill on a fresh (empty) database.
     auto_backfill_if_fresh(conn, cfg)

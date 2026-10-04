@@ -73,6 +73,20 @@ enforce.
 - **`transport.trucks`** referenced by: `transport.loads` (`truck_id`).
 - **`transport.loads`** referenced by: `transport.load_items`,
   `inv.receipts` (`load_id`).
+- **`inv.suppliers`** (new hub, t_57b1a1ab) referenced by: `inv.products`
+  (`supplier_id`), `inv.receipts` (`supplier_id`),
+  `inv.supplier_delivery_schedules` (`supplier_id`),
+  `inv.short_ship_events` (`supplier_id`),
+  `inv.supplier_credit_memos` (`supplier_id`), `inv.dsd_deliveries`
+  (`supplier_id`).
+- **`inv.supplier_delivery_schedules`** referenced by: `inv.dsd_deliveries`
+  (`schedule_id`) — the vendor-window a delivery's on-time rate is measured
+  against (`SEMA-26` asserts a delivery lands on a weekday the schedule visits).
+- **`inv.short_ship_events`** referenced by: `inv.supplier_credit_memos`
+  (`short_ship_id`, UNIQUE — one claim per shortfall, which is what makes
+  `open_credit_memo` idempotent).
+- **`inv.dsd_deliveries`** referenced by: `inv.dsd_delivery_items`
+  (`dsd_delivery_id`).
 
 ---
 
@@ -193,6 +207,57 @@ POS and online draw on the same shelf; a line the shelf cannot cover at all is
 dropped rather than written at zero (`pos.transaction_items` and
 `online.order_items` both `CHECK (quantity > 0)`), and the shopper's lost
 demand is recorded instead.
+
+### Vendors, short-ships and credit memos (t_57b1a1ab)
+
+Before this card a supplier was a free-text `supplier_name VARCHAR(200)` chosen
+by a module-level literal inside `models/inventory.py`, with no id to join on and
+no behaviour attached — so "which vendor keeps shorting us" was not merely
+unbuilt, it was unbuildable. `inv.products.lead_time_days` was a single static
+integer per product, so a vendor had no *promise* and therefore no arrival could
+be late against it.
+
+The short-ship side was worse than missing: `fulfillment.items` did record
+`pick_status = 'short'`, and `transport.receive_delivered_loads` then filtered
+`WHERE fi.pick_status = 'picked'` — so the short lines were excluded from the
+receipt and went nowhere. A vendor who could not fill an order left no trace.
+
+**`inv.stockout_events` and `inv.short_ship_events` are different events.** The
+first is what the **shop** could not sell because the shelf was empty; the second
+is what the **vendor** could not deliver. Different owner, different remedy
+(reorder vs credit claim), different clock. A mart that joins them measures
+vendor fill rate against shelf availability and blames the vendor for our own
+stockouts.
+
+| Assertion | Rule |
+|---|---|
+| `SEMA-14` | a short-ship's `supplier_id` is the vendor that supplies that **product** (`inv.products.supplier_id`) — the vendor is derived from the goods, not from the load |
+| `SEMA-15` | a short-ship's `quantity_requested` / `quantity_picked` mirror the `fulfillment.items` line it came from |
+| `SEMA-16` | `detected_source` matches the vendor's `fulfillment_model` — a DSD vendor's short is found at the shelf (`dsd_delivery`), a warehouse vendor's at the dock (`receiving`) |
+| `SEMA-17` | a credit memo exists only against a short-ship flagged `is_creditable` — the vendor's terms decide, not the model's convenience |
+| `SEMA-18` | a memo's vendor, product and location all match the short-ship's |
+| `SEMA-19` | a memo's `credit_quantity` / `credit_amount` are the shortfall and its value — the claim is the shortfall priced at the same unit cost the receipt used for the goods that did arrive |
+| `SEMA-20` | `submitted_dt` is on or before `claim_deadline`; a late claim must be recorded `expired` instead |
+| `SEMA-21` | a resolved claim resolves **after** it was submitted |
+| `SEMA-22` | a short-ship is never recorded against a line the warehouse fully picked |
+| `SEMA-23` | `realized_lead_time_days` is never negative (a gaussian can be, a lead time cannot) |
+| `SEMA-24` | a DSD delivery's `total_units` / `total_value` / `line_count` reconcile with its item lines |
+| `SEMA-25` | a DSD delivery's supplier matches its schedule's supplier |
+| `SEMA-26` | a DSD delivery lands on a weekday its schedule actually visits |
+| `SEMA-27` | `inv.products.supplier_name` agrees with `inv.suppliers.supplier_name` — the denormalised display copy can never disagree with the row it came from |
+
+`HARD-29`..`HARD-39` cover the new foreign keys themselves, plus the one that is
+also a type check: a DSD delivery's supplier must actually be
+`fulfillment_model = 'dsd'`.
+
+**A memo that never resolves is a finding, not a missing value.** `memo_status`
+is a lifecycle — `open` → `submitted` → `paid` | `rejected`, with `expired` when
+the vendor's claim window closed first and `written_off` when the store decided
+the paperwork was not worth it — because "how long did this vendor take to pay,
+and did it ever" is the question a claims-aging mart exists to answer. The
+`CHECK`s enforce that a terminal status carries its timestamp, that a claim was
+filed inside the window, and that an `expired` / `written_off` memo never also
+claims a vendor resolution.
 
 ### Promotion validity windows (temporal — also NOT FK-enforced)
 

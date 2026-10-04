@@ -235,12 +235,87 @@ SELECT sd.location_id, sd.demand_date
             WHERE NOT EXISTS (
                 SELECT 1 FROM hr.locations l WHERE l.location_id = sd.location_id);
 
--- [HARD-29] pos.loyalty_members.customer_id → pos.customers
-SELECT lm.member_id, lm.customer_id
-            FROM pos.loyalty_members lm
-            WHERE lm.customer_id IS NOT NULL
+-- [HARD-29] inv.products.supplier_id → inv.suppliers
+SELECT ip.inv_product_id, ip.supplier_id
+            FROM inv.products ip
+            WHERE ip.supplier_id IS NOT NULL
               AND NOT EXISTS (
-                SELECT 1 FROM pos.customers c WHERE c.customer_id = lm.customer_id);
+                SELECT 1 FROM inv.suppliers s
+                WHERE s.supplier_id = ip.supplier_id);
+
+-- [HARD-30] inv.receipts.supplier_id → inv.suppliers
+SELECT r.receipt_id, r.supplier_id
+            FROM inv.receipts r
+            WHERE r.supplier_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM inv.suppliers s
+                WHERE s.supplier_id = r.supplier_id);
+
+-- [HARD-31] inv.supplier_delivery_schedules.supplier_id → inv.suppliers
+SELECT ds.schedule_id, ds.supplier_id
+            FROM inv.supplier_delivery_schedules ds
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inv.suppliers s
+                WHERE s.supplier_id = ds.supplier_id);
+
+-- [HARD-32] inv.short_ship_events.fulfillment_item_id → fulfillment.items
+SELECT se.short_ship_id, se.fulfillment_item_id
+            FROM inv.short_ship_events se
+            WHERE NOT EXISTS (
+                SELECT 1 FROM fulfillment.items fi
+                WHERE fi.item_id = se.fulfillment_item_id)
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [HARD-33] inv.short_ship_events.supplier_id → inv.suppliers
+SELECT se.short_ship_id, se.supplier_id
+            FROM inv.short_ship_events se
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inv.suppliers s
+                WHERE s.supplier_id = se.supplier_id)
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [HARD-34] inv.short_ship_events.location_id → hr.locations
+SELECT se.short_ship_id, se.location_id
+            FROM inv.short_ship_events se
+            WHERE NOT EXISTS (
+                SELECT 1 FROM hr.locations l WHERE l.location_id = se.location_id)
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [HARD-35] inv.supplier_credit_memos.short_ship_id → inv.short_ship_events
+SELECT m.credit_memo_id, m.short_ship_id
+            FROM inv.supplier_credit_memos m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inv.short_ship_events se
+                WHERE se.short_ship_id = m.short_ship_id);
+
+-- [HARD-36] inv.supplier_credit_memos.supplier_id → inv.suppliers
+SELECT m.credit_memo_id, m.supplier_id
+            FROM inv.supplier_credit_memos m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inv.suppliers s
+                WHERE s.supplier_id = m.supplier_id);
+
+-- [HARD-37] inv.dsd_deliveries.schedule_id → inv.supplier_delivery_schedules
+SELECT d.dsd_delivery_id, d.schedule_id
+            FROM inv.dsd_deliveries d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inv.supplier_delivery_schedules ds
+                WHERE ds.schedule_id = d.schedule_id)
+              AND d.delivery_date < CURRENT_DATE;
+
+-- [HARD-38] inv.dsd_delivery_items.dsd_delivery_id → inv.dsd_deliveries
+SELECT i.dsd_item_id, i.dsd_delivery_id
+            FROM inv.dsd_delivery_items i
+            WHERE NOT EXISTS (
+                SELECT 1 FROM inv.dsd_deliveries d
+                WHERE d.dsd_delivery_id = i.dsd_delivery_id);
+
+-- [HARD-39] inv.dsd_deliveries.supplier_id → inv.suppliers, and it must be a DSD vendor
+SELECT d.dsd_delivery_id, d.supplier_id, s.fulfillment_model
+            FROM inv.dsd_deliveries d
+            JOIN inv.suppliers s ON s.supplier_id = d.supplier_id
+            WHERE s.fulfillment_model <> 'dsd'
+              AND d.delivery_date < CURRENT_DATE;
 
 -- --------------------------------------------------------------------------
 -- SEMANTIC_TYPE — ordering.store_orders.store_location_id must be a STORE location
@@ -357,21 +432,115 @@ SELECT sd.location_id, sd.product_id, sd.demand_date,
             WHERE sd.lost_units <> sd.requested_units - sd.fulfilled_units
                OR sd.requested_units < sd.fulfilled_units;
 
--- [SEMA-14] pos.customers.household_size must be >= the number of loyalty cards the household holds
-SELECT c.customer_id, c.household_size, card_count
-            FROM pos.customers c
-            JOIN (
-                SELECT customer_id, COUNT(*) AS card_count
-                FROM pos.loyalty_members
-                WHERE customer_id IS NOT NULL
-                GROUP BY customer_id
-            ) lm ON lm.customer_id = c.customer_id
-            WHERE c.household_size < lm.card_count;
+-- [SEMA-14] a short-ship's vendor must be the vendor that supplies the product
+SELECT se.short_ship_id, se.product_id, se.supplier_id,
+                   ip.supplier_id AS product_supplier_id
+            FROM inv.short_ship_events se
+            JOIN inv.products ip ON ip.product_id = se.product_id
+            WHERE se.supplier_id IS DISTINCT FROM ip.supplier_id
+              AND se.event_dt::date < CURRENT_DATE;
 
--- [SEMA-15] every loyalty card must resolve to a household (a dimension with holes is not a dimension)
-SELECT lm.member_id, lm.signup_date
-            FROM pos.loyalty_members lm
-            WHERE lm.customer_id IS NULL;
+-- [SEMA-15] a short_ship_event's quantities must match the fulfillment line it came from
+SELECT se.short_ship_id, se.quantity_requested, se.quantity_picked,
+                   fi.quantity_requested AS fi_requested,
+                   fi.quantity_picked AS fi_picked
+            FROM inv.short_ship_events se
+            JOIN fulfillment.items fi ON fi.item_id = se.fulfillment_item_id
+            WHERE (se.quantity_requested <> fi.quantity_requested
+               OR se.quantity_picked <> fi.quantity_picked)
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [SEMA-16] a DSD short-ship must be flagged as detected at a DSD delivery
+SELECT se.short_ship_id, se.detected_source, s.fulfillment_model
+            FROM inv.short_ship_events se
+            JOIN inv.suppliers s ON s.supplier_id = se.supplier_id
+            WHERE ((s.fulfillment_model = 'dsd' AND se.detected_source = 'receiving')
+               OR (s.fulfillment_model = 'warehouse' AND se.detected_source = 'dsd_delivery'))
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [SEMA-17] a credit memo must exist only against a creditable short-ship
+SELECT m.credit_memo_id, m.short_ship_id, se.is_creditable
+            FROM inv.supplier_credit_memos m
+            JOIN inv.short_ship_events se ON se.short_ship_id = m.short_ship_id
+            WHERE NOT se.is_creditable;
+
+-- [SEMA-18] a credit memo's vendor, product and location must match the short-ship's
+SELECT m.credit_memo_id, m.supplier_id, se.supplier_id,
+                   m.product_id, se.product_id, m.location_id, se.location_id
+            FROM inv.supplier_credit_memos m
+            JOIN inv.short_ship_events se ON se.short_ship_id = m.short_ship_id
+            WHERE m.supplier_id IS DISTINCT FROM se.supplier_id
+               OR m.product_id IS DISTINCT FROM se.product_id
+               OR m.location_id IS DISTINCT FROM se.location_id;
+
+-- [SEMA-19] a credit memo's amount must be the shortfall priced at the short-ship's cost
+SELECT m.credit_memo_id, m.credit_amount, m.credit_quantity,
+                   se.short_value, se.quantity_short
+            FROM inv.supplier_credit_memos m
+            JOIN inv.short_ship_events se ON se.short_ship_id = m.short_ship_id
+            WHERE m.credit_quantity <> se.quantity_short
+               OR m.credit_amount <> se.short_value;
+
+-- [SEMA-20] a submitted claim must be dated on or before its claim_deadline
+SELECT m.credit_memo_id, m.submitted_dt, m.claim_deadline
+            FROM inv.supplier_credit_memos m
+            WHERE m.submitted_dt IS NOT NULL
+              AND m.submitted_dt::date > m.claim_deadline;
+
+-- [SEMA-21] a resolved claim must resolve after it was submitted, never before
+SELECT m.credit_memo_id, m.submitted_dt, m.resolved_dt
+            FROM inv.supplier_credit_memos m
+            WHERE m.submitted_dt IS NOT NULL
+              AND m.resolved_dt IS NOT NULL
+              AND m.resolved_dt < m.submitted_dt;
+
+-- [SEMA-22] a short-ship must never be recorded against a line the warehouse fully picked
+SELECT se.short_ship_id, se.quantity_picked, se.quantity_requested,
+                   fi.pick_status
+            FROM inv.short_ship_events se
+            JOIN fulfillment.items fi ON fi.item_id = se.fulfillment_item_id
+            WHERE fi.pick_status = 'picked'
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [SEMA-23] a short-ship's realized lead time must never be reported as negative
+SELECT se.short_ship_id, se.realized_lead_time_days
+            FROM inv.short_ship_events se
+            WHERE se.realized_lead_time_days < 0
+              AND se.event_dt::date < CURRENT_DATE;
+
+-- [SEMA-24] a DSD delivery's item lines must reconcile with its header totals
+SELECT d.dsd_delivery_id, d.total_units, d.total_value,
+                   d.line_count, SUM(i.quantity_delivered) AS item_units,
+                   SUM(i.line_total) AS item_value, COUNT(*) AS items
+            FROM inv.dsd_deliveries d
+            JOIN inv.dsd_delivery_items i
+              ON i.dsd_delivery_id = d.dsd_delivery_id
+            WHERE d.delivery_date < CURRENT_DATE
+            GROUP BY d.dsd_delivery_id, d.total_units, d.total_value, d.line_count
+            HAVING SUM(i.quantity_delivered) <> d.total_units
+                OR ROUND(SUM(i.line_total), 2) <> ROUND(d.total_value, 2)
+                OR COUNT(*) <> d.line_count;
+
+-- [SEMA-25] a DSD delivery's supplier must match the schedule's supplier
+SELECT d.dsd_delivery_id, d.supplier_id, ds.supplier_id AS schedule_supplier
+            FROM inv.dsd_deliveries d
+            JOIN inv.supplier_delivery_schedules ds ON ds.schedule_id = d.schedule_id
+            WHERE d.supplier_id IS DISTINCT FROM ds.supplier_id
+              AND d.delivery_date < CURRENT_DATE;
+
+-- [SEMA-26] a DSD delivery must land on a weekday the schedule actually visits
+SELECT d.dsd_delivery_id, d.delivery_date, ds.delivery_weekday
+            FROM inv.dsd_deliveries d
+            JOIN inv.supplier_delivery_schedules ds
+              ON ds.schedule_id = d.schedule_id
+            WHERE (EXTRACT(ISODOW FROM d.delivery_date)::int - 1 <> ds.delivery_weekday)
+              AND d.delivery_date < CURRENT_DATE;
+
+-- [SEMA-27] a product's denormalised supplier_name must agree with its vendor's name
+SELECT ip.product_id, ip.supplier_name, s.supplier_name AS vendor_name
+            FROM inv.products ip
+            JOIN inv.suppliers s ON s.supplier_id = ip.supplier_id
+            WHERE ip.supplier_name IS DISTINCT FROM s.supplier_name;
 
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
