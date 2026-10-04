@@ -1061,11 +1061,34 @@ def pos_price_history(
     total = query(f"""
         SELECT COUNT(*) AS n FROM pos.price_history ph WHERE {where}
     """, params, industry)[0]["n"]
+    # `ph.product_id` is the real key of the row and belongs in the payload next to
+    # the label (t_ea399398). The DB has always joined on it — `product_id` is
+    # `NOT NULL REFERENCES pos.products(product_id)` — and then threw it away in
+    # favour of `p.name`, handing the consumer an unenforced natural key instead.
+    # `pos.products.name` carries no uniqueness constraint (only `sku`/`upc` do),
+    # so a consumer that joins the name back to an id re-points a product's whole
+    # price history at whichever product holds that name after a rename, and
+    # merges two products' histories outright if two names ever collide.
+    #
+    # `product_name` stays for one transition cycle: dropping it is a breaking
+    # change for any consumer outside this repo, and nothing here can see them.
+    # data-lab's `stg_pos_price_history` is the one known reader still on the name.
+    #
+    # `LEFT JOIN` is what makes `total` trustworthy rather than merely fast. The
+    # COUNT(*) above counts `pos.price_history` on its own and never joins, so an
+    # inner join here is the only thing that can make the advertised total and the
+    # pages disagree — and it would do so silently, the same way a tie cluster
+    # straddling a page boundary once did (t_d7892e10). The FK currently makes an
+    # orphan unreachable, so this is insurance rather than a live fix; it costs one
+    # word and it keeps `product_name`/`category` as nullable labels rather than
+    # load-bearing ones. `p.category` is a real column on `pos.products`, not a
+    # substituted key, so it stays as a convenience label for the same window.
     rows = query(f"""
-        SELECT ph.price_history_id, p.name AS product_name, p.category,
+        SELECT ph.price_history_id, ph.product_id,
+               p.name AS product_name, p.category,
                ph.old_price, ph.new_price, ph.changed_at
         FROM pos.price_history ph
-        JOIN pos.products p ON p.product_id = ph.product_id
+        LEFT JOIN pos.products p ON p.product_id = ph.product_id
         WHERE {where}
         ORDER BY ph.changed_at DESC, ph.price_history_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
