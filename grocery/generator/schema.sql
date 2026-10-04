@@ -149,6 +149,42 @@ CREATE TABLE pos.combo_deals (
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
+-- The customer / household master dimension. `pos.loyalty_members` is a
+-- *card*: `pos.transactions.member_id` resolves to it or is NULL, and nothing
+-- on either side carried a demographic or household attribute, so the marts a
+-- grocery warehouse actually wants (RFM cohorts, basket affinity, segment
+-- penetration, household-size vs basket size) had no conformed dimension to
+-- join to.
+--
+-- The link is `loyalty_members.customer_id`, nullable and NOT unique: one
+-- household may hold several cards (two adults, a card each) and a card-less
+-- shopper belongs to no household at all. `household_size` is the household's
+-- size, so it is legitimately larger than its card count — the children in it
+-- never signed up. Populated by `models/customers.py`, which carries its own
+-- `IF NOT EXISTS` copy of this DDL for a data dir generated before it (a
+-- schema.sql change only reaches a fresh bootstrap).
+--
+-- Deliberately NOT stored here: loyalty-card count and first-signup date.
+-- Both are a LEFT JOIN from `pos.loyalty_members`, and a stored copy would go
+-- stale the moment a second card joined the household or a back-dated signup
+-- landed out of order. Likewise there is no `pos.transactions.customer_id`:
+-- denormalising the snowflake into the fact table would re-attribute every
+-- anonymous shopper. The mart joins transactions -> loyalty_members ->
+-- customers.
+CREATE TABLE pos.customers (
+    customer_id     UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    age_band        VARCHAR(20)  NOT NULL
+                        CHECK (age_band IN ('under_25', '25_34', '35_44',
+                                            '45_54', '55_64', '65_plus')),
+    household_size  SMALLINT     NOT NULL CHECK (household_size BETWEEN 1 AND 12),
+    segment         VARCHAR(30)  NOT NULL
+                        CHECK (segment IN ('value_seeker', 'family_stock_up',
+                                           'convenience', 'health_conscious',
+                                           'premium_enthusiast', 'budget_constrained')),
+    created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE pos.loyalty_members (
     member_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     first_name      VARCHAR(100) NOT NULL,
@@ -159,6 +195,10 @@ CREATE TABLE pos.loyalty_members (
     points_balance  INTEGER      NOT NULL DEFAULT 0,
     tier            VARCHAR(20)  NOT NULL DEFAULT 'bronze'
                         CHECK (tier IN ('bronze', 'silver', 'gold', 'platinum')),
+    -- The household this card belongs to. NULL on a card created before this
+    -- column existed and not yet picked up by the backfill; NULL for a
+    -- walk-in shopper who never signed up.
+    customer_id     UUID         REFERENCES pos.customers(customer_id),
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -408,6 +448,8 @@ CREATE INDEX idx_pos_txn_member       ON pos.transactions (member_id);
 CREATE INDEX idx_pos_items_txn        ON pos.transaction_items (transaction_id);
 CREATE INDEX idx_pos_items_product    ON pos.transaction_items (product_id);
 CREATE INDEX idx_pos_members_email    ON pos.loyalty_members (email);
+CREATE INDEX idx_pos_members_customer  ON pos.loyalty_members (customer_id);
+CREATE INDEX idx_pos_customers_segment ON pos.customers (segment, age_band);
 CREATE INDEX idx_pos_products_dept    ON pos.products (department_id);
 CREATE INDEX idx_pos_coupons_active   ON pos.coupons (is_active, valid_until);
 CREATE INDEX idx_pos_deals_active     ON pos.combo_deals (is_active, valid_until);

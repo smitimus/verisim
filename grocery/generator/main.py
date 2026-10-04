@@ -33,7 +33,7 @@ import psycopg2.extras
 
 from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
-from models import shrinkage, promotions, scheduling, returns, online
+from models import shrinkage, promotions, scheduling, returns, online, customers
 from elasticity import seed_elasticity_columns
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
@@ -308,6 +308,12 @@ def seed_all(conn, cfg):
     # an install generated before t_08deeddf keeps its old `pos.products` and
     # the demand curve has nothing to key on. Idempotent and additive.
     seed_elasticity_columns(conn, cfg)
+    # Same trap, same remedy, for the customer dimension: a `schema.sql`
+    # change only reaches a fresh bootstrap, so an install generated before
+    # this card has no `pos.customers` and no `loyalty_members.customer_id`.
+    # Idempotent and additive, and it must run BEFORE seed_loyalty_members
+    # so the seeded cards are dimensioned in the same pass.
+    customers.ensure_tables(conn)
     locations = hr.seed_locations(conn, cfg)
     employees = hr.seed_employees(conn, cfg, locations)
     departments = pos.seed_departments(conn, cfg)
@@ -323,6 +329,10 @@ def seed_all(conn, cfg):
     pos.seed_coupons(conn, cfg, departments, products, history_days)
     pos.seed_combo_deals(conn, cfg, departments, products, history_days)
     pos.seed_loyalty_members(conn, cfg)
+    # Every loyalty card gets a household. Idempotent: the candidate set is
+    # "cards with a NULL customer_id" and the write sets it, so this also
+    # picks up members that predate the dimension and nothing on a re-run.
+    customers.backfill_customers(conn, cfg)
     # One-time: mark perishable products + assign shelf_life_days
     shrinkage.mark_perishable_products(conn)
     # Ensure a current weekly ad exists at startup
@@ -542,6 +552,14 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         ad_prices=ad_prices,
         stock_allowance=stock_allowance,
     )
+
+    # Loyalty signups this batch just wrote are dimensioned here, not at the
+    # next restart: `backfill_customers` is the one code path that creates a
+    # household, and its candidate set is "cards with a NULL customer_id", so
+    # this is a no-op on every tick that signed nobody up. Without it, a card
+    # created on day 30 of a run would carry no segment until someone rebooted
+    # the generator — a dimension that fills in behind the mart's back.
+    customers.backfill_customers(conn, cfg)
 
     # Timeclock events
     tc_count = timeclock.generate_events(conn, sim_dt, employees, locations)
@@ -828,6 +846,19 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
     # redemptions would stay uncounted until the next simulated midnight.
     # Reconcile once here so a freshly loaded database reads exactly correct.
     pos.reconcile_promotions(conn)
+
+    # Dimension every loyalty card the backfill just wrote, in ONE pass over
+    # the whole set — deliberately NOT per day. `plan_households` groups cards
+    # by walking them in signup order and deciding, per card, whether it joins
+    # the household already open; run per backfill day instead, the walk would
+    # restart at each day's boundary and the second adult's card — signed up on
+    # a later day than the first — would never be considered as sitting next to
+    # its partner. A 30-day backfill would then produce ~30 single-card
+    # households instead of the intended mix, and the segment mix would depend
+    # on where the backfill happened to be cut. It is idempotent and cheap (it
+    # no-ops the moment nothing has a NULL customer_id), so running it here as
+    # well as per-tick in realtime is safe.
+    customers.backfill_customers(conn, cfg)
 
     with conn.cursor() as cur:
         cur.execute("""

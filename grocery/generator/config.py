@@ -40,6 +40,30 @@ class LoyaltyConfig:
     loyalty_usage_rate: float = 0.40
     initial_member_count: int = 300
 
+@dataclass
+class CustomersConfig:
+    """The customer / household master dimension (pos.customers).
+
+    The taxonomy itself — which segments exist and which way each one's age
+    and household-size distributions lean — lives in `models/customers.py` as
+    named data, because that is the *definition* of a segment rather than an
+    operator preference. What is tuned here is only the shape of the base:
+
+    * `segment_shares` — relative weight per segment, overriding the module
+      default for whichever keys are present. Unnormalised; the draw
+      normalises, so overriding one segment does not require rescaling the
+      other five.
+    * `multi_member_household_share` — the chance a household keeps its next
+      loyalty card instead of forming a new household. 0 means every card is
+      its own household, 1 means every card joins the same one.
+    * `household_size_max` — cap on the drawn household size. The segment
+      distribution is renormalised over the sizes this allows, so raising the
+      cap does not skew the mix toward small households.
+    """
+    segment_shares: Dict[str, float] = field(default_factory=dict)
+    multi_member_household_share: float = 0.25
+    household_size_max: int = 6
+
 
 @dataclass
 class PricingConfig:
@@ -178,6 +202,7 @@ class Config:
     locations: LocationConfig = field(default_factory=LocationConfig)
     volumes: VolumeConfig = field(default_factory=VolumeConfig)
     loyalty: LoyaltyConfig = field(default_factory=LoyaltyConfig)
+    customers: CustomersConfig = field(default_factory=CustomersConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
     inventory: InventoryConfig = field(default_factory=InventoryConfig)
     coupons: CouponConfig = field(default_factory=CouponConfig)
@@ -269,6 +294,17 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
         cfg.loyalty.loyalty_usage_rate = float(loy['loyalty_usage_rate'])
     if 'initial_member_count' in loy:
         cfg.loyalty.initial_member_count = int(loy['initial_member_count'])
+
+    cust = data.get('customers', {})
+    if 'segment_shares' in cust:
+        cfg.customers.segment_shares = {
+            str(k): float(v) for k, v in cust['segment_shares'].items()
+        }
+    if 'multi_member_household_share' in cust:
+        cfg.customers.multi_member_household_share = float(
+            cust['multi_member_household_share'])
+    if 'household_size_max' in cust:
+        cfg.customers.household_size_max = int(cust['household_size_max'])
 
     pri = data.get('pricing', {})
     if 'product_price_change_frequency_days' in pri:
