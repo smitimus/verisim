@@ -199,6 +199,75 @@ The Verisim grocery standalone image serves a FastAPI API at port 8010 with Swag
 | POST | `/grocery/generator/start` | Start/resume generator, accepts `{"mode":"backfill","force":true}` |
 | POST | `/grocery/generator/stop` | Pause generator at next tick boundary |
 
+### Observability (t_196d8da2)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/{industry}/metrics` | Is the generator keeping up? Plain text (Prometheus-style) by default; `?fmt=json`, `?window=N`, `?rows=false` |
+
+**"Lag" is not the number you would expect, and the reason is the loop.** The main
+loop is `run_tick(...)` then `time.sleep(tick_interval_seconds)`, and the sleep is
+UNCONDITIONAL — so one iteration costs `interval + tick_cost`, not `interval`.
+Measured by replaying the loop over one simulated day (2880 ticks at 30s):
+
+| tick cost | real time for one simulated day | behind realtime |
+|-----------|-----------------------------------|-----------------|
+| 0.05s     | 24h 2.4min                       | 2.4 min         |
+| 0.5s      | 24h 24min                        | 24 min          |
+| 5s        | 25h 40min                        | 4 hours         |
+| 45s       | 41h                              | 36 hours        |
+
+So an absolute "seconds behind realtime" grows without bound on a **healthy**
+box, and no fixed threshold on it can be right: it either fires forever or never.
+Three consequences, and the repo depends on all three:
+
+* **`verisim_realtime_factor` is the number to alert on** —
+  `interval / mean_period`, dimensionless, so one threshold works on a fast box
+  and a slow one. 1.0 is realtime.
+* **`verisim_data_staleness_seconds` is suppressed when the clock skews.** The
+  generator writes `simulation_dt` from a *naive* `datetime.now()`, which
+  Postgres reads in the DATABASE's timezone — when the two containers' `TZ`
+  differ (compose sets it per service) the column lands hours off. Measured on
+  the dev slot: the newest `simulation_dt` was 3.71h in the *future*, and a naive
+  subtraction reported `-13412s`. A negative staleness is not a measurement, so it
+  is omitted and `simulation_clock_skew_seconds` explains why.
+  `verisim_tick_staleness_seconds` and `realtime_factor` are unaffected —
+  `recorded_at` is `DEFAULT NOW()`, written by Postgres itself.
+* **`lagging` never fires on a stopped, paused or backfilling generator.** A
+  generator that was told to stop is not late, and a backfill is deliberately
+  writing history. The bar is three missed cadences, which scales with the
+  interval instead of being a fixed number of seconds.
+
+The generator side is `grocery/generator/observability.py` (`TickCadence`):
+deadline lag against `interval + EWMA(recent tick costs)`, plus a per-tick
+overrun ratio. `cadence.reset()` is called whenever the generator is not writing
+realtime data — a generator that is not generating owes realtime nothing, and a
+stale cost EWMA would measure a resumed box against a deadline that no longer
+fits it. The backfill writes its hours' REAL `wall_clock_ms` now (it wrote a
+literal `0`, so a 90s hour and a 9s hour both recorded "0ms"); it reports no lag,
+because it is not behind realtime while it writes history.
+
+Every per-tick log line begins `[tick N][sim_dt]` — the SIMULATED stamp, so a
+backfilled hour is distinguishable from a live one, and one grep finds every line
+for a tick. A tick past `observability.tick_lag_alert_seconds` of lag, or one
+that overran its interval on its own, is logged at WARNING with the numbers.
+
+The UI dashboard carries a tick-health panel (realtime factor, mean tick cost,
+loop overhead, ticks measured) that degrades silently on an API older than
+`/metrics` — a rolling deploy leaves a slot behind for a while and the panel must
+not turn that into a red banner.
+
+**Placement constraint, both halves load-bearing.** `/{industry}/metrics` sits at
+the very TOP of `base/api/main.py`, before the first route decorator, and it is
+a SHARED (never "Grocery only") section. Tests slice `main.py` from one route's
+decorator to the next `@app.` to read "that route's SQL" — parked between two
+routes, this section's catalogue query lands inside a neighbour's slice (it
+broke `test_generation_stats.py`'s `ORDER BY … stat_id` assertion, then
+`receipt-items`, then `ad-items`, and appending at EOF fails too because the last
+route's slice runs to end-of-file). And a grocery-only header would delete it from
+the gas-station image, whose generator writes the same ledger.
+`grocery/api/tests/test_tick_metrics.py` pins both, and checks the route survives
+both build-time strip scripts.
+
 ### Data Access (all with offset pagination)
 | Method | Path | Description |
 |--------|------|-------------|

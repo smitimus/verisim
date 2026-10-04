@@ -13,6 +13,8 @@ Route pattern: /{industry}/...
 import json
 import logging
 import os
+import re
+import time as _time
 import yaml
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
@@ -22,7 +24,7 @@ import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("api")
@@ -38,6 +40,38 @@ try:
     GROCERY_COST_PER_MILE = float(_GROCERY_CFG.get("transport", {}).get("cost_per_mile", 1.85))
 except FileNotFoundError:
     GROCERY_COST_PER_MILE = 1.85
+
+# The tick-lag alert threshold, read from the SAME mounted config.yaml the
+# generator reads, so `/metrics` and the generator's own log line cannot quote
+# different numbers for the same knob (t_196d8da2). Defaults identical to
+# `generator/config.py`'s ObservabilityConfig and to the shipped config.yaml.
+DEFAULT_TICK_INTERVAL_SECONDS = 30
+DEFAULT_ALERT_LAG_SECONDS = 120.0
+
+
+def metrics_alert_threshold() -> float:
+    """`observability.tick_lag_alert_seconds` from the mounted config.
+
+    Read at CALL time, not at import: config.yaml is hot-reloaded, and an API
+    process that captured the threshold once at boot would report the value the
+    container started with forever. A bad value falls back to the documented
+    default instead of raising — a metrics endpoint that 500s on a typo is worse
+    than one that reports the default.
+    """
+    try:
+        with open(_GROCERY_CONFIG_PATH) as _mf:
+            data = yaml.safe_load(_mf) or {}
+    except (FileNotFoundError, OSError):
+        return DEFAULT_ALERT_LAG_SECONDS
+    value = (data.get("observability") or {}).get("tick_lag_alert_seconds")
+    if value is None:
+        return DEFAULT_ALERT_LAG_SECONDS
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ALERT_LAG_SECONDS
+    return value if value >= 0 else DEFAULT_ALERT_LAG_SECONDS
+
 
 # ---------------------------------------------------------------------------
 # Industry → DB name mapping
@@ -338,6 +372,430 @@ class AdItemCreate(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Platform-level endpoints
+# ---------------------------------------------------------------------------
+# Metrics — is the generator keeping up? (t_196d8da2)
+#
+# `control.generation_stats` records what every tick cost, and nothing ever
+# surfaced whether that was acceptable. This route answers it from the ledger
+# alone: no state of its own, no new dependency, no write.
+#
+# Deliberately in a SHARED section, not a "Grocery only" one. Every industry has
+# a tick ledger with the same shape, and `strip_grocery.py` deletes every
+# grocery-only section at build time — a route parked there would simply not
+# exist in the gas-station image while its generator writes the same ledger.
+# ---------------------------------------------------------------------------
+
+# How long a row-count snapshot is reused. The counts are exact but not cheap: a
+# count(*) over transaction_items on a full install is tens of millions of rows,
+# and a UI polling every 15s would otherwise pay for the whole catalogue every
+# 15s to answer a question whose answer changes slowly. Tick timing is NOT
+# cached — it is the thing being watched.
+METRICS_ROWS_TTL_SECONDS = 60.0
+
+# industry -> (expires_at, rows). Module-level so the cache survives between
+# requests; `_tick_metrics` is pure, so nothing here can leak into its numbers.
+_metrics_rows_cache: Dict[str, tuple] = {}
+
+
+def _tick_window(industry: str, window: int) -> Dict[str, Any]:
+    """Tick timing over the newest `window` ledger rows, from SQL.
+
+    All the arithmetic the endpoint needs is aggregate-only over an indexed
+    column, so this is one cheap round trip regardless of how large the ledger
+    has grown.
+
+    `wall_clock_ms` was written as a hardcoded 0 by the backfill until
+    t_196d8da2, so `avg_wall_clock_ms` is NULL for rows written by an older
+    image. That is reported as absent rather than as 0 — a backfill hour that
+    cost 90s and one that cost 9s both used to record "0ms", and a metric that
+    renders those as 0 is a false reading rather than a missing one.
+    """
+    return query("""
+        SELECT
+            COUNT(*)                                              AS ticks,
+            MIN(recorded_at)                                     AS first_tick,
+            MAX(recorded_at)                                     AS last_tick,
+            AVG(wall_clock_ms)                                   AS avg_wall_clock_ms,
+            MIN(wall_clock_ms)                                   AS min_wall_clock_ms,
+            MAX(wall_clock_ms)                                   AS max_wall_clock_ms,
+            COUNT(wall_clock_ms)                                 AS timed_ticks,
+            MAX(simulation_dt)                                   AS newest_simulation_dt,
+            SUM(COALESCE(pos_transactions_generated, 0))         AS pos_rows,
+            SUM(COALESCE(orders_generated, 0))                   AS orders_rows
+        FROM (
+            SELECT recorded_at, wall_clock_ms, simulation_dt,
+                   pos_transactions_generated, orders_generated
+            FROM control.generation_stats
+            ORDER BY recorded_at DESC, stat_id DESC
+            LIMIT %s
+        ) AS recent
+    """, [window], industry)[0]
+
+
+def _tick_metrics(window_row: Dict[str, Any], state_row: Dict[str, Any],
+                  interval: int, now, threshold: float) -> Dict[str, Any]:
+    """Turn the window aggregate into the numbers an operator reads.
+
+    Split out from the route so it can be tested against hand-built aggregates —
+    the arithmetic is where this endpoint's value and its mistakes both live.
+
+    Three quantities, and they answer different questions:
+
+    * **mean tick cost** — what a tick has been costing. `wall_clock_ms` from the
+      ledger.
+    * **mean period** — `span / (n - 1)`, the wall-clock cost of one loop
+      iteration. `recorded_at` is stamped by the ledger INSERT at the END of a
+      tick, so first..last spans n-1 whole iterations, and the newest tick's own
+      cost is NOT in the window. Subtract the interval to get the per-iteration
+      overhead the unconditional loop sleep cannot hide.
+    * **realtime factor** — `interval / mean_period`, the fraction of realtime
+      the generator is actually producing, 1.0 being perfect. This is the one
+      that needs no per-box calibration: it is dimensionless, so the same
+      threshold is right on a fast machine and a slow one, which no absolute
+      seconds threshold can be.
+
+    With fewer than 2 ticks there is no period and no factor — reporting
+    `1.0` or `0.0` there would be inventing a measurement.
+    """
+    ticks = int(window_row.get("ticks") or 0)
+    timed = int(window_row.get("timed_ticks") or 0)
+    interval = max(1, int(interval or 1))
+
+    mean_cost = window_row.get("avg_wall_clock_ms")
+    metrics: Dict[str, Any] = {
+        "window_ticks": ticks,
+        "timed_ticks": timed,
+        "first_tick_at": window_row.get("first_tick"),
+        "last_tick_at": window_row.get("last_tick"),
+        "mean_tick_cost_ms": float(mean_cost) if mean_cost is not None else None,
+        "min_tick_cost_ms": window_row.get("min_wall_clock_ms"),
+        "max_tick_cost_ms": window_row.get("max_wall_clock_ms"),
+        "interval_seconds": interval,
+        "mean_period_seconds": None,
+        "mean_overhead_ms": None,
+        "realtime_factor": None,
+        "lag_alert_seconds": threshold,
+    }
+
+    first = window_row.get("first_tick")
+    last = window_row.get("last_tick")
+    if ticks >= 2 and first is not None and last is not None:
+        span = (last - first).total_seconds()
+        mean_period = span / (ticks - 1)
+        metrics["mean_period_seconds"] = round(mean_period, 3)
+        # The overhead the loop's unconditional sleep cannot absorb: one
+        # iteration really costs `interval + tick_cost`.
+        metrics["mean_overhead_ms"] = round(max(0.0, mean_period - interval) * 1000, 1)
+        metrics["realtime_factor"] = round(interval / mean_period, 5) if mean_period > 0 else None
+
+    # "How stale is the newest data" — the operator's actual question, and the
+    # one that is directly comparable with a dashboard's last refresh.
+    #
+    # Reported ONLY when it is a real measurement. The generator writes
+    # `simulation_dt` from a NAIVE `datetime.now()`, which Postgres then reads in
+    # the DATABASE's timezone; when the generator container's TZ differs from
+    # Postgres's — the normal case, since compose sets `TZ` per service — the
+    # column lands hours away from the truth. Measured on the dev slot
+    # (2026-10-04): the newest `simulation_dt` was 3.71h in the FUTURE of the
+    # database clock, so a naive `now - newest_sim` reported a staleness of
+    # -13412s.
+    #
+    # A negative staleness is not a measurement, so it is reported as absent plus
+    # the skew that caused it, rather than as a number an operator has to notice is
+    # nonsense. `tick_staleness_seconds` below is the reliable one: `recorded_at`
+    # is `DEFAULT NOW()`, written by Postgres itself.
+    newest_sim = window_row.get("newest_simulation_dt")
+    if newest_sim is None:
+        metrics["data_staleness_seconds"] = None
+    else:
+        skew = (now - newest_sim).total_seconds()
+        metrics["data_staleness_seconds"] = round(skew, 1) if skew >= 0 else None
+        if skew < 0:
+            metrics["simulation_clock_skew_seconds"] = round(-skew, 1)
+            metrics["skew_note"] = (
+                f"simulation_dt is {-skew:.0f}s ahead of the database clock — the "
+                f"generator writes it from a naive datetime.now(), so it is read "
+                f"in the database's timezone. data_staleness_seconds is suppressed "
+                f"rather than reported negative; tick_staleness_seconds and "
+                f"realtime_factor are unaffected.")
+
+    last_tick = window_row.get("last_tick")
+    metrics["tick_staleness_seconds"] = (
+        round((now - last_tick).total_seconds(), 1)
+        if last_tick is not None else None)
+
+    # `lagging` is a verdict about the REALTIME path only, and the mode decides
+    # whether it applies at all:
+    #
+    # * stopped / paused — not late, it was told to stop. Same reasoning as
+    #   `cadence.reset()` in the generator: a paused generator owes nothing.
+    # * backfill — deliberately writing history, so its newest data being old is
+    #   the design rather than a defect. Without this, every fresh install's first
+    #   minute would look like a failure, and an alert that cries wolf on day one
+    #   is an alert nobody reads.
+    # * realtime — genuinely lagging when no tick has landed for three cadences.
+    #
+    # Three missed cadences is the bar rather than an absolute number of seconds,
+    # because "has it gone quiet?" has a per-box-independent answer once you allow
+    # for the interval: 90s of silence means something different at 30s than at 300s.
+    mode = (state_row or {}).get("mode")
+    paused = bool((state_row or {}).get("is_paused")) or mode in ("stopped", "paused")
+    metrics["mode"] = mode
+    staleness = metrics["tick_staleness_seconds"]
+    quiet_after = interval * 3
+    metrics["quiet_after_seconds"] = quiet_after
+    metrics["lagging"] = bool(
+        not paused
+        and mode != "backfill"
+        and staleness is not None
+        and staleness >= quiet_after)
+
+    if mode == "backfill":
+        metrics["lagging_note"] = (
+            "backfill in progress — newest simulated data is historical by design")
+    elif paused:
+        metrics["lagging_note"] = (
+            "generator is paused, not generating — lag is not measured")
+
+    return metrics
+
+
+def _rows_by_table(industry: str) -> List[Dict[str, Any]]:
+    """Exact row count per user table, cached for METRICS_ROWS_TTL_SECONDS.
+
+    The table list comes from the catalogue rather than a hardcoded constant, so
+    a table added to `schema.sql` is counted without editing this file. Names are
+    matched against a strict identifier pattern before being interpolated: they
+    come from `information_schema` rather than from user input, but a value that
+    reaches a query string unvalidated is a query-injection waiting for a schema
+    someone hand-edits.
+    """
+    cached = _metrics_rows_cache.get(industry)
+    now = _time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1]
+
+    tables = query("""
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY table_schema, table_name
+    """, None, industry)
+
+    rows: List[Dict[str, Any]] = []
+    for entry in tables:
+        schema, table = entry["table_schema"], entry["table_name"]
+        if not re.match(r'^[a-z_][a-z0-9_]*$', schema) or \
+           not re.match(r'^[a-z_][a-z0-9_]*$', table):
+            log.warning("metrics: skipping table with unexpected name %s.%s", schema, table)
+            continue
+        counted = query(f'SELECT COUNT(*) AS n FROM "{schema}"."{table}"',
+                        None, industry)[0]["n"]
+        rows.append({"schema": schema, "table": table, "rows": int(counted)})
+
+    _metrics_rows_cache[industry] = (now + METRICS_ROWS_TTL_SECONDS, rows)
+    return rows
+
+
+def _render_prometheus(industry: str, metrics: Dict[str, Any],
+                       rows: List[Dict[str, Any]]) -> str:
+    """Prometheus text exposition. Values only; no dependencies, no registry.
+
+    Deliberately simple: one number per line with a HELP/TYPE header, which is
+    what `curl` reads, what a scraper parses, and what a human reads in a
+    terminal. A JSON blob would serve none of the three as well.
+    """
+    def _emit(name, help_text, value, mtype="gauge", labels=""):
+        if value is None:
+            return []                       # absent, not zero — see _tick_metrics
+        return [f"# HELP {name} {help_text}",
+                f"# TYPE {name} {mtype}",
+                f"{name}{labels} {value}"]
+
+    prefix = "verisim_"
+    out: List[str] = []
+
+    out += _emit(f"{prefix}generator_running",
+                 "1 when the generator is running and not paused.",
+                 1 if (metrics.get("mode") == "realtime" and not metrics.get("lagging"))
+                 else 0)
+    out += _emit(f"{prefix}generator_mode_info",
+                 "The generator's current mode, as a label.",
+                 1, labels=f'{{mode="{metrics.get("mode") or "unknown"}"}}')
+
+    out += _emit(f"{prefix}tick_interval_seconds",
+                 "Configured wall-clock seconds between realtime ticks.",
+                 metrics["interval_seconds"])
+    out += _emit(f"{prefix}tick_lag_alert_seconds",
+                 "Configured staleness after which the generator counts as lagging.",
+                 metrics["lag_alert_seconds"])
+
+    out += _emit(f"{prefix}ticks_in_window",
+                 "Tick ledger rows the timing summary was computed over.",
+                 metrics["window_ticks"])
+    out += _emit(f"{prefix}ticks_timed",
+                 "Window rows carrying a real wall_clock_ms (a backfill wrote 0 "
+                 "before t_196d8da2).",
+                 metrics["timed_ticks"])
+
+    for key, help_text in (
+            ("mean_tick_cost_ms", "Mean cost of one tick, from wall_clock_ms."),
+            ("min_tick_cost_ms", "Cheapest tick in the window."),
+            ("max_tick_cost_ms", "Most expensive tick in the window."),
+    ):
+        out += _emit(f"{prefix}{key}", help_text, metrics.get(key))
+    out += _emit(f"{prefix}tick_mean_period_seconds",
+                 "Wall-clock seconds per loop iteration: span / (n-1). One "
+                 "iteration costs tick_interval_seconds plus the tick's own cost.",
+                 metrics.get("mean_period_seconds"))
+    out += _emit(f"{prefix}tick_mean_overhead_ms",
+                 "Mean iteration cost above tick_interval_seconds.",
+                 metrics.get("mean_overhead_ms"))
+    out += _emit(f"{prefix}realtime_factor",
+                 "interval / mean_period. 1.0 is realtime; below 1.0 the "
+                 "generator is producing slower than realtime.",
+                 metrics.get("realtime_factor"))
+
+    out += _emit(f"{prefix}data_staleness_seconds",
+                 "How far the newest simulated data is behind the wall clock.",
+                 metrics.get("data_staleness_seconds"))
+    out += _emit(f"{prefix}tick_staleness_seconds",
+                 "Seconds since the generator last wrote a tick.",
+                 metrics.get("tick_staleness_seconds"))
+    out += _emit(f"{prefix}lagging",
+                 "1 when the generator has not ticked recently enough to be "
+                 "considered behind.",
+                 1 if metrics.get("lagging") else 0)
+
+    if rows:
+        out += [f"# HELP {prefix}rows Exact row count per table.",
+                f"# TYPE {prefix}rows gauge"]
+        for row in rows:
+            out.append(f'{prefix}rows{{schema="{row["schema"]}",'
+                       f'table="{row["table"]}"}} {row["rows"]}')
+
+    return "\n".join(out) + "\n"
+
+
+@app.get("/{industry}/metrics", tags=["Metrics"],
+         response_class=PlainTextResponse)
+def metrics(industry: str,
+            window: int = Query(100, ge=2, le=5000),
+            fmt: str = Query("text", pattern="^(text|json)$"),
+            rows: bool = Query(True)):
+    """Is the generator keeping up? Plain text (Prometheus-style) or JSON.
+
+    **Why this exists.** `control.generation_stats.wall_clock_ms` has recorded
+    what every tick cost since the ledger did, and nothing ever surfaced whether
+    that was acceptable — so "the container crash-loops after an upgrade" was
+    log-archaeology over `wall_clock_ms` values nobody had looked at.
+
+    **Where the numbers come from.** The ledger, by aggregate only: no state is
+    kept between calls, so two scrapes cannot disagree and a restart loses
+    nothing. `window` is the number of recent tick rows the timing summary is
+    computed over, and it is the whole knob — the ledger holds tens of thousands
+    of rows and only the recent tail is meaningful.
+
+    **`realtime_factor` is the number to alert on.** The generator's loop sleeps
+    `tick_interval_seconds` unconditionally, so one iteration really costs
+    `interval + tick_cost` and a generator doing honest work is always slightly
+    behind. Measured over a simulated day at the default 30s cadence: 0.05s/tick
+    → 2.4 min behind, 0.5s → 24 min, 5s → 4 hours. Any absolute seconds
+    threshold on raw lag therefore fires forever on a healthy box or never on a
+    slow one. The factor is dimensionless, so one threshold is right everywhere.
+
+    `?rows=false` skips the per-table row counts, which are exact but not cheap
+    (a `count(*)` over a full transaction_items), and are cached for a minute
+    regardless.
+    """
+    state_rows = query("SELECT mode, is_running, is_paused, tick_interval_seconds, "
+                       "last_tick_at FROM control.generator_state WHERE state_id = 1",
+                       None, industry)
+    state = state_rows[0] if state_rows else {}
+    if not state:
+        raise HTTPException(503, "Generator state not initialised")
+
+    interval = int(state.get("tick_interval_seconds") or DEFAULT_TICK_INTERVAL_SECONDS)
+    window_row = _tick_window(industry, window)
+    # `now` is the database's own clock, the same one that stamps `recorded_at`,
+    # so a container-clock skew cannot manufacture or hide a staleness figure.
+    now = query("SELECT NOW() AS n", None, industry)[0]["n"]
+
+    computed = _tick_metrics(window_row, state, interval, now,
+                             metrics_alert_threshold())
+
+    computed["industry"] = industry
+    computed["generator"] = {
+        "mode": state.get("mode"),
+        "is_running": state.get("is_running"),
+        "is_paused": state.get("is_paused"),
+        "last_tick_at": state.get("last_tick_at"),
+        "active_scenario": (query(
+            "SELECT active_scenario FROM control.generator_state WHERE state_id = 1",
+            None, industry)[0].get("active_scenario")
+            if state_rows else None),
+    }
+    computed["ledger_volume"] = {
+        "pos_transactions": window_row.get("pos_rows"),
+        "orders": window_row.get("orders_rows"),
+    }
+
+    if rows:
+        computed["rows"] = _rows_by_table(industry)
+    else:
+        computed["rows"] = []
+
+    if fmt == "json":
+        # FastAPI would serialise the dict itself, but the values carry
+        # `datetime`/`Decimal` from psycopg2, so this renders through `default=str`
+        # explicitly rather than letting a `json.dumps` failure surface as a 500
+        # on a route whose whole job is to always answer.
+        return JSONResponse(json.loads(json.dumps(computed, default=str)))
+    return PlainTextResponse(_render_prometheus(industry, computed, computed["rows"]))
+
+
+@app.get("/{industry}/stats/today", tags=["Stats"])
+def stats_today(industry: str):
+    pool_for(industry)
+    if industry == "support":
+        return query("""
+            SELECT
+                COALESCE(SUM(tickets_generated), 0)         AS tickets,
+                COALESCE(SUM(calls_generated), 0)           AS calls,
+                COALESCE(SUM(chat_sessions_generated), 0)   AS chats,
+                COALESCE(SUM(surveys_generated), 0)         AS surveys,
+                COUNT(*) AS ticks,
+                MIN(recorded_at) AS first_tick,
+                MAX(recorded_at) AS last_tick
+            FROM control.generation_stats
+            WHERE recorded_at >= CURRENT_DATE
+        """, None, industry)[0]
+    if industry == "grocery":
+        return query("""
+            SELECT
+                COALESCE(SUM(pos_transactions_generated), 0)  AS pos_transactions,
+                COALESCE(SUM(timeclock_events_generated), 0)  AS timeclock_events,
+                COALESCE(SUM(orders_generated), 0)            AS orders,
+                COUNT(*) AS ticks,
+                MIN(recorded_at) AS first_tick,
+                MAX(recorded_at) AS last_tick
+            FROM control.generation_stats
+            WHERE recorded_at >= CURRENT_DATE
+        """, None, industry)[0]
+    return query("""
+        SELECT
+            COALESCE(SUM(pos_transactions_generated), 0)   AS pos_transactions,
+            COALESCE(SUM(fuel_transactions_generated), 0)  AS fuel_transactions,
+            COALESCE(SUM(inventory_receipts_generated), 0) AS inventory_receipts,
+            COUNT(*) AS ticks,
+            MIN(recorded_at) AS first_tick,
+            MAX(recorded_at) AS last_tick
+        FROM control.generation_stats
+        WHERE recorded_at >= CURRENT_DATE
+    """, None, industry)[0]
+
+
 # ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Platform"])
@@ -1915,47 +2373,6 @@ def stats_generation(
         ORDER BY recorded_at DESC, stat_id DESC LIMIT %s OFFSET %s
     """, params + [page_size, offset], industry)
     return {"data": rows, "total": total, "limit": page_size, "offset": offset}
-
-
-@app.get("/{industry}/stats/today", tags=["Stats"])
-def stats_today(industry: str):
-    pool_for(industry)
-    if industry == "support":
-        return query("""
-            SELECT
-                COALESCE(SUM(tickets_generated), 0)         AS tickets,
-                COALESCE(SUM(calls_generated), 0)           AS calls,
-                COALESCE(SUM(chat_sessions_generated), 0)   AS chats,
-                COALESCE(SUM(surveys_generated), 0)         AS surveys,
-                COUNT(*) AS ticks,
-                MIN(recorded_at) AS first_tick,
-                MAX(recorded_at) AS last_tick
-            FROM control.generation_stats
-            WHERE recorded_at >= CURRENT_DATE
-        """, None, industry)[0]
-    if industry == "grocery":
-        return query("""
-            SELECT
-                COALESCE(SUM(pos_transactions_generated), 0)  AS pos_transactions,
-                COALESCE(SUM(timeclock_events_generated), 0)  AS timeclock_events,
-                COALESCE(SUM(orders_generated), 0)            AS orders,
-                COUNT(*) AS ticks,
-                MIN(recorded_at) AS first_tick,
-                MAX(recorded_at) AS last_tick
-            FROM control.generation_stats
-            WHERE recorded_at >= CURRENT_DATE
-        """, None, industry)[0]
-    return query("""
-        SELECT
-            COALESCE(SUM(pos_transactions_generated), 0)   AS pos_transactions,
-            COALESCE(SUM(fuel_transactions_generated), 0)  AS fuel_transactions,
-            COALESCE(SUM(inventory_receipts_generated), 0) AS inventory_receipts,
-            COUNT(*) AS ticks,
-            MIN(recorded_at) AS first_tick,
-            MAX(recorded_at) AS last_tick
-        FROM control.generation_stats
-        WHERE recorded_at >= CURRENT_DATE
-    """, None, industry)[0]
 
 
 # ---------------------------------------------------------------------------

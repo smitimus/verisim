@@ -146,6 +146,29 @@ class GeneratorConfig:
 
 
 @dataclass
+class ObservabilityConfig:
+    """How loudly the generator reports that it is behind realtime.
+
+    `tick_lag_alert_seconds` is the one knob this card adds, and it is the only
+    thing here: the lag itself is computed from the tick ledger
+    (`observability.TickCadence`), never configured.
+
+    The threshold is in SECONDS OF LAG, not of tick duration — it answers "is
+    the generator behind realtime by more than this?", which is the question an
+    operator has when a dashboard's data is not as current as it should be. A
+    per-tick duration threshold would be the wrong unit: at the default 30s
+    cadence a 45s tick is late but healthy, and a 45s tick against a 300s
+    interval is neither.
+
+    120s is four default-cadence ticks. A lag that small still leaves the
+    generator writing ~99.9% of the day it owes, so crossing it is worth a look
+    rather than a page — raise it on a slower box, lower it to catch the first
+    sign of trouble.
+    """
+    tick_lag_alert_seconds: float = 120.0
+
+
+@dataclass
 class CouponConfig:
     active_at_any_time: int = 8
     valid_duration_days: int = 14
@@ -310,6 +333,7 @@ class Config:
     coupons: CouponConfig = field(default_factory=CouponConfig)
     combo_deals: ComboDealConfig = field(default_factory=ComboDealConfig)
     transport: TransportConfig = field(default_factory=TransportConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     online: OnlineConfig = field(default_factory=OnlineConfig)
     scenarios: ScenarioConfig = field(default_factory=ScenarioConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
@@ -375,6 +399,12 @@ SCHEMA = (
     (('combo_deals', 'combo_use_rate'), ('combo_deals', 'combo_use_rate')),
     # transport
     (('transport', 'cost_per_mile'), ('transport', 'cost_per_mile')),
+    # observability — the tick-lag alert threshold (t_196d8da2). Optional in
+    # every sense: an absent `observability:` block leaves the dataclass default
+    # (120s), which is also what observability.DEFAULT_ALERT_LAG_SECONDS falls
+    # back to, so an install whose config predates this card is unaffected.
+    (('observability', 'tick_lag_alert_seconds'),
+     ('observability', 'tick_lag_alert_seconds')),
     # online
     (('online', 'orders_per_day'), ('online',),
      {'min': 'orders_per_day_min', 'max': 'orders_per_day_max'}),
