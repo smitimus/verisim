@@ -113,6 +113,24 @@ def _last_order_key(body: str) -> str:
     return last_key.rsplit(".", 1)[-1]
 
 
+def _max_limit(path: str) -> int:
+    """The `le=` ceiling the route declares on its own `limit` parameter.
+
+    The live paging check must ask for a page the route will actually serve.
+    The caps are not uniform across the API by design — 24 routes cap at 5000
+    and 15 at 2000, and `/{industry}/inventory/suppliers` is one of the 2000s
+    while its five vendor siblings are 5000s — so a check that hardcoded one
+    number asked a 2000-cap route for 5000, took a 422, and read `["data"]` off
+    the error body: `KeyError: 'data'`, which looks like a paging defect and is
+    not one. Measured in CI on the t_bed5eab3 merge (148 passed, this 1 failed).
+    """
+    body = _route_source(_params(path)[1])
+    m = re.search(r"limit:\s*int\s*=\s*Query\([^)]*?le=(\d+)", body)
+    assert m, (f"{path}: no `le=` ceiling found on the route's limit "
+               f"parameter, so this check cannot know a valid page size")
+    return int(m.group(1))
+
+
 # ---------------------------------------------------------------------------
 # 1. Every route exists, and is guarded
 # ---------------------------------------------------------------------------
@@ -359,10 +377,19 @@ def test_paging_a_vendor_route_loses_no_rows(quiesced_generator):
         total = client.get(path, params={"limit": 1}).json()["total"]
         if total == 0:
             continue
-        page = client.get(path, params={"limit": 5000}).json()
+        # Ask for the largest page THIS route will serve, not a hardcoded
+        # number: the `le=` ceilings differ per route, and over-asking is a
+        # 422 whose body has no `data` key — a KeyError that reads like a
+        # paging bug. See `_max_limit`.
+        cap = _max_limit(path)
+        resp = client.get(path, params={"limit": cap})
+        assert resp.status_code == 200, (
+            f"{path} returned {resp.status_code} for limit={cap}, its own "
+            f"declared ceiling: {resp.text[:200]}")
+        page = resp.json()
         seen = {row[primary_key] for row in page["data"]}
-        assert len(seen) == min(total, 5000), (
+        assert len(seen) == min(total, cap), (
             f"{path}: one page returned {len(seen)} distinct {primary_key} for "
-            f"a total of {min(total, 5000)}")
+            f"a total of {min(total, cap)}")
         assert len(page["data"]) == len(seen), (
             f"{path}: the page returned a duplicate {primary_key}")
