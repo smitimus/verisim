@@ -186,15 +186,21 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
+      # Same contract as grocery's, from the same script — one convention, one
+      # implementation. See verisim-grocery.yml for what this replaced: a main
+      # push used to publish `:${GITHUB_SHA}` and no version at all, which is how
+      # 18 of the 28 tags on smiti/verisim-grocery ended up as bare SHAs
+      # (t_4b05829c). Gas-station had the same defect and the same fix.
       - name: Compute tags
         id: meta
         if: github.event_name != 'pull_request'
         run: |
-          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+          bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"
+          {
+            echo "::notice title=Published version::${IMAGE_NAME} will be tagged :${VERSION}"
+            echo "tags:"
+            echo "${tags}"
+          }
 
       - name: Push to Docker Hub
         if: github.event_name != 'pull_request'

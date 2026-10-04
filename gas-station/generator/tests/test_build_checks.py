@@ -197,3 +197,85 @@ def test_checkers_do_not_read_sys_argv_at_import(name):
         f"path pytest was given, not the repo root. Derive CHECKOUT from "
         f"pathlib.Path(__file__).resolve().parents[1] instead."
     )
+
+
+# ── the publish-tag convention ──────────────────────────────────────────────
+
+def test_published_tags_are_versions_not_commit_shas():
+    """A registry tag must be a tracked version, never a bare commit SHA.
+
+    The measured failure (t_4b05829c): both workflows' `Compute tags` step
+    assigned `:${GITHUB_SHA}` on a main push, so 18 of the 28 tags on
+    smiti/verisim-grocery were 40-character SHAs and the last versioned release
+    was v1.3.3 on 2026-09-21. The run was green throughout — a green CI run is
+    not a published artifact, and it was not a readable one either.
+
+    The convention now lives in `.github/scripts/compute-push-tags.sh`, keyed to
+    the VERSION file at the repo root. This asserts the whole chain: VERSION is a
+    version, it agrees with pyproject, both workflows route through the script
+    rather than inlining their own, and the script as executed emits the version
+    for both a main push and a v* tag push.
+    """
+    check = _load("check_publish_tags")
+    assert check.main() == 0, "check_publish_tags failed — see its output above"
+
+
+def test_publish_tag_gate_has_teeth(tmp_path):
+    """RED: re-introduce the SHA-only tag computation and the gate must fail.
+
+    A gate nobody has watched fail is a gate that does not work. The claim in
+    the test above is that `check_publish_tags` catches the exact defect it was
+    written for, so this plants that defect in a copy of the repo and requires a
+    failure. `main(root)` exists for this: the checker resolves the real checkout
+    from its own location (t_a6ecb731), so a mutated copy has to be handed to it
+    explicitly.
+    """
+    check = _load("check_publish_tags")
+    tree = _mini_tree(tmp_path, "repo_sha_tags")
+    # The clean copy must pass first, or the failing assertion below proves
+    # nothing about the mutation.
+    assert check.main(tree) == 0, "the unmutated copy must pass"
+
+    workflow = tree / ".github" / "workflows" / "verisim-grocery.yml"
+    workflow.write_text(workflow.read_text().replace(
+        'bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"',
+        'echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"',
+    ))
+    assert check.main(tree) != 0, (
+        "an inlined :${GITHUB_SHA} tag computation must fail the gate — that is "
+        "the t_4b05829c bug (18 of 28 registry tags were bare SHAs)"
+    )
+
+
+def test_publish_tag_gate_catches_a_missing_version_file(tmp_path):
+    """RED: delete VERSION and the gate must fail rather than fall back to a SHA.
+
+    The card's real complaint is that a publish can succeed while tagging the
+    image with an opaque identifier. If losing VERSION silently degraded to the
+    SHA, the gate would have to be rewritten to catch it — so losing it is a
+    failure, asserted here.
+    """
+    check = _load("check_publish_tags")
+    tree = _mini_tree(tmp_path, "repo_no_version")
+    assert check.main(tree) == 0
+
+    (tree / "VERSION").unlink()
+    assert check.main(tree) != 0, "a missing VERSION must fail the gate"
+
+
+def test_publish_tag_gate_catches_a_pyproject_drift(tmp_path):
+    """Two files naming the same version is still two files — so a drift is loud.
+
+    pyproject's version was 0.1.0 and had never been bumped, which is part of
+    why nothing tracked a release number. Bumping it to match VERSION means the
+    two must now agree, or the release name is ambiguous.
+    """
+    check = _load("check_publish_tags")
+    tree = _mini_tree(tmp_path, "repo_version_drift")
+    assert check.main(tree) == 0
+
+    pyproject = tree / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text().replace(
+        'version = "1.3.4"', 'version = "0.1.0"', 1))
+
+    assert check.main(tree) != 0, "a VERSION/pyproject drift must fail the gate"

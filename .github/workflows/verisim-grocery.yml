@@ -9,6 +9,12 @@ on:
 
 env:
   IMAGE_NAME: smiti/verisim-grocery
+  # The registry our own image pins name, not just the public one. data-lab pins
+  # verisim-grocery BY DIGEST in this registry (verisim-grocery/compose.yaml +
+  # docs/image-pins.lock), so a release that exists only on Docker Hub is invisible
+  # to every slot. See "Two registries, one build" below.
+  REGISTRY_NAME: gitea.afastbox.com
+  REGISTRY_IMAGE: gitea.afastbox.com/admin/verisim-grocery
 
 jobs:
   test:
@@ -125,13 +131,13 @@ jobs:
         run: docker rm -f verisim-test 2>/dev/null || true
 
   publish:
-    name: Push to Docker Hub
+    name: Push to Docker Hub + our registry
     runs-on: ubuntu-latest
     needs: [test, integration]
     # Runs for a main/version-tag push (and publishes), and for a pull request, where it
     # deliberately skips publishing: a fork cannot see the repository secrets. Which of
     # the two branches this job takes is decided by the EVENT and never by whether the
-    # credential happens to be empty — see "Require Docker Hub credentials" below.
+    # credential happens to be empty — see "Require publish credentials" below.
     if: >-
       github.event_name == 'pull_request' ||
       (github.event_name == 'push' &&
@@ -139,6 +145,8 @@ jobs:
     env:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -148,19 +156,28 @@ jobs:
       # up the stale tag. On main and on v* tags an absent (or unusable) credential has to
       # be loud. Pull requests are the only skip, and that skip is the event's, not the
       # secret's — a release can therefore never be skipped silently again.
-      - name: Require Docker Hub credentials
+      #
+      # BOTH credential pairs are required, and that is deliberate rather than strict:
+      # data-lab pins by digest in OUR registry, so a release that reaches Docker Hub but
+      # not gitea.afastbox.com is unusable to every slot — that exact gap blocked
+      # data-dev's t_3f078e61 for hours on 2026-10-04 and needed a hand-mirror to clear
+      # (t_94476148). Half a publish is the failure mode this step exists to prevent, so
+      # the Gitea pair is mandatory rather than best-effort: warn-and-skip is how the gap
+      # opened in the first place, and it happened twice in one day.
+      - name: Require publish credentials
         if: github.event_name != 'pull_request'
         run: |
           missing=""
-          if [ -z "${DOCKER_USERNAME}" ]; then missing="DOCKER_USERNAME"; fi
-          if [ -z "${DOCKER_PASSWORD}" ]; then
-            missing="${missing:+${missing} and }DOCKER_PASSWORD"
-          fi
+          for var in DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD; do
+            if [ -z "${!var}" ]; then
+              missing="${missing:+${missing}, }${var}"
+            fi
+          done
           if [ -n "${missing}" ]; then
-            echo "::error title=Missing Docker Hub credential::Cannot publish ${IMAGE_NAME} for ${GITHUB_REF_NAME}: the repository secret(s) ${missing} are not set. Add them under smitimus/verisim -> Settings -> Secrets and variables -> Actions (DOCKER_USERNAME = the Docker Hub account, DOCKER_PASSWORD = a Docker Hub access token with read/write on ${IMAGE_NAME}). Publishing on main and on version tags is required, so this run fails instead of skipping."
+            echo "::error title=Missing publish credential::Cannot publish ${IMAGE_NAME} for ${GITHUB_REF_NAME}: the repository secret(s) ${missing} are not set. Add them under smitimus/verisim -> Settings -> Secrets and variables -> Actions: DOCKER_USERNAME/DOCKER_PASSWORD are the Docker Hub account and a token with read/write on ${IMAGE_NAME}; REGISTRY_USERNAME/REGISTRY_PASSWORD are the ${REGISTRY_NAME} account and a token with write on package ${REGISTRY_IMAGE}. Both registries are required: data-lab pins this image by digest in ${REGISTRY_IMAGE}, so a release published to only one of them cannot be pulled by a slot. Publishing on main and on version tags is required, so this run fails instead of skipping."
             exit 1
           fi
-          echo "Docker Hub credentials are present (DOCKER_USERNAME=${DOCKER_USERNAME})."
+          echo "Publish credentials are present (Docker Hub user=${DOCKER_USERNAME}, registry user=${REGISTRY_USERNAME})."
 
       - name: Set up Docker Buildx
         if: github.event_name != 'pull_request'
@@ -173,17 +190,68 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
+      - name: Log in to our registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_NAME }}
+          username: ${{ env.REGISTRY_USERNAME }}
+          password: ${{ env.REGISTRY_PASSWORD }}
+
+      # The tag convention lives in ONE script, shared with the gas-station workflow,
+      # because it used to be duplicated here and the two could drift.
+      #
+      # What it changed: a main push used to publish `:${GITHUB_SHA}` and nothing
+      # else, so the registry filled with 40-character tags and the only version
+      # tags were the v* tag pushes — 18 of the 28 tags on smiti/verisim-grocery
+      # were bare SHAs on 2026-10-04, and the last versioned release was v1.3.3
+      # on 2026-09-21 (t_4b05829c). A version you can read in the registry is now
+      # the tracked VERSION file at the repo root, and the script refuses to
+      # publish rather than falling back to the SHA: no VERSION, a malformed one,
+      # a pyproject drift, or a v* tag that disagrees with VERSION all fail the
+      # job by name.
+      #
+      # It is ALSO the only thing that names the second registry's refs, which is the
+      # reconciliation this step exists to be (t_e1b1de67). PR #9 computed the Gitea
+      # refs inline HERE while t_4b05829c moved the Hub refs into the script; the two
+      # touched the same hunk, so whichever merged second silently dropped the other.
+      # Now one script owns every tag name for both registries, and
+      # REQUIRE_SECOND_REGISTRY makes an unset REGISTRY_IMAGE a loud failure rather
+      # than a Hub-only publish — the four-secret gate above would still pass in that
+      # case, so the protection has to live here as well.
+      #
+      # The script emits the refs the verification step below re-reads: hub_ref,
+      # registry_ref and version_ref, all as GITHUB_OUTPUT keys.
       - name: Compute tags
         id: meta
         if: github.event_name != 'pull_request'
         run: |
-          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+          REGISTRY_IMAGE="${REGISTRY_IMAGE}" REQUIRE_SECOND_REGISTRY=true \
+            bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"
+          {
+            echo "::notice title=Published version::${IMAGE_NAME} will be tagged :${VERSION}, and ${REGISTRY_IMAGE} at ${registry_version_ref#*:} / ${dev_tag}"
+            echo "hub:"
+            echo "${hub_tags}"
+            echo "registry:"
+            echo "${registry_tags}"
+          }
 
-      - name: Push to Docker Hub
+      # ONE build, ONE push, TWO registries.
+      #
+      # Every tag leaves the one push above, which is what makes the two registries
+      # hold the SAME index digest rather than merely equivalent builds. Measured on
+      # 2026-10-04 (CT106, two throwaway registries, `--provenance=true`, which is
+      # what produces the attestation): all the tags came back at one digest,
+      # sha256:d676dec5…, and the provenance statement inside it listed ALL the
+      # subject names. So the attestation does NOT fork per registry — it enumerates
+      # every reference of the one build, which is exactly why one digest can serve
+      # both.
+      #
+      # The digest pushed is the OCI INDEX, not a per-platform child: data-lab pins
+      # b1589f84… (the index), and `platforms: linux/amd64` makes buildx produce that
+      # index rather than a bare amd64 manifest. Pushing the child would produce a
+      # different digest and silently break the pin.
+      - name: Push to both registries
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
@@ -194,7 +262,18 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
 
+      # Assert the ARTIFACT, not the run status. A green job that pushed nothing is
+      # precisely the failure this repo already had once, and it is why this step reads
+      # both registries back and compares digests instead of trusting the push log.
+      - name: Verify the release is in both registries at one digest
+        if: github.event_name != 'pull_request'
+        run: |
+          bash .github/scripts/verify-release-in-both-registries.sh \
+            "${{ steps.meta.outputs.hub_ref }}" \
+            "${{ steps.meta.outputs.registry_ref }}" \
+            "${GITHUB_SHA}"
+
       - name: Publishing skipped — pull request
         if: github.event_name == 'pull_request'
         run: |
-          echo "::notice title=Docker Hub publishing skipped (pull request)::Publishing runs on pushes to main and on v* tags. A pull request cannot see the repository secrets, so it builds and tests only - nothing is published and nothing needs to be."
+          echo "::notice title=Publishing skipped (pull request)::Publishing runs on pushes to main and on v* tags. A pull request cannot see the repository secrets, so it builds and tests only - nothing is published and nothing needs to be."

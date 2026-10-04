@@ -1,6 +1,10 @@
 [project]
 name = "verisim"
-version = "0.1.0"
+# Must equal the VERSION file at the repo root — that file is what a publish
+# tags the image with, so a drift here means the package version and the
+# published version disagree. Asserted by tools/check_publish_tags.py (and by
+# compute-push-tags.sh itself, which refuses to publish on a mismatch).
+version = "1.3.4"
 description = "Verisim mock data platform"
 requires-python = ">=3.11"
 dependencies = [
