@@ -1,12 +1,31 @@
 """
-Configuration loader for the data generator.
+Configuration loader for the gas-station data generator.
 Reads /config/config.yaml (mounted from /opt/conf/data-generator/config.yaml)
 and merges with environment variables for DB connection.
+
+Validation (t_6081478a)
+-----------------------
+The YAML is applied through the declarative SCHEMA below rather than a chain of
+``if '<key>' in block`` tests, so a typo is a startup/reload error instead of a
+silently ignored line. SCHEMA is the authoritative list of keys this generator
+reads: when you add a field to Config, add it to SCHEMA too. KNOWN_UNUSED holds
+keys we deliberately accept but do not read, each with the reason, so a
+shipped-but-inert key warns rather than fails.
+
+Types are not restated in the table. Each value is coerced to the annotation on
+the dataclass field SCHEMA points at, so the schema cannot drift from the
+dataclass it describes.
 """
+import logging
 import os
+
 import yaml
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import Dict, List
+
+from config_schema import length, validate_and_apply
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -102,6 +121,74 @@ class Config:
     initial_product_count: int = 200
 
 
+# ---------------------------------------------------------------------------
+# Schema — every key this generator reads, as (yaml_path, attr_path).
+# See grocery/generator/config.py for the full explanation of the rule shapes.
+# ---------------------------------------------------------------------------
+SCHEMA = (
+    # generator
+    (('generator', 'tick_interval_seconds'), ('generator', 'tick_interval_seconds')),
+    (('generator', 'simulation_minutes_per_tick'), ('generator', 'simulation_minutes_per_tick')),
+    # locations
+    (('locations', 'count'), ('locations', 'count')),
+    (('locations', 'employees_per_location'), ('locations',),
+     {'min': 'employees_per_location_min', 'max': 'employees_per_location_max'}),
+    (('locations', 'pumps_per_location'), ('locations',),
+     {'min': 'pumps_per_location_min', 'max': 'pumps_per_location_max'}),
+    # volumes
+    (('volumes', 'pos_transactions_per_day'), ('volumes',),
+     {'min': 'pos_transactions_per_day_min', 'max': 'pos_transactions_per_day_max'}),
+    (('volumes', 'fuel_transactions_per_day'), ('volumes',),
+     {'min': 'fuel_transactions_per_day_min', 'max': 'fuel_transactions_per_day_max'}),
+    # The scenario engine scales volume by weight x 24, which assumes the 24
+    # weights sum to 1.0. The shipped gas-station config.yaml sums to 1.06, and
+    # the loader normalized it away silently; the sum is now checked here, with
+    # the fix (normalize) applied in _apply_yaml so the check and the
+    # correction cannot disagree.
+    (('volumes', 'hourly_weights'), ('volumes', 'hourly_weights'), None, length(24)),
+    (('volumes', 'day_of_week_multipliers'), ('volumes', 'day_of_week_multipliers')),
+    # loyalty
+    (('loyalty', 'signup_rate'), ('loyalty', 'signup_rate')),
+    (('loyalty', 'loyalty_usage_rate'), ('loyalty', 'loyalty_usage_rate')),
+    # pricing
+    (('pricing', 'fuel_price_change_frequency_days'), ('pricing', 'fuel_price_change_frequency_days')),
+    (('pricing', 'fuel_price_change_pct_max'), ('pricing', 'fuel_price_change_pct_max')),
+    (('pricing', 'product_price_change_frequency_days'), ('pricing', 'product_price_change_frequency_days')),
+    (('pricing', 'tax_rate'), ('pricing', 'tax_rate')),
+    # inventory
+    (('inventory', 'initial_stock_per_product'), ('inventory', 'initial_stock_per_product')),
+    (('inventory', 'restock_threshold_pct'), ('inventory', 'restock_threshold_pct')),
+    # scenarios
+    (('scenarios', 'rush_hour', 'volume_multiplier'), ('scenarios', 'rush_hour_multiplier')),
+    (('scenarios', 'rush_hour', 'hours'), ('scenarios', 'rush_hour_hours')),
+    (('scenarios', 'weekend', 'volume_multiplier'), ('scenarios', 'weekend_multiplier')),
+    (('scenarios', 'promotion', 'discount_pct'), ('scenarios', 'promotion_discount_pct')),
+    (('scenarios', 'promotion', 'affected_categories'), ('scenarios', 'promotion_categories')),
+    (('scenarios', 'fuel_spike', 'price_increase_pct'), ('scenarios', 'fuel_spike_increase_pct')),
+    # products
+    (('products', 'initial_count'), ('initial_product_count',)),
+    (('products', 'categories'), ('product_categories',)),
+)
+
+# Keys this product accepts but does not read. They WARN (logged on every
+# reload) rather than failing, because installs already ship them and removing
+# them is a config change of its own — but nothing reads them, so they must not
+# be left looking effective. Measured dead as of t_6081478a:
+#   scenarios.promotion.duration_hours
+#   scenarios.fuel_spike.duration_hours
+#   inventory.restock_check_frequency_hours
+#   (the last is a dataclass field with no reader anywhere in this product)
+KNOWN_UNUSED = {
+    ('scenarios', 'promotion', 'duration_hours'):
+        'not read; the promotion scenario lasts as long as the scenario is active',
+    ('scenarios', 'fuel_spike', 'duration_hours'):
+        'not read; the fuel_spike scenario lasts as long as the scenario is active',
+    ('inventory', 'restock_check_frequency_hours'):
+        'not read by this generator (no ordering loop); the dataclass field '
+        'exists but nothing consults it',
+}
+
+
 def _load_yaml(path: str) -> dict:
     try:
         with open(path, 'r') as f:
@@ -125,7 +212,12 @@ def load_config() -> Config:
 
 
 def reload_config(cfg: Config) -> Config:
-    """Re-read the YAML file and return an updated Config (keeps DB env vars)."""
+    """Re-read the YAML file and return an updated Config (keeps DB env vars).
+
+    A rejected document RAISES rather than returning: the caller is a generator
+    mid-run, and quietly continuing on the previous config would hide the very
+    misconfiguration being reported.
+    """
     new_cfg = Config(
         db_host=cfg.db_host,
         db_port=cfg.db_port,
@@ -141,94 +233,39 @@ def reload_config(cfg: Config) -> Config:
 def _apply_yaml(cfg: Config, data: dict) -> None:
     if not data:
         return
+    data = _normalize_hourly_weights(data)
+    for warning in validate_and_apply(cfg, data, SCHEMA, unused=KNOWN_UNUSED,
+                                      path_hint=cfg.conf_path, product='gas-station'):
+        log.warning('config.yaml: %s', warning)
 
-    gen = data.get('generator', {})
-    if 'tick_interval_seconds' in gen:
-        cfg.generator.tick_interval_seconds = int(gen['tick_interval_seconds'])
-    if 'simulation_minutes_per_tick' in gen:
-        cfg.generator.simulation_minutes_per_tick = int(gen['simulation_minutes_per_tick'])
 
-    loc = data.get('locations', {})
-    if 'count' in loc:
-        cfg.locations.count = int(loc['count'])
-    epl = loc.get('employees_per_location', {})
-    if 'min' in epl:
-        cfg.locations.employees_per_location_min = int(epl['min'])
-    if 'max' in epl:
-        cfg.locations.employees_per_location_max = int(epl['max'])
-    ppl = loc.get('pumps_per_location', {})
-    if 'min' in ppl:
-        cfg.locations.pumps_per_location_min = int(ppl['min'])
-    if 'max' in ppl:
-        cfg.locations.pumps_per_location_max = int(ppl['max'])
+def _normalize_hourly_weights(data: dict) -> dict:
+    """Rescale the 24 hourly weights to sum to 1.0 before validation.
 
-    vol = data.get('volumes', {})
-    pos_d = vol.get('pos_transactions_per_day', {})
-    if 'min' in pos_d:
-        cfg.volumes.pos_transactions_per_day_min = int(pos_d['min'])
-    if 'max' in pos_d:
-        cfg.volumes.pos_transactions_per_day_max = int(pos_d['max'])
-    fuel_d = vol.get('fuel_transactions_per_day', {})
-    if 'min' in fuel_d:
-        cfg.volumes.fuel_transactions_per_day_min = int(fuel_d['min'])
-    if 'max' in fuel_d:
-        cfg.volumes.fuel_transactions_per_day_max = int(fuel_d['max'])
-    if 'hourly_weights' in vol:
-        # The scenario engine scales volume by (weight * 24), which assumes the
-        # 24 weights sum to 1.0. Normalize whatever the user provided.
-        raw = [float(x) for x in vol['hourly_weights']]
-        total = sum(raw)
-        if len(raw) == 24 and total > 0:
-            cfg.volumes.hourly_weights = [w / total for w in raw]
-    if 'day_of_week_multipliers' in vol:
-        cfg.volumes.day_of_week_multipliers = {k: float(v) for k, v in vol['day_of_week_multipliers'].items()}
-
-    loy = data.get('loyalty', {})
-    if 'signup_rate' in loy:
-        cfg.loyalty.signup_rate = float(loy['signup_rate'])
-    if 'loyalty_usage_rate' in loy:
-        cfg.loyalty.loyalty_usage_rate = float(loy['loyalty_usage_rate'])
-
-    pri = data.get('pricing', {})
-    if 'fuel_price_change_frequency_days' in pri:
-        cfg.pricing.fuel_price_change_frequency_days = float(pri['fuel_price_change_frequency_days'])
-    if 'fuel_price_change_pct_max' in pri:
-        cfg.pricing.fuel_price_change_pct_max = float(pri['fuel_price_change_pct_max'])
-    if 'product_price_change_frequency_days' in pri:
-        cfg.pricing.product_price_change_frequency_days = float(pri['product_price_change_frequency_days'])
-    if 'tax_rate' in pri:
-        cfg.pricing.tax_rate = float(pri['tax_rate'])
-
-    inv = data.get('inventory', {})
-    if 'initial_stock_per_product' in inv:
-        cfg.inventory.initial_stock_per_product = int(inv['initial_stock_per_product'])
-    if 'restock_threshold_pct' in inv:
-        cfg.inventory.restock_threshold_pct = float(inv['restock_threshold_pct'])
-
-    sc = data.get('scenarios', {})
-    rh = sc.get('rush_hour', {})
-    if 'volume_multiplier' in rh:
-        cfg.scenarios.rush_hour_multiplier = float(rh['volume_multiplier'])
-    if 'hours' in rh:
-        cfg.scenarios.rush_hour_hours = list(rh['hours'])
-
-    we = sc.get('weekend', {})
-    if 'volume_multiplier' in we:
-        cfg.scenarios.weekend_multiplier = float(we['volume_multiplier'])
-
-    pro = sc.get('promotion', {})
-    if 'discount_pct' in pro:
-        cfg.scenarios.promotion_discount_pct = float(pro['discount_pct'])
-    if 'affected_categories' in pro:
-        cfg.scenarios.promotion_categories = list(pro['affected_categories'])
-
-    fs = sc.get('fuel_spike', {})
-    if 'price_increase_pct' in fs:
-        cfg.scenarios.fuel_spike_increase_pct = float(fs['price_increase_pct'])
-
-    if 'products' in data:
-        prods = data['products']
-        if 'initial_count' in prods:
-            cfg.initial_product_count = int(prods['initial_count'])
-        if 'categories' in prods:
-            cfg.product_categories = prods['categories']
+    The pre-t_6081478a loader did this silently, which meant a config whose
+    weights did not sum to 1.0 looked configured and quietly ran a whole day
+    of volume 6% off (the shipped gas-station config.yaml summed to 1.06). It is
+    still normalized rather than rejected — the intent is legible and the
+    correction is unambiguous — but the correction is now logged, so the file
+    and the running generator cannot silently disagree.
+    """
+    vol = data.get('volumes')
+    if not isinstance(vol, dict):
+        return data
+    raw = vol.get('hourly_weights')
+    if not isinstance(raw, list) or len(raw) != 24:
+        return data
+    try:
+        weights = [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return data  # let the schema report the type error, with its own message
+    total = sum(weights)
+    if total <= 0 or abs(total - 1.0) <= 1e-6:
+        return data
+    data = dict(data)
+    data['volumes'] = dict(vol)
+    data['volumes']['hourly_weights'] = [w / total for w in weights]
+    log.warning('config.yaml: volumes.hourly_weights summed to %.6f, not 1.0 — '
+                'rescaled to 1.0 (volume is weight x 24, so the sum sets the '
+                'day\'s total).', total)
+    return data

@@ -1,11 +1,28 @@
 """
 Configuration loader for the customer-support data generator.
 Reads /config/config.yaml and merges with environment variables for DB connection.
+
+Validation (t_6081478a)
+-----------------------
+The YAML is applied through the declarative SCHEMA below rather than a chain of
+``if '<key>' in block`` tests, so a typo is a startup/reload error instead of a
+silently ignored line. SCHEMA is the authoritative list of keys this generator
+reads: when you add a field to Config, add it to SCHEMA too.
+
+Types are not restated in the table. Each value is coerced to the annotation on
+the dataclass field SCHEMA points at, so the schema cannot drift from the
+dataclass it describes.
 """
+import logging
 import os
+
 import yaml
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import Dict, List
+
+from config_schema import length, validate_and_apply
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -20,8 +37,7 @@ class VolumeConfig:
         0.0113, 0.0057, 0.0038, 0.0028, 0.0038, 0.0085,
         0.0236, 0.0491, 0.0736, 0.0868, 0.0913, 0.0849,
         0.0717, 0.0679, 0.0736, 0.0717, 0.0642, 0.0547,
-        0.0425, 0.0330, 0.0264, 0.0208, 0.0160, 0.0123]
-    )
+        0.0425, 0.0330, 0.0264, 0.0208, 0.0160, 0.0123])
     day_of_week_multipliers: Dict[str, float] = field(default_factory=lambda: {
         'monday': 1.30, 'tuesday': 1.05, 'wednesday': 0.98,
         'thursday': 0.97, 'friday': 1.02, 'saturday': 0.62, 'sunday': 0.55
@@ -113,6 +129,75 @@ class Config:
     scenarios: ScenarioConfig = field(default_factory=ScenarioConfig)
 
 
+# ---------------------------------------------------------------------------
+# Schema — every key this generator reads, as (yaml_path, attr_path).
+# See grocery/generator/config.py for the full explanation of the rule shapes.
+# ---------------------------------------------------------------------------
+SCHEMA = (
+    # generator
+    (('generator', 'tick_interval_seconds'), ('generator', 'tick_interval_seconds')),
+    (('generator', 'simulation_minutes_per_tick'), ('generator', 'simulation_minutes_per_tick')),
+    # locations
+    (('locations', 'contact_center_count'), ('locations', 'contact_center_count')),
+    (('locations', 'satellite_count'), ('locations', 'satellite_count')),
+    (('locations', 'agents_per_location'), ('locations',),
+     {'min': 'agents_per_location_min', 'max': 'agents_per_location_max'}),
+    # volumes
+    (('volumes', 'tickets_per_day'), ('volumes',),
+     {'min': 'tickets_per_day_min', 'max': 'tickets_per_day_max'}),
+    (('volumes', 'calls_per_day'), ('volumes',),
+     {'min': 'calls_per_day_min', 'max': 'calls_per_day_max'}),
+    (('volumes', 'chats_per_day'), ('volumes',),
+     {'min': 'chats_per_day_min', 'max': 'chats_per_day_max'}),
+    # The scenario engine scales volume by weight x 24, which assumes the 24
+    # weights sum to 1.0. The pre-t_6081478a loader normalized a bad sum away
+    # silently; it is still normalized (see _normalize_hourly_weights) but now
+    # logged, so the file and the running generator cannot disagree quietly.
+    (('volumes', 'hourly_weights'), ('volumes', 'hourly_weights'), None, length(24)),
+    (('volumes', 'day_of_week_multipliers'), ('volumes', 'day_of_week_multipliers')),
+    # queues
+    (('queues', 'ticket_weight'), ('queues', 'ticket_weight')),
+    (('queues', 'phone_share'), ('queues', 'phone_share')),
+    (('queues', 'chat_share'), ('queues', 'chat_share')),
+    (('queues', 'email_share'), ('queues', 'email_share')),
+    (('queues', 'web_share'), ('queues', 'web_share')),
+    (('queues', 'social_share'), ('queues', 'social_share')),
+    (('queues', 'abandonment_rate'), ('queues', 'abandonment_rate')),
+    (('queues', 'transfer_rate'), ('queues', 'transfer_rate')),
+    (('queues', 'first_contact_resolution_rate'), ('queues', 'first_contact_resolution_rate')),
+    (('queues', 'reopen_rate'), ('queues', 'reopen_rate')),
+    # customers
+    (('customers', 'initial_customer_count'), ('customers', 'initial_customer_count')),
+    (('customers', 'new_customer_daily'), ('customers',),
+     {'min': 'new_customer_daily_min', 'max': 'new_customer_daily_max'}),
+    (('customers', 'repeat_contact_rate'), ('customers', 'repeat_contact_rate')),
+    # surveys
+    (('surveys', 'response_rate_voice'), ('surveys', 'response_rate_voice')),
+    (('surveys', 'response_rate_chat'), ('surveys', 'response_rate_chat')),
+    (('surveys', 'response_rate_ticket'), ('surveys', 'response_rate_ticket')),
+    (('surveys', 'detractor_shift'), ('surveys', 'detractor_shift')),
+    # training
+    (('training', 'qa_assignment_rate'), ('training', 'qa_assignment_rate')),
+    (('training', 'onboarding_within_days'), ('training', 'onboarding_within_days')),
+    # scenarios
+    (('scenarios', 'service_outage', 'volume_multiplier'), ('scenarios', 'outage_volume_multiplier')),
+    (('scenarios', 'service_outage', 'sentiment_shift'), ('scenarios', 'outage_sentiment_shift')),
+    (('scenarios', 'product_launch', 'volume_multiplier'), ('scenarios', 'product_launch_multiplier')),
+    (('scenarios', 'holiday_week', 'volume_multiplier'), ('scenarios', 'holiday_multiplier')),
+    (('scenarios', 'weather_outage', 'volume_multiplier'), ('scenarios', 'weather_outage_multiplier')),
+    (('scenarios', 'marketing_blast', 'volume_multiplier'), ('scenarios', 'marketing_blast_multiplier')),
+    (('scenarios', 'rush_hour', 'volume_multiplier'), ('scenarios', 'rush_hour_multiplier')),
+    (('scenarios', 'rush_hour', 'hours'), ('scenarios', 'rush_hour_hours')),
+    (('scenarios', 'weekend', 'volume_multiplier'), ('scenarios', 'weekend_multiplier')),
+)
+
+# Keys this product accepts but does not read. None as of t_6081478a — every
+# key in the shipped support/config.yaml reached an attribute. The table stays
+# because a new inert key belongs here, documented, rather than being deleted
+# from the file and forgotten.
+KNOWN_UNUSED: Dict[tuple, str] = {}
+
+
 def _load_yaml(path: str) -> dict:
     try:
         with open(path, 'r') as f:
@@ -136,6 +221,12 @@ def load_config() -> 'Config':
 
 
 def reload_config(cfg: 'Config') -> 'Config':
+    """Re-read the YAML and return an updated Config, keeping the DB env vars.
+
+    A rejected document RAISES rather than returning: the caller is a generator
+    mid-run, and quietly continuing on the previous config would hide the very
+    misconfiguration being reported.
+    """
     new_cfg = Config(
         db_host=cfg.db_host, db_port=cfg.db_port,
         db_user=cfg.db_user, db_password=cfg.db_password,
@@ -148,92 +239,37 @@ def reload_config(cfg: 'Config') -> 'Config':
 def _apply_yaml(cfg: 'Config', data: dict) -> None:
     if not data:
         return
+    data = _normalize_hourly_weights(data)
+    for warning in validate_and_apply(cfg, data, SCHEMA, unused=KNOWN_UNUSED,
+                                      path_hint=cfg.conf_path, product='support'):
+        log.warning('config.yaml: %s', warning)
 
-    gen = data.get('generator', {})
-    if 'tick_interval_seconds' in gen:
-        cfg.generator.tick_interval_seconds = int(gen['tick_interval_seconds'])
-    if 'simulation_minutes_per_tick' in gen:
-        cfg.generator.simulation_minutes_per_tick = int(gen['simulation_minutes_per_tick'])
 
-    loc = data.get('locations', {})
-    if 'contact_center_count' in loc:
-        cfg.locations.contact_center_count = int(loc['contact_center_count'])
-    if 'satellite_count' in loc:
-        cfg.locations.satellite_count = int(loc['satellite_count'])
-    apl = loc.get('agents_per_location', {})
-    if 'min' in apl:
-        cfg.locations.agents_per_location_min = int(apl['min'])
-    if 'max' in apl:
-        cfg.locations.agents_per_location_max = int(apl['max'])
+def _normalize_hourly_weights(data: dict) -> dict:
+    """Rescale the 24 hourly weights to sum to 1.0 before validation.
 
-    vol = data.get('volumes', {})
-    for key, attr in [('tickets_per_day', 'tickets_per_day'),
-                      ('calls_per_day', 'calls_per_day'),
-                      ('chats_per_day', 'chats_per_day')]:
-        d = vol.get(key, {})
-        if 'min' in d:
-            setattr(cfg.volumes, f'{attr}_min', int(d['min']))
-        if 'max' in d:
-            setattr(cfg.volumes, f'{attr}_max', int(d['max']))
-    if 'hourly_weights' in vol:
-        # The scenario engine scales volume by (weight * 24), which assumes the
-        # 24 weights sum to 1.0. Normalize whatever the user provided.
-        raw = [float(x) for x in vol['hourly_weights']]
-        total = sum(raw)
-        if len(raw) == 24 and total > 0:
-            cfg.volumes.hourly_weights = [w / total for w in raw]
-    if 'day_of_week_multipliers' in vol:
-        cfg.volumes.day_of_week_multipliers = {k: float(v) for k, v in vol['day_of_week_multipliers'].items()}
-
-    q = data.get('queues', {})
-    if 'ticket_weight' in q:
-        cfg.queues.ticket_weight = {k: float(v) for k, v in q['ticket_weight'].items()}
-    for key in ['phone_share', 'chat_share', 'email_share', 'web_share', 'social_share',
-                'abandonment_rate', 'transfer_rate', 'first_contact_resolution_rate', 'reopen_rate']:
-        if key in q:
-            setattr(cfg.queues, key, float(q[key]))
-
-    cust = data.get('customers', {})
-    if 'initial_customer_count' in cust:
-        cfg.customers.initial_customer_count = int(cust['initial_customer_count'])
-    nc = cust.get('new_customer_daily', {})
-    if 'min' in nc:
-        cfg.customers.new_customer_daily_min = int(nc['min'])
-    if 'max' in nc:
-        cfg.customers.new_customer_daily_max = int(nc['max'])
-    if 'repeat_contact_rate' in cust:
-        cfg.customers.repeat_contact_rate = float(cust['repeat_contact_rate'])
-
-    srv = data.get('surveys', {})
-    for key in ['response_rate_voice', 'response_rate_chat', 'response_rate_ticket']:
-        if key in srv:
-            setattr(cfg.surveys, key, float(srv[key]))
-    if 'detractor_shift' in srv:
-        cfg.surveys.detractor_shift = float(srv['detractor_shift'])
-
-    trn = data.get('training', {})
-    if 'qa_assignment_rate' in trn:
-        cfg.training.qa_assignment_rate = float(trn['qa_assignment_rate'])
-    if 'onboarding_within_days' in trn:
-        cfg.training.onboarding_within_days = int(trn['onboarding_within_days'])
-
-    sc = data.get('scenarios', {})
-    mapping = {
-        'service_outage': {'volume_multiplier': 'outage_volume_multiplier',
-                           'sentiment_shift': 'outage_sentiment_shift'},
-        'product_launch': {'volume_multiplier': 'product_launch_multiplier'},
-        'holiday_week': {'volume_multiplier': 'holiday_multiplier'},
-        'weather_outage': {'volume_multiplier': 'weather_outage_multiplier'},
-        'marketing_blast': {'volume_multiplier': 'marketing_blast_multiplier'},
-        'rush_hour': {'volume_multiplier': 'rush_hour_multiplier', 'hours': 'rush_hour_hours'},
-        'weekend': {'volume_multiplier': 'weekend_multiplier'},
-    }
-    for scen, keys in mapping.items():
-        block = sc.get(scen, {})
-        for ykey, attr in keys.items():
-            if ykey in block:
-                val = block[ykey]
-                if ykey == 'hours':
-                    setattr(cfg.scenarios, attr, list(val))
-                else:
-                    setattr(cfg.scenarios, attr, float(val))
+    The pre-t_6081478a loader did this silently. It is still normalized rather
+    than rejected — the intent is legible and the correction unambiguous — but
+    the correction is now logged, so the file and the running generator cannot
+    silently disagree.
+    """
+    vol = data.get('volumes')
+    if not isinstance(vol, dict):
+        return data
+    raw = vol.get('hourly_weights')
+    if not isinstance(raw, list) or len(raw) != 24:
+        return data
+    try:
+        weights = [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return data  # let the schema report the type error, with its own message
+    total = sum(weights)
+    if total <= 0 or abs(total - 1.0) <= 1e-6:
+        return data
+    data = dict(data)
+    data['volumes'] = dict(vol)
+    data['volumes']['hourly_weights'] = [w / total for w in weights]
+    log.warning('config.yaml: volumes.hourly_weights summed to %.6f, not 1.0 — '
+                'rescaled to 1.0 (volume is weight x 24, so the sum sets the '
+                'day\'s total).', total)
+    return data
