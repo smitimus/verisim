@@ -26,7 +26,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta, date
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import psycopg2
 import psycopg2.extras
@@ -678,6 +678,33 @@ def get_ad_product_prices(conn, sim_date: date) -> Dict[str, float]:
         """, (sim_date, sim_date))
         return {r[0]: float(r[1]) for r in cur.fetchall()}
 
+def _weekly_ad_prices(conn, sim_date: date,
+                      products: List[Dict]) -> Dict[str, float]:
+    """product_id -> promoted_price for the ad in force on `sim_date`, creating
+    that ad first if it does not exist yet.
+
+    THE ORDERING IS THE BUG (t_3902120b). `expire_old_ads` + `ensure_current_ad`
+    used to run from the end-of-day block, AFTER the day's hours were already
+    written. So during a backfill the ad covering the day being written did not
+    exist while that day was being written, and every ad line of that day was
+    rung at shelf price. Measured on CT107 2026-10-04 across 5 windows: 0% of
+    `start_date` lines at the advertised price for the four backfilled windows
+    (the current one was 100%, because `seed_all` had already created its ad),
+    and 0% on 2026-09-04 — the first day of history, four days into the 08-31
+    window. Same defect, different phase: an ad is absent until the day it
+    covers has been generated.
+
+    Running the lifecycle BEFORE any of the day's hours are written is what
+    makes the advertised price real on `start_date`. It is idempotent — both
+    halves no-op when the current ad already exists — so this is also the
+    repair path for a database generated before this fix: the next call
+    materialises the missing ad and the till stops charging shelf price.
+    """
+    promotions.expire_old_ads(conn, sim_date)
+    promotions.ensure_current_ad(conn, sim_date, products)
+    return get_ad_product_prices(conn, sim_date)
+
+
 def _weather_for_tick(conn, cfg, sim_date: date, weather_cache: Dict[str, object]) -> Optional[dict]:
     """The day's weather effect, generated once and cached (t_2ab1fb0a).
 
@@ -736,7 +763,11 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     # This week's ad prices: the price of record for ad items, and therefore
     # the key of the demand curve for them (t_08deeddf). One read per tick,
     # shared by both channels — the same law must see the same prices.
-    ad_prices = get_ad_product_prices(conn, sim_date)
+    #
+    # The lifecycle runs HERE, not in the midnight block below (t_3902120b):
+    # the ad covering a day has to exist before that day is sold, or the till
+    # charges shelf price for the ad's own SKUs on `start_date`.
+    ad_prices = _weekly_ad_prices(conn, sim_date, products)
 
     # Stock-aware capping (t_959cd040). ONE allowance for the whole tick, shared
     # by both channels: POS and online sell the same shelf, so they must draw
@@ -822,9 +853,13 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         shrinkage.set_expiry_dates(conn, sim_dt)
         shrinkage.generate_shrinkage_events(conn, sim_dt, locations['stores'], scenario)
 
-        # Phase 3: weekly ad lifecycle
-        promotions.expire_old_ads(conn, sim_dt.date())
-        promotions.ensure_current_ad(conn, sim_dt.date(), products)
+        # Phase 3: weekly ad lifecycle — ALREADY DONE, per simulated hour,
+        # before any of the day's sales are written (t_3902120b). Running it
+        # here as well was the bug: an ad was created only after the day it
+        # covers had already been rung at shelf price, so `start_date` carried
+        # none of its own discount. Left idempotent-free deliberately — calling
+        # it twice a day would buy nothing and re-flag is_on_ad for free.
+        # `_weekly_ad_prices` inside the hour loop owns this phase.
 
         # Phase 4: labor scheduling (generate next week) + resolve yesterday's actuals
         scheduling.resolve_schedule_actuals(conn, sim_dt.date(), scenario)
@@ -992,8 +1027,12 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             online_count = compute_online_count(cfg, scenario, SIM_HOUR_SECONDS, cur_date)
             # The ad in force for the BACKFILLED date, not today's: a backfill
             # hour must see the price of record of the day it is writing, or
-            # the ad signal lands on the wrong dates (t_08deeddf).
-            ad_prices = get_ad_product_prices(conn, cur_date)
+            # the ad signal lands on the wrong dates (t_08deeddf). The
+            # lifecycle runs inside this call so the ad covering `cur_date`
+            # already exists before any hour of it is written — which is what
+            # puts the advertised price on the till on `start_date` itself
+            # (t_3902120b).
+            ad_prices = _weekly_ad_prices(conn, cur_date, products)
 
             # Same one-allowance-per-tick rule as the realtime path: the whole
             # simulated hour's POS + online demand is resolved against one
@@ -1089,8 +1128,8 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             sim_day_end = datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59)
             shrinkage.set_expiry_dates(conn, sim_day_end)
             shrinkage.generate_shrinkage_events(conn, sim_day_end, locations['stores'], eod_scenario)
-            promotions.expire_old_ads(conn, cur_date)
-            promotions.ensure_current_ad(conn, cur_date, products)
+            # Weekly ad lifecycle ran per simulated hour, before those hours
+            # were written (t_3902120b) — see `_weekly_ad_prices`.
             scheduling.resolve_schedule_actuals(conn, cur_date, eod_scenario)
             scheduling.generate_weekly_schedule(conn, cur_date, locations, employees, eod_scenario)
             # Yesterday's shifts resolved under YESTERDAY's weather, exactly as
