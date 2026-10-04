@@ -72,6 +72,27 @@ the hour actually wrote (`len(depletion)`, never the planned `pos_count`) and
 backfill is simulating yesterday, so stamping the wall clock there would read as live
 progress. `grocery/api/tests/test_generation_stats.py` pins all of this.
 
+**Every naive timestamp depends on `get_connection` (t_35b4d860).** Every stamp this
+generator writes — `simulation_dt`, `transaction_dt`, `event_dt`, `placed_dt` — comes
+from a NAIVE `datetime.now()` and lands in a `TIMESTAMPTZ` column, and Postgres resolves
+a naive timestamp against the **session's** timezone. That session used to be whatever
+the *server* was configured with, which compose sets per service and which is not
+guaranteed to equal the `TZ` that `datetime.now()` was resolved against — so the stored
+instant could be wrong by whole hours while every column kept looking plausible.
+
+`get_connection` now issues `SET SESSION TIME ZONE $TZ` on the connection it returns, so
+a naive stamp means what the code that built it meant, on every topology, with no change
+to the ~60 write sites and no schema change (an existing data dir picks it up on
+restart). Deliberately NOT `UTC`: that moves the interpretation of a *local* business
+time to UTC, so a 09:00 opening would read back as 05:00 New York — the same class of
+bug, opposite direction. The zone comes from `_local_timezone_name()`, which reads the
+`TZ` env var and never `str(tzinfo)`: that yields the POSIX abbreviation `'EDT'`, which
+Postgres **rejects outright** (`invalid value for parameter "TimeZone": "EDT"` — measured,
+not assumed), which would turn a silent data bug into a generator that will not start.
+Gas-station and support have the same write path and the same pin.
+`grocery/generator/tests/test_session_timezone.py` pins all of it, including the
+abbreviation trap.
+
 Note the sibling generators were never affected: gas-station and support each write an
 inline INSERT per simulated hour in their own `run_backfill`. Grocery was the odd one out.
 

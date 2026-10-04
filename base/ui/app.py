@@ -1561,6 +1561,115 @@ SCENARIOS_BY_INDUSTRY = {
 
 
 # ---------------------------------------------------------------------------
+# Tick health (t_196d8da2) — is the generator keeping up?
+# ---------------------------------------------------------------------------
+#
+# Reads /{industry}/metrics (JSON, rows=false — the row counts are a full
+# catalogue scan and this panel refreshes every 15s).
+#
+# The headline number is the REALTIME FACTOR, not a lag in seconds, and that is a
+# deliberate choice rather than a cosmetic one. The generator's loop sleeps
+# tick_interval_seconds unconditionally, so one iteration really costs
+# `interval + tick_cost` and a generator doing honest work is always a little
+# behind: at the default 30s cadence, 0.05s/tick puts it 2.4 minutes behind a
+# simulated day and 0.5s/tick puts it 24 minutes behind. A seconds-based "lag"
+# badge would therefore be permanently non-zero on a healthy box, and the first
+# thing anyone would do is learn to ignore it.
+#
+# The factor is dimensionless, so the same reading means the same thing on a fast
+# machine and a slow one: 1.0 is realtime.
+#
+# The green/red boundary is 0.80, and it is MEASURED rather than picked for
+# tidiness (t_35b4d860). Over the dev slot's whole 37k-row tick ledger, every
+# trailing-100-tick `realtime_factor` window was recomputed and the trip rate
+# read off the distribution:
+#
+#   below 0.95 -> 4.88% of windows     below 0.90 -> 2.35%     below 0.80 -> 1.10%
+#
+# The generator is not slow — p50 tick cost is 72ms against a 30s cadence — but
+# the tail is real: 3.29% of ticks cost over a second and the slowest cost 95.7s,
+# so any window containing a spike reads low for as long as that spike stays
+# inside the trailing 100. A boundary at 0.95 would therefore paint the badge
+# red on roughly one window in twenty of a HEALTHY day, which is the definition
+# of an alert nobody reads; 0.80 holds the false-trip rate to about 1% while
+# still firing long before the generator is meaningfully behind. 0.80 at a 30s
+# cadence means ticks are collectively costing more than a fifth of the
+# interval, which is a box that genuinely needs a look.
+#
+# Module level, not inside a fragment, per the tab rules in AGENTS.md: fragment
+# bodies are a local scope, so a helper defined in one is invisible to the next.
+def _tick_health_panel(path: str):
+    metrics = api_get(path, {"fmt": "json", "rows": False})
+    if not metrics:
+        # An API older than this panel simply has no /metrics. A rolling deploy
+        # leaves a slot behind for a while, and the panel must not turn that into
+        # a red banner on the dashboard.
+        return
+
+    factor = metrics.get("realtime_factor")
+    interval = metrics.get("interval_seconds")
+    lagging = metrics.get("lagging")
+
+    h1, h2, h3, h4 = st.columns(4)
+
+    if factor is None:
+        h1.metric("Realtime Factor", "—", help="Not enough ticks in the window yet.")
+    elif factor >= 0.80:
+        h1.metric("Realtime Factor", f"{factor:.3f}",
+                  help="1.0 is realtime. Below 0.80 the ticks in the window are "
+                       "collectively costing more than a fifth of the interval. "
+                       "Short spikes dip this temporarily — the trailing window "
+                       "carries them for ~100 ticks.")
+    else:
+        h1.metric("Realtime Factor", f"{factor:.3f}",
+                  delta=f"{(1 - factor) * 100:.0f}% behind realtime", delta_color="inverse",
+                  help="Fraction of realtime actually produced: interval / "
+                       "mean seconds per loop iteration.")
+
+    mean_cost = metrics.get("mean_tick_cost_ms")
+    h2.metric("Mean Tick Cost",
+              f"{mean_cost:.0f} ms" if mean_cost is not None else "—",
+              help=f"Against a {interval}s cadence.")
+
+    overhead = metrics.get("mean_overhead_ms")
+    h3.metric("Loop Overhead",
+              f"{overhead:.0f} ms" if overhead is not None else "—",
+              help="Mean iteration cost above the interval. Non-zero on any healthy "
+                   "generator — the loop's sleep is unconditional, so a tick's own "
+                   "cost is added to the interval rather than absorbed by it.")
+
+    ticks = metrics.get("window_ticks")
+    h4.metric("Ticks Measured", f"{ticks:,}" if ticks else "—",
+              help="Ledger rows the timing summary was computed over.")
+
+    # The verdict, and the reason for it. An unexplained red badge is the thing
+    # this card exists to replace, so the note always ships with the flag.
+    if lagging:
+        stale = metrics.get("tick_staleness_seconds")
+        st.warning(
+            f"⚠️ No tick for {_fmt_duration(stale)} against a {interval}s cadence "
+            f"(quiet after {metrics.get('quiet_after_seconds')}s).",
+            icon="⚠️")
+    note = metrics.get("lagging_note") or metrics.get("skew_note")
+    if note:
+        st.caption(note)
+
+
+def _fmt_duration(seconds) -> str:
+    """Seconds as a short human string. None/absent renders as an em dash."""
+    if seconds is None:
+        return "—"
+    seconds = float(seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} min"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 86400:.1f} days"
+
+
+# ---------------------------------------------------------------------------
 # Main layout
 # ---------------------------------------------------------------------------
 
@@ -1598,6 +1707,8 @@ with tab1:
             col_tick.metric("Last Tick", last_tick[:19].replace("T", " ") if last_tick else "Never")
         else:
             st.error(f"Cannot reach API at `{pfx}/status`. Is the generator running?")
+
+        _tick_health_panel(f"{pfx}/metrics")
 
         st.divider()
 

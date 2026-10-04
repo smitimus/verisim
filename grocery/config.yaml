@@ -248,6 +248,19 @@ combo_deals:
 transport:
   cost_per_mile: 1.85              # operational cost per mile (fuel + maintenance)
 
+observability:
+  # Seconds of LAG — how far behind realtime the generator may fall before it
+  # says so — past which each tick is logged at WARNING instead of INFO.
+  # The lag is measured against a fixed-rate schedule (tick i was due at
+  # anchor + i * tick_interval_seconds), so a tick that runs fast REPAYS debt
+  # and being ahead of schedule is never reported as a problem.
+  #
+  # Not the same unit as tick duration: at 30s a 45s tick is late but healthy,
+  # and at a 300s interval it is neither. 120 is four default-cadence ticks, so
+  # the generator is still writing ~99.9% of the day it owes. Raise it on a
+  # slower box, lower it to catch the first sign of trouble (t_196d8da2).
+  tick_lag_alert_seconds: 120
+
 online:
   orders_per_day:                  # the channel's own baseline day, drawn once per
     min: 90                        # date (like pos_transactions_per_day). The

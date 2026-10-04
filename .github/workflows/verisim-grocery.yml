@@ -47,7 +47,20 @@ jobs:
           python-version: '3.11'
 
       - name: Install test deps
-        run: pip install pytest httpx
+        # The API contract tests import `base/api/main.py` itself, so every
+        # module-scope import in it is a test dependency — fastapi, pydantic,
+        # psycopg2, yaml. This job hand-listed a subset, and each missing one
+        # surfaced as a `ModuleNotFoundError` in a separate CI run (yaml, then
+        # psycopg2, then fastapi), which is three runs to discover one rule.
+        #
+        # Installing the lockfile instead of a hand-kept list means the tests get
+        # whatever the API actually needs, and a new import cannot drift the
+        # list out of step — the same reasoning as `tools/check_deps.py`
+        # (t_773c981e). pyyaml is added separately because the API reads the
+        # mounted config.yaml with it but it is not in base/api/requirements.txt.
+        run: |
+          pip install pytest httpx -r base/api/requirements.txt
+          pip install pyyaml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
