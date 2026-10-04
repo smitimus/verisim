@@ -685,14 +685,22 @@ def _weekly_ad_prices(conn, sim_date: date,
 
     THE ORDERING IS THE BUG (t_3902120b). `expire_old_ads` + `ensure_current_ad`
     used to run from the end-of-day block, AFTER the day's hours were already
-    written. So during a backfill the ad covering the day being written did not
-    exist while that day was being written, and every ad line of that day was
-    rung at shelf price. Measured on CT107 2026-10-04 across 5 windows: 0% of
-    `start_date` lines at the advertised price for the four backfilled windows
-    (the current one was 100%, because `seed_all` had already created its ad),
-    and 0% on 2026-09-04 — the first day of history, four days into the 08-31
-    window. Same defect, different phase: an ad is absent until the day it
-    covers has been generated.
+    written. So the ad covering the day being written did not exist while that
+    day was being written, and every ad line of that day was rung at shelf
+    price.
+
+    Measured 2026-10-04, both slots, per-day coverage of `promoted_price`:
+
+        CT107  day 0 of 4 backfilled windows   0.00%   (the current window 100%)
+        CT107  every other offset              100.00%
+        CT106  2026-08-22 .. 2026-10-02         0.00%   (every single day)
+        CT106  2026-10-03 / 2026-10-04        3.19% / 76.48%
+
+    CT106's flat 0.00% is the ordering bug with no `seed_all` head start and no
+    refreshed `products` snapshot; CT107's day-0-only hole is the same bug on a
+    slot whose `seed_all` had already created the current ad. Both are the
+    ad-absent-while-its-own-day-is-written defect, not an era boundary — see
+    `docs/weekly-ad-pricing-era.md` for why no sale-date boundary exists here.
 
     Running the lifecycle BEFORE any of the day's hours are written is what
     makes the advertised price real on `start_date`. It is idempotent — both
