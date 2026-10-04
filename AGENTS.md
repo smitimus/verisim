@@ -404,7 +404,7 @@ The data-lab dbt project expects these 27 source tables from the generator. If y
 | ordering | store_orders, store_order_items | stg_ordering_* |
 | fulfillment | orders, order_items | stg_fulfillment_* |
 | transport | trucks, loads, load_items | stg_transport_* |
-| inv | stock_levels, shrinkage_events, receipts, receipt_items, products | stg_inv_* |
+| inv | stock_levels, shrinkage_events, receipts, receipt_items, products, **suppliers, supplier_delivery_schedules, short_ship_events, supplier_credit_memos, dsd_deliveries, dsd_delivery_items** | stg_inv_* |
 | pricing | weekly_ads, ad_items | stg_pricing_* |
 
 ## Architecture Decisions (ADRs)

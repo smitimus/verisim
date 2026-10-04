@@ -68,6 +68,27 @@ def seed_inventory(conn, cfg: Config, products: List[Dict],
     Create inv.products and inv.stock_levels for all product/store combos.
     Only seeds stock at store locations (warehouse stock managed separately).
     Idempotent.
+
+    VENDORS (t_57b1a1ab). This used to carry its own hardcoded list:
+
+        SUPPLIERS = ['UNFI', 'KeHE Distributors', 'McLane Company',
+                     'C&S Wholesale Grocers', 'Nash Finch', 'Supervalu']
+        ...
+        random.choice(SUPPLIERS), random.randint(1, 4)   # lead_time_days
+
+    — a module-level literal that could only be changed by editing code, with
+    no id to join on and no properties, so every vendor behaved identically
+    and `lead_time_days` was the same constant for every product.
+
+    The vendor list now lives in `cfg.vendors` and the rows in `inv.suppliers`
+    (`models.suppliers.seed_suppliers` + `seed_supplier_assignments`, called
+    from `main.seed_all` BEFORE this). This function only writes the
+    per-product replenishment fields; `seed_supplier_assignments` sets
+    `supplier_id`, `supplier_name` and `lead_time_days` afterwards, from the
+    vendor the product's department is served by.
+
+    A product whose `inv.products` row already exists is left alone, so the
+    assignments are not undone on a restart.
     """
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM inv.products")
@@ -78,11 +99,6 @@ def seed_inventory(conn, cfg: Config, products: List[Dict],
              len(products), len(store_locations))
 
     import random
-    SUPPLIERS = [
-        'UNFI', 'KeHE Distributors', 'McLane Company',
-        'C&S Wholesale Grocers', 'Nash Finch', 'Supervalu'
-    ]
-
     inv_prod_records = []
     for p in products:
         inv_prod_records.append((
@@ -90,8 +106,9 @@ def seed_inventory(conn, cfg: Config, products: List[Dict],
             random.randint(15, 40),    # reorder_point
             random.randint(50, 300),   # reorder_qty
             p.get('uom', 'each'),
-            random.choice(SUPPLIERS),
-            random.randint(1, 4),      # lead_time_days
+            None,                      # supplier_id  — set by seed_supplier_assignments
+            None,                      # supplier_name — set by seed_supplier_assignments
+            2,                         # lead_time_days — set by seed_supplier_assignments
         ))
 
     stock_records = []
@@ -108,9 +125,10 @@ def seed_inventory(conn, cfg: Config, products: List[Dict],
         execute_values(cur, """
             INSERT INTO inv.products
                 (product_id, reorder_point, reorder_qty, unit_of_measure,
-                 supplier_name, lead_time_days)
+                 supplier_id, supplier_name, lead_time_days)
             VALUES %s ON CONFLICT (product_id) DO NOTHING
-        """, inv_prod_records, template="(%s::uuid,%s,%s,%s,%s,%s)")
+        """, inv_prod_records,
+            template="(%s::uuid,%s,%s,%s,%s::uuid,%s,%s)")
 
         execute_values(cur, """
             INSERT INTO inv.stock_levels

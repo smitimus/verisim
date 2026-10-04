@@ -204,6 +204,37 @@ def _has_customers_table(industry: str) -> bool:
     return present
 
 
+# Cache of the t_57b1a1ab vendor-table probe, keyed by industry. Same reason as
+# the two probes above: a `schema.sql` change only reaches a fresh bootstrap, so
+# a slot on an older image has none of these tables and the vendor routes must
+# degrade to an empty result instead of 500ing (which would take the whole
+# inventory section down for data-lab).
+_VENDOR_TABLES: Dict[str, bool] = {}
+
+VENDOR_TABLES = (
+    'suppliers', 'supplier_delivery_schedules', 'short_ship_events',
+    'supplier_credit_memos', 'dsd_deliveries', 'dsd_delivery_items',
+)
+
+
+def _has_vendor_tables(industry: str) -> bool:
+    """True when this data dir carries the t_57b1a1ab vendor tables."""
+    cached = _VENDOR_TABLES.get(industry)
+    if cached is not None:
+        return cached
+    try:
+        rows = query("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'inv' AND table_name = ANY(%s)
+        """, [list(VENDOR_TABLES)], industry)
+        found = {r['table_name'] for r in rows}
+        present = set(VENDOR_TABLES) <= found
+    except Exception:
+        present = False
+    _VENDOR_TABLES[industry] = present
+    return present
+
+
 def query_write(sql: str, params, industry: str) -> List[Dict]:
     """Execute a write statement with RETURNING and commit."""
     pool = pool_for(industry)
@@ -1715,6 +1746,456 @@ def inventory_stockout_events(
         JOIN hr.locations l ON l.location_id = se.location_id
         WHERE {where}
         ORDER BY se.event_dt DESC, se.stockout_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/suppliers", tags=["Inventory"])
+def inventory_suppliers(
+    industry: str,
+    fulfillment_model: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    limit: int = Query(200, le=2000),
+    offset: int = 0,
+):
+    """
+    Vendors, with the behaviour a vendor-performance mart measures against
+    (t_57b1a1ab): the promised lead time and its spread, the short-ship rate,
+    the credit terms, and the fulfilment model.
+
+    `lead_time_mean_days` is what the vendor PROMISED and
+    `inv.short_ship_events.realized_lead_time_days` is what it DID — the two are
+    only comparable because the generator draws the second around the first.
+
+    Degrades to an empty result on a data dir generated before t_57b1a1ab (a
+    `schema.sql` change only reaches a fresh bootstrap, and a 500 here would take
+    the whole inventory section down for data-lab).
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if fulfillment_model:
+        filters.append("s.fulfillment_model = %s")
+        params.append(fulfillment_model)
+    if is_active is not None:
+        filters.append("s.is_active = %s")
+        params.append(is_active)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM inv.suppliers s "
+                  f"WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT s.supplier_id, s.supplier_name, s.supplier_code,
+               s.fulfillment_model, s.lead_time_mean_days,
+               s.lead_time_stddev_days, s.short_ship_rate, s.credit_eligible,
+               s.credit_window_days, s.credit_settle_mean_days,
+               s.credit_settle_stddev_days, s.is_active,
+               (SELECT COUNT(*) FROM inv.products ip
+                 WHERE ip.supplier_id = s.supplier_id) AS product_count,
+               (SELECT COUNT(*) FROM inv.short_ship_events se
+                 WHERE se.supplier_id = s.supplier_id) AS short_ship_count
+        FROM inv.suppliers s
+        WHERE {where}
+        ORDER BY s.supplier_name, s.supplier_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/suppliers/{supplier_id}", tags=["Inventory"])
+def inventory_supplier_detail(industry: str, supplier_id: str):
+    """
+    One vendor and its performance: fill rate, dollars short-shipped, dollars
+    credited, and days-to-pay.
+
+    This is the shape a procurement analyst actually asks for, and it is only
+    possible because the short-ship and the credit memo are first-class rows —
+    before t_57b1a1ab a short pick was excluded from the receipt and the vendor
+    behind it was a string.
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"available": False, "supplier": None}
+    rows = query("""
+        SELECT s.supplier_id, s.supplier_name, s.supplier_code,
+               s.fulfillment_model, s.lead_time_mean_days,
+               s.lead_time_stddev_days, s.short_ship_rate, s.credit_eligible,
+               s.credit_window_days, s.is_active,
+               COUNT(se.short_ship_id) AS short_ship_events,
+               COALESCE(SUM(se.quantity_requested), 0) AS units_requested,
+               COALESCE(SUM(se.quantity_picked), 0) AS units_picked,
+               COALESCE(SUM(se.quantity_short), 0) AS units_short,
+               COALESCE(ROUND(SUM(se.short_value), 2), 0) AS short_value,
+               -- Fill rate on requested units. COALESCE because a vendor with
+               -- no short-ships has a NULL SUM, and NULL is not a fill rate.
+               ROUND(
+                   COALESCE(SUM(se.quantity_picked), 0)::numeric
+                   / NULLIF(SUM(se.quantity_requested), 0) * 100, 2
+               ) AS fill_rate_pct,
+               COALESCE(ROUND(AVG(se.realized_lead_time_days
+                                 - se.promised_lead_time_days), 2), 0)
+                   AS avg_lead_time_slippage_days
+        FROM inv.suppliers s
+        LEFT JOIN inv.short_ship_events se ON se.supplier_id = s.supplier_id
+        WHERE s.supplier_id = %s::uuid
+        GROUP BY s.supplier_id
+    """, [supplier_id], industry)
+    if not rows:
+        return {"available": True, "supplier": None}
+
+    memos = query("""
+        SELECT m.credit_memo_id, m.credit_memo_number, m.credit_quantity,
+               m.credit_amount, m.short_reason, m.memo_status,
+               m.claim_deadline, m.submitted_dt, m.resolved_dt,
+               m.resolved_by, m.rejection_reason, m.product_id,
+               p.name AS product_name, m.location_id, l.name AS location_name,
+               m.created_at
+        FROM inv.supplier_credit_memos m
+        JOIN pos.products p ON p.product_id = m.product_id
+        JOIN hr.locations l ON l.location_id = m.location_id
+        WHERE m.supplier_id = %s::uuid
+        ORDER BY m.created_at DESC, m.credit_memo_id
+        LIMIT 500
+    """, [supplier_id], industry)
+
+    totals = query("""
+        SELECT COUNT(*) AS memos,
+               COUNT(*) FILTER (WHERE m.memo_status = 'paid') AS paid,
+               COUNT(*) FILTER (WHERE m.memo_status = 'rejected') AS rejected,
+               COUNT(*) FILTER (WHERE m.memo_status IN ('open','submitted'))
+                   AS outstanding,
+               COUNT(*) FILTER (WHERE m.memo_status = 'expired') AS expired,
+               COALESCE(SUM(m.credit_amount)
+                        FILTER (WHERE m.memo_status = 'paid'), 0) AS paid_amount,
+               COALESCE(SUM(m.credit_amount)
+                        FILTER (WHERE m.memo_status IN ('open','submitted')), 0)
+                   AS outstanding_amount,
+               -- Days to pay, over the claims that resolved. AVG ignores NULLs,
+               -- so an unresolved claim never flatters the figure.
+               ROUND(AVG(EXTRACT(EPOCH FROM (m.resolved_dt - m.submitted_dt))
+                         / 86400.0)
+                     FILTER (WHERE m.submitted_dt IS NOT NULL
+                             AND m.resolved_dt IS NOT NULL)::numeric, 2)
+                   AS avg_days_to_pay
+        FROM inv.supplier_credit_memos m
+        WHERE m.supplier_id = %s::uuid
+    """, [supplier_id], industry)[0]
+
+    return {"available": True, "supplier": rows[0], "credit_summary": totals,
+            "credit_memos": memos}
+
+
+@app.get("/{industry}/inventory/short-ship-events", tags=["Inventory"])
+def inventory_short_ship_events(
+    industry: str,
+    supplier_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    location_id: Optional[str] = None,
+    detected_source: Optional[str] = None,
+    is_creditable: Optional[bool] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """
+    Lines a vendor could not fill (t_57b1a1ab) — the inbound-shortage feed.
+
+    The counterpart to `inv.stockout_events`: that table records what the SHOP
+    could not sell because the shelf was empty, this one records what the
+    VENDOR could not deliver. They are different events with different owners,
+    and a mart that joined them would be measuring vendor fill rate against
+    shelf availability — the whole point of separating them.
+
+    `quantity_requested` / `quantity_picked` / `quantity_short` mirror the
+    fulfillment line the event came from (asserted by harness check SEMA-15),
+    and `short_value` is that shortfall priced at the same unit cost the
+    receipt used for the goods that DID arrive.
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if supplier_id:
+        filters.append("se.supplier_id = %s::uuid")
+        params.append(supplier_id)
+    if product_id:
+        filters.append("se.product_id = %s::uuid")
+        params.append(product_id)
+    if location_id:
+        filters.append("se.location_id = %s::uuid")
+        params.append(location_id)
+    if detected_source:
+        filters.append("se.detected_source = %s")
+        params.append(detected_source)
+    if is_creditable is not None:
+        filters.append("se.is_creditable = %s")
+        params.append(is_creditable)
+    if start_dt:
+        filters.append("se.event_dt >= %s")
+        params.append(start_dt)
+    if end_dt:
+        filters.append("se.event_dt <= %s")
+        params.append(end_dt)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM inv.short_ship_events se "
+                  f"WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT se.short_ship_id, se.fulfillment_item_id, se.fulfillment_id,
+               se.supplier_id, s.supplier_name, se.product_id,
+               p.name AS product_name, p.category, se.location_id,
+               l.name AS location_name, se.detected_source,
+               se.quantity_requested, se.quantity_picked, se.quantity_short,
+               se.unit_cost, se.short_value, se.promised_lead_time_days,
+               se.realized_lead_time_days, se.is_creditable, se.event_dt,
+               se.scenario_tag, se.created_at
+        FROM inv.short_ship_events se
+        JOIN inv.suppliers s ON s.supplier_id = se.supplier_id
+        JOIN pos.products p ON p.product_id = se.product_id
+        JOIN hr.locations l ON l.location_id = se.location_id
+        WHERE {where}
+        ORDER BY se.event_dt DESC, se.short_ship_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/supplier-credit-memos", tags=["Inventory"])
+def inventory_supplier_credit_memos(
+    industry: str,
+    supplier_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    location_id: Optional[str] = None,
+    memo_status: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """
+    Credit claims against vendors, and whether they were paid (t_57b1a1ab).
+
+    The lifecycle is open -> submitted -> paid | rejected, plus `expired` when the
+    vendor's claim window closed before anyone filed and `written_off` when the
+    store decided the paperwork was not worth it. `memo_status` is a real
+    dimension here rather than a flag: "how long did this vendor take to pay,
+    and did it ever" is the question a claims-aging mart exists to answer, and
+    an unresolved claim is a real finding rather than a missing value.
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if supplier_id:
+        filters.append("m.supplier_id = %s::uuid")
+        params.append(supplier_id)
+    if product_id:
+        filters.append("m.product_id = %s::uuid")
+        params.append(product_id)
+    if location_id:
+        filters.append("m.location_id = %s::uuid")
+        params.append(location_id)
+    if memo_status:
+        filters.append("m.memo_status = %s")
+        params.append(memo_status)
+    if start_date:
+        filters.append("m.created_at::date >= %s")
+        params.append(start_date)
+    if end_date:
+        filters.append("m.created_at::date <= %s")
+        params.append(end_date)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM inv.supplier_credit_memos m "
+                  f"WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT m.credit_memo_id, m.credit_memo_number, m.short_ship_id,
+               m.supplier_id, s.supplier_name, m.product_id,
+               p.name AS product_name, p.category, m.location_id,
+               l.name AS location_name, m.credit_quantity, m.unit_cost,
+               m.credit_amount, m.short_reason, m.memo_status,
+               m.claim_deadline, m.submitted_dt, m.resolved_dt,
+               m.resolved_by, m.rejection_reason, m.scenario_tag,
+               m.created_at, m.updated_at
+        FROM inv.supplier_credit_memos m
+        JOIN inv.suppliers s ON s.supplier_id = m.supplier_id
+        JOIN pos.products p ON p.product_id = m.product_id
+        JOIN hr.locations l ON l.location_id = m.location_id
+        WHERE {where}
+        ORDER BY m.created_at DESC, m.credit_memo_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/dsd-deliveries", tags=["Inventory"])
+def inventory_dsd_deliveries(
+    industry: str,
+    supplier_id: Optional[str] = None,
+    location_id: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """
+    Direct Store Delivery drops (t_57b1a1ab) — the vendor's own truck at the
+    store.
+
+    Deliberately NOT an `inv.receipts` row: a DSD pallet never rides on one of
+    our `transport.loads` and never crosses a receiving dock, so modelling it as
+    a receipt would double-count the goods (once on our truck, once on the
+    vendor's). This route is the inbound channel for the perishable half of the
+    catalogue, which otherwise arrived by a mechanism no table described.
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if supplier_id:
+        filters.append("d.supplier_id = %s::uuid")
+        params.append(supplier_id)
+    if location_id:
+        filters.append("d.location_id = %s::uuid")
+        params.append(location_id)
+    if start_date:
+        filters.append("d.delivery_date >= %s")
+        params.append(start_date)
+    if end_date:
+        filters.append("d.delivery_date <= %s")
+        params.append(end_date)
+    where = " AND ".join(filters)
+    total = query(f"SELECT COUNT(*) AS n FROM inv.dsd_deliveries d "
+                  f"WHERE {where}", params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT d.dsd_delivery_id, d.schedule_id, d.supplier_id,
+               s.supplier_name, d.location_id, l.name AS location_name,
+               d.delivery_date, d.delivered_at, d.total_units, d.total_value,
+               d.line_count, d.created_at
+        FROM inv.dsd_deliveries d
+        JOIN inv.suppliers s ON s.supplier_id = d.supplier_id
+        JOIN hr.locations l ON l.location_id = d.location_id
+        WHERE {where}
+        ORDER BY d.delivery_date DESC, d.dsd_delivery_id LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/dsd-delivery-items", tags=["Inventory"])
+def inventory_dsd_delivery_items(
+    industry: str,
+    dsd_delivery_id: Optional[str] = None,
+    supplier_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    location_id: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """
+    DSD line items. `quantity_delivered = 0` is a MISSED drop, not a missing row:
+    it is the record that makes the shortfall visible, which is why the column
+    is CHECK (>= 0) rather than (> 0).
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if dsd_delivery_id:
+        filters.append("i.dsd_delivery_id = %s::uuid")
+        params.append(dsd_delivery_id)
+    if supplier_id:
+        filters.append("d.supplier_id = %s::uuid")
+        params.append(supplier_id)
+    if product_id:
+        filters.append("i.product_id = %s::uuid")
+        params.append(product_id)
+    if location_id:
+        filters.append("d.location_id = %s::uuid")
+        params.append(location_id)
+    if start_date:
+        filters.append("d.delivery_date >= %s")
+        params.append(start_date)
+    if end_date:
+        filters.append("d.delivery_date <= %s")
+        params.append(end_date)
+    where = " AND ".join(filters)
+    total = query(f"""
+        SELECT COUNT(*) AS n
+        FROM inv.dsd_delivery_items i
+        JOIN inv.dsd_deliveries d ON d.dsd_delivery_id = i.dsd_delivery_id
+        WHERE {where}
+    """, params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT i.dsd_item_id, i.dsd_delivery_id, d.supplier_id,
+               s.supplier_name, d.location_id, l.name AS location_name,
+               d.delivery_date, i.product_id, p.name AS product_name,
+               p.category, i.quantity_delivered, i.unit_cost, i.line_total,
+               i.created_at
+        FROM inv.dsd_delivery_items i
+        JOIN inv.dsd_deliveries d ON d.dsd_delivery_id = i.dsd_delivery_id
+        JOIN inv.suppliers s ON s.supplier_id = d.supplier_id
+        JOIN pos.products p ON p.product_id = i.product_id
+        JOIN hr.locations l ON l.location_id = d.location_id
+        WHERE {where}
+        ORDER BY d.delivery_date DESC, i.dsd_delivery_id, i.dsd_item_id
+        LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "available": True}
+
+
+@app.get("/{industry}/inventory/supplier-delivery-schedules", tags=["Inventory"])
+def inventory_supplier_delivery_schedules(
+    industry: str,
+    supplier_id: Optional[str] = None,
+    location_id: Optional[str] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """
+    When each DSD vendor visits each store (t_57b1a1ab) — the commitment a
+    delivery's on-time rate is measured against.
+
+    `delivery_weekday` is 0..6 with Monday = 0, matching Python's
+    `datetime.weekday()` (harness check SEMA-26 asserts a delivery only lands on
+    a weekday its schedule actually visits).
+    """
+    pool_for(industry)
+    if not _has_vendor_tables(industry):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "available": False}
+    filters, params = ["TRUE"], []
+    if supplier_id:
+        filters.append("ds.supplier_id = %s::uuid")
+        params.append(supplier_id)
+    if location_id:
+        filters.append("ds.location_id = %s::uuid")
+        params.append(location_id)
+    where = " AND ".join(filters)
+    total = query(f"""
+        SELECT COUNT(*) AS n FROM inv.supplier_delivery_schedules ds
+        WHERE {where}
+    """, params, industry)[0]["n"]
+    rows = query(f"""
+        SELECT ds.schedule_id, ds.supplier_id, s.supplier_name, s.supplier_code,
+               ds.location_id, l.name AS location_name, ds.delivery_weekday,
+               TO_CHAR(ds.delivery_window_start, 'HH24:MI') AS window_start,
+               TO_CHAR(ds.delivery_window_end, 'HH24:MI') AS window_end,
+               ds.is_active, ds.created_at
+        FROM inv.supplier_delivery_schedules ds
+        JOIN inv.suppliers s ON s.supplier_id = ds.supplier_id
+        JOIN hr.locations l ON l.location_id = ds.location_id
+        WHERE {where}
+        ORDER BY s.supplier_name, l.name, ds.delivery_weekday, ds.schedule_id
+        LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset,
             "available": True}

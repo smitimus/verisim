@@ -235,6 +235,105 @@ inventory:
   # store did not have.
   enforce_stock_availability: true
 
+# ---------------------------------------------------------------------------
+# Vendors (t_57b1a1ab)
+# ---------------------------------------------------------------------------
+# Before this block a supplier was a hardcoded Python list inside
+# models/inventory.py and `lead_time_days` was random.randint(1, 4) — no id to
+# join on, and every vendor behaved identically because the only behaviour hung
+# off one was random.choice(SUPPLIERS). A vendor-performance mart was impossible
+# by construction.
+#
+# Each entry becomes one inv.suppliers row. `inv.products.supplier_id` is a real
+# FK to it, and the three numbers below are what make one vendor behave
+# differently from another:
+#
+#   lead_time_mean_days    what the vendor PROMISES
+#   lead_time_stddev_days  how much it varies — the realised lead time of each
+#                          arrival is drawn around the promise, so on-time
+#                          delivery is measurable at all
+#   short_ship_rate        share of lines this vendor comes up short on
+#
+# fulfillment_model decides the inbound shape: 'warehouse' goods ride one of our
+# transport.loads and arrive as inv.receipts; 'dsd' (Direct Store Delivery) the
+# vendor's own truck restocks the shelf, so there is no pallet, no dock and
+# deliberately NO receipt — see inv.dsd_deliveries.
+#
+# credit_eligible / credit_window_days / credit_settle_*_days are the vendor's
+# terms: a vendor we cannot credit from produces no inv.supplier_credit_memos,
+# which is a real procurement decision rather than a gap in the data.
+#
+# Omitting a key keeps its declared default rather than zeroing it — a missing
+# `short_ship_rate` must not become "this vendor never shorts anything".
+# ---------------------------------------------------------------------------
+vendors:
+  dsd_departments: [Produce, Deli]     # departments a DSD vendor serves
+  dsd_deliveries_per_week: 4           # visits per store per week (0-7)
+  dsd_short_ship_bonus: 0.02           # extra short rate on a DSD drop
+  credit_claim_rate: 0.70              # share of creditable shorts we claim
+  credit_pay_rate: 0.85                # share of claims the vendor pays
+  credit_chase_after_days: 3           # days before a silent claim is chased
+
+  vendors:
+    - name: UNFI
+      code: UNFI
+      fulfillment_model: warehouse
+      lead_time_mean_days: 2.0
+      lead_time_stddev_days: 0.6
+      short_ship_rate: 0.06
+      credit_eligible: true
+      credit_window_days: 14
+      credit_settle_mean_days: 8
+      credit_settle_stddev_days: 3
+    - name: McLane Company
+      code: MCLN
+      fulfillment_model: warehouse
+      lead_time_mean_days: 2.5
+      lead_time_stddev_days: 0.8
+      short_ship_rate: 0.09
+      credit_eligible: true
+      credit_window_days: 14
+    - name: C&S Wholesale Grocers
+      code: CSWG
+      fulfillment_model: warehouse
+      lead_time_mean_days: 3.0
+      lead_time_stddev_days: 1.0
+      short_ship_rate: 0.12
+      credit_eligible: false          # no returns agreement: shortages are ours
+      credit_window_days: 10
+    - name: Supervalu
+      code: SVAL
+      fulfillment_model: warehouse
+      lead_time_mean_days: 2.0
+      lead_time_stddev_days: 0.5
+      short_ship_rate: 0.05
+      credit_eligible: true
+      credit_window_days: 21
+    - name: Nash Finch
+      code: NASH
+      fulfillment_model: warehouse
+      lead_time_mean_days: 3.5
+      lead_time_stddev_days: 1.2
+      short_ship_rate: 0.15            # the worst vendor on purpose
+      credit_eligible: false
+      credit_window_days: 7
+    - name: FreshFields Produce
+      code: FRFP
+      fulfillment_model: dsd            # produce comes straight to the store
+      lead_time_mean_days: 1.0
+      lead_time_stddev_days: 0.3
+      short_ship_rate: 0.08
+      credit_eligible: true
+      credit_window_days: 7
+    - name: KeHE Distributors
+      code: KEHE
+      fulfillment_model: dsd
+      lead_time_mean_days: 1.5
+      lead_time_stddev_days: 0.4
+      short_ship_rate: 0.04
+      credit_eligible: true
+      credit_window_days: 14
+
 coupons:
   active_at_any_time: 8            # how many coupons are active at once
   valid_duration_days: 14          # coupon validity window

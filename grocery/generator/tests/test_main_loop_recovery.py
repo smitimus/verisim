@@ -92,6 +92,56 @@ class AbortingConnection:
         self.broken = False
 
 
+def _seed_stub():
+    """A `seed_all` stand-in with the arity `main()` actually destructures.
+
+    Why this is derived rather than written out (t_5d727acb)
+    -------------------------------------------------------
+    This stub was a literal 5-tuple: `({}, [], [], [], [])`. That was correct when
+    the vendor layer (t_57b1a1ab) widened `seed_all` to also return `vendors`,
+    and this test file did not exist yet — so it encoded main's *pre-vendor*
+    arity by accident.
+
+    Merging t_57b1a1ab therefore broke a test that was green on both sides
+    before the merge and green on neither CI run afterwards:
+
+        main.py: `locations, employees, departments, products, trucks, vendors
+                  = seed_all(conn, cfg)`      (6 targets, post-merge)
+        stub:   returns 5 values             -> ValueError at the unpack
+
+    `ValueError: not enough values to unpack` is raised *before* the loop starts,
+    so all three tests failed at the harness rather than on the recovery contract
+    they exist to pin — and the failure names the stub, not the behaviour under
+    test, which is the worst possible shape for a regression suite.
+
+    Reading the count off the real unpack site means a future arity change can
+    never re-break it, and the failure has to be a real behaviour regression
+    rather than a bookkeeping mismatch. If `main()` stops destructuring
+    `seed_all` entirely, this raises loudly instead of returning a plausible
+    wrong-shaped tuple.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(gen_main))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if not (isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "seed_all"):
+            continue
+        targets = node.targets[0]
+        if isinstance(targets, ast.Tuple):
+            # First element is the seeded locations dict, the rest are lists.
+            return ({},) + ([],) * (len(targets.elts) - 1)
+    raise AssertionError(
+        "no `a, b, ... = seed_all(...)` unpack found in "
+        "grocery/generator/main.py — _seed_stub() must be taught the new shape"
+    )
+
+
 @pytest.fixture
 def loop_harness(monkeypatch):
     """Boot `main()` with the database stubbed out, and interrupt its sleep.
@@ -121,7 +171,7 @@ def loop_harness(monkeypatch):
         monkeypatch.setattr(gen_main, "wait_for_db", lambda c: None)
         monkeypatch.setattr(gen_main, "bootstrap_database", lambda c: None)
         monkeypatch.setattr(gen_main, "get_connection", lambda c: conn)
-        monkeypatch.setattr(gen_main, "seed_all", lambda c, cf: ({}, [], [], [], []))
+        monkeypatch.setattr(gen_main, "seed_all", lambda c, cf: _seed_stub())
         monkeypatch.setattr(gen_main, "auto_backfill_if_fresh", lambda c, cf: None)
         monkeypatch.setattr(gen_main, "customers", type("C", (), {
             "backfill_customers": staticmethod(lambda c, cf: None)}))
