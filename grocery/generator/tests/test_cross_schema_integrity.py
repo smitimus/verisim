@@ -160,6 +160,43 @@ TABLE_OR_COLUMN_OPTIONAL = {
     "HARD-29": ("pos", "customers", None),
     "SEMA-14": ("pos", "customers", None),
     "SEMA-15": ("pos", "loyalty_members", "customer_id"),
+
+    # t_57b1a1ab: the vendor layer (suppliers, delivery schedules, short-ships,
+    # credit memos, DSD deliveries and their items). Six new `inv` relations
+    # that a data dir predating the card simply does not have, and 22 new
+    # assertions that read them — so without this entry every slot running an
+    # older image fails 22 integrity checks on every run, which is the same
+    # mistake the customer dimension above already documents.
+    #
+    # `inv.suppliers` is the anchor: every other vendor table has a supplier_id
+    # FK into it (HARD-30/31/33/36/39 all read it directly), so a data dir that
+    # has the vendors at all has `inv.suppliers`. Registering each assertion
+    # against the table it reads keeps the skip message naming the relation
+    # actually absent.
+    "HARD-30": ("inv", "suppliers", None),
+    "HARD-31": ("inv", "supplier_delivery_schedules", None),
+    "HARD-32": ("inv", "short_ship_events", None),
+    "HARD-33": ("inv", "short_ship_events", None),
+    "HARD-34": ("inv", "short_ship_events", None),
+    "HARD-35": ("inv", "short_ship_events", None),
+    "HARD-36": ("inv", "supplier_credit_memos", None),
+    "HARD-37": ("inv", "dsd_deliveries", None),
+    "HARD-38": ("inv", "dsd_delivery_items", None),
+    "HARD-39": ("inv", "dsd_deliveries", None),
+    "SEMA-16": ("inv", "short_ship_events", None),
+    "SEMA-17": ("inv", "supplier_credit_memos", None),
+    "SEMA-18": ("inv", "supplier_credit_memos", None),
+    "SEMA-19": ("inv", "supplier_credit_memos", None),
+    "SEMA-20": ("inv", "supplier_credit_memos", None),
+    "SEMA-21": ("inv", "supplier_credit_memos", None),
+    "SEMA-22": ("inv", "short_ship_events", None),
+    "SEMA-23": ("inv", "short_ship_events", None),
+    "SEMA-24": ("inv", "dsd_deliveries", None),
+    "SEMA-25": ("inv", "dsd_deliveries", None),
+    "SEMA-26": ("inv", "dsd_deliveries", None),
+    # SEMA-27 reads inv.suppliers for the denormalised supplier_name on
+    # inv.products — the vendor is what it compares against.
+    "SEMA-27": ("inv", "suppliers", None),
 }
 
 _OPTIONAL_ASSERTION_IDS = frozenset(TABLE_OR_COLUMN_OPTIONAL)
