@@ -208,6 +208,49 @@ Whole-table routes accept `start_dt`/`end_dt` so consumers can pull bounded, res
 pieces instead of paging everything: `/grocery/pos/price-history` (`changed_at`),
 `/grocery/pos/return-items` (`return_dt`), `/grocery/online/order-items` (`placed_dt`).
 
+**The tick ledger (`control.generation_stats`) took part in t_ac80c514.** It is the
+relation a consumer asks when a sales dip needs explaining — *was the generator down,
+paused, or running under a scenario regime when these rows were written?* — and it had
+two defects, the second of which made the data wrong rather than merely unreachable:
+
+* `GET /{industry}/stats/generation` took `last_n_ticks` capped at 1000 with no offset
+  and no window, so the newest-1000 slice was all it could serve against a relation
+  holding tens of thousands of rows (`last_n_ticks=2000` → 422). It now takes
+  `limit`/`offset` over a PK-terminated `ORDER BY recorded_at DESC, stat_id DESC` and
+  both windows, and returns `{data, total, limit, offset}`. `last_n_ticks` still works —
+  the UI dashboard and data-lab's readiness sensor both read it — but it means the *page
+  size*, not the ceiling on the relation, and passing it with a different `limit` is a
+  400 rather than a silent preference. Both parameters are `Optional[...] = None` so a
+  bare GET and a `last_n_ticks`-only caller both resolve to the old default of 100.
+* **`run_backfill` never wrote the ledger at all.** Every day produced by a backfill —
+  the 30-day window of a fresh install, and every day a gap-fill repairs — left no
+  telemetry. Measured on dev: the ledger started 2026-09-21 (the first realtime tick)
+  while `pos.transactions` started 2026-08-22, so 94,867 transactions across 30 days had
+  no ledger rows and 2026-09-05..09-09 (the labour-day window) held **zero**. The holiday
+  regime *was* stamped on the transactions, so a consumer joining the ledger to explain a
+  dip found nothing for exactly the days that needed explaining. The backfill now writes
+  one `record_stats` row per simulated hour, inside the hour's own loop, with the counts
+  the hour actually wrote (`len(depletion)`, not the planned `pos_count`) and
+  `scenario.scenario_tag` — the same context object the hour's rows were generated from,
+  so the tag cannot drift from the data.
+
+  Three details that are load-bearing. `record_stats` gained `bump_state_clock`, and the
+  backfill passes `False`: `last_tick_at` is what `/status` and the readiness sensor read
+  as "the generator is alive", and during a backfill the generator is simulating
+  yesterday, so stamping the wall clock there would read as live progress. The ledger
+  delete in `_clear_date_range` now covers `simulation_dt` for the forced-backfill range —
+  otherwise a forced backfill leaves the old ledger rows for a range whose fact tables were
+  just emptied and then appends a second, equally valid set beside them.
+
+**`control.active_scenarios` and `control.scenario_schedules` are manual-only.** Nothing
+seeds them: they get rows only from `POST /{industry}/generator/scenarios` and
+`.../scenario-schedules`, so they are 0 rows on every slot until someone calls them by
+hand. The calendar regimes (labour day, thanksgiving, …) do **not** come from there —
+`scenario_engine._get_holiday_multiplier` is a pure function of the date and touches
+neither table, which is why those tags reach `pos.transactions` while both relations stay
+empty. `idx_scenario_schedules_dates` exists for the read in `get_active_scenario_names`,
+not as evidence of seeding. A consumer must not assume either relation ever has data.
+
 **Two windows, and which one an incremental load needs.** `start_dt`/`end_dt` always
 bound the *business* time — when the event happened. That is the right window for
 analysis and the wrong one for a delta load whenever the business timestamp is
@@ -221,6 +264,7 @@ past:
 | `pos.price_history` | `changed_at` | no — stamped at insert | — | — |
 | `online.orders` / `online.order_items` | `placed_dt` | yes, during backfill | `created_at` | `orders.updated_at` |
 | `online.order_events` | `event_dt` | yes, during backfill | `created_at` | — |
+| `control.generation_stats` | `simulation_dt` | yes, during backfill | `recorded_at` | `generator_state.last_tick_at` (realtime only) |
 
 A consumer that watermarks on a backdated column loses rows: the watermark sits at the
 newest business time already seen, and every row a later batch backdates below it is

@@ -60,6 +60,21 @@ All models use raw `psycopg2` with `execute_values` for bulk inserts. No ORM.
 4. record_stats() → control.generation_stats
 ```
 
+**`run_backfill` writes the ledger too (t_ac80c514).** It did not, which meant a day
+produced by a backfill left no telemetry at all — the 30-day window of a fresh install,
+and every day a gap-fill repairs. On dev that left 94,867 transactions across 30 days with
+no ledger rows, and 2026-09-05..09-09 (the labour-day window) empty while the holiday
+regime was plainly stamped on the fact tables. The backfill now calls the same
+`record_stats` once per simulated hour, inside the hour's own loop, passing the counts
+the hour actually wrote (`len(depletion)`, never the planned `pos_count`) and
+`scenario.scenario_tag`. It passes `bump_state_clock=False`: `last_tick_at` is what
+`/status` and data-lab's readiness sensor read as "the generator is alive", and a
+backfill is simulating yesterday, so stamping the wall clock there would read as live
+progress. `grocery/api/tests/test_generation_stats.py` pins all of this.
+
+Note the sibling generators were never affected: gas-station and support each write an
+inline INSERT per simulated hour in their own `run_backfill`. Grocery was the odd one out.
+
 ### Backfill
 - Fresh DB: 30-day backfill (today-30 → today), then auto-transition to realtime
 - Gap detection: checks max transaction timestamp per day, fills missing days

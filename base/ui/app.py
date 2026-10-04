@@ -1325,8 +1325,10 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
             return pd.DataFrame(), 0
         return pd.DataFrame([r.get("state", {})]), 1
     if table == "control.generation_stats":
+        # `paged`, not `flat`: the route returns the {data,total,...} envelope (t_ac80c514)
+        # so the explorer's row count is the advertised total rather than the page length.
         n = extra.get("last_n_ticks", 100)
-        return flat(f"{pfx}/stats/generation", {"last_n_ticks": n})
+        return paged(f"{pfx}/stats/generation", {"last_n_ticks": n})
 
     # --- Gas-station-only tables ---
     if table == "fuel.transactions":
@@ -1582,6 +1584,10 @@ with tab1:
         status_data = api_get(f"{pfx}/status")
         today_data = api_get(f"{pfx}/stats/today")
         gen_stats = api_get(f"{pfx}/stats/generation", {"last_n_ticks": 200})
+        # The route returns the {data,total,limit,offset} envelope, so the chart reads
+        # `data` — passing the envelope itself to DataFrame would plot the dict columns
+        # (t_ac80c514).
+        gen_rows = (gen_stats or {}).get("data", [])
 
         if status_data:
             state = status_data.get("state", {})
@@ -1619,8 +1625,8 @@ with tab1:
 
         st.divider()
 
-        if gen_stats:
-            df = pd.DataFrame(gen_stats)
+        if gen_rows:
+            df = pd.DataFrame(gen_rows)
             if not df.empty:
                 df["recorded_at"] = pd.to_datetime(df["recorded_at"])
                 df = df.sort_values("recorded_at")

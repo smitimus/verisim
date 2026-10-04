@@ -603,6 +603,18 @@ def _clear_date_range(industry: str, start: date, end: date) -> None:
                 "WHERE scheduled_date BETWEEN %s AND %s",
                 (start, end))
 
+            # Tick ledger for the window (t_ac80c514). Keyed on `simulation_dt`, like
+            # every other delete above, so it covers the rows this backfill is about to
+            # re-generate. Without it a forced backfill leaves the OLD ledger rows for a
+            # range whose fact tables were just emptied — and now that the backfill
+            # writes a row per simulated hour, it would append a second, equally valid
+            # set beside them: two ledger rows per hour, differing counts, with nothing
+            # to tell a consumer which is the one that describes the data on disk.
+            cur.execute(
+                "DELETE FROM control.generation_stats "
+                "WHERE simulation_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+
         conn.commit()
         log.info("Cleared data for %s → %s in industry '%s'", start, end, industry)
     except Exception:
@@ -1803,32 +1815,101 @@ def inventory_receipt_items(
 # Shared: Stats
 # ---------------------------------------------------------------------------
 
+# The ledger route's page size when the caller asks for none. The old route's
+# `last_n_ticks` default was 100, and a bare GET must keep returning the same 100 rows
+# rather than silently switching to a different default (t_ac80c514).
+DEFAULT_PAGE_SIZE = 100
+
+
 @app.get("/{industry}/stats/generation", tags=["Stats"])
-def stats_generation(industry: str, last_n_ticks: int = Query(100, le=1000)):
+def stats_generation(
+    industry: str,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
+    limit: Optional[int] = Query(None, le=5000),
+    offset: int = 0,
+    last_n_ticks: Optional[int] = Query(None, le=5000),
+):
+    """The per-tick generation ledger — paged, and windowed on both clocks (t_ac80c514).
+
+    This is the relation a consumer asks when a sales dip needs explaining: *was the
+    generator down, paused, or running under a scenario regime when these rows were
+    written?* It used to answer `last_n_ticks` capped at 1000 with no offset and no
+    window, so the newest-1000 slice was all the route could ever serve against a
+    relation that holds tens of thousands of rows (`last_n_ticks=2000` → 422). A bounded
+    mirror was the only design left to a consumer.
+
+    **Two windows, because the two clocks answer different questions.**
+
+    ``start_dt``/``end_dt`` bound ``simulation_dt`` — *business* time, the hour the tick
+    simulated. A backfill backdates it (a whole day written at one instant), so this is
+    the right window for analysis and the wrong one for a delta load.
+
+    ``created_after``/``created_before`` bound ``recorded_at`` — the *insert* clock,
+    ``DEFAULT NOW()``, written by the same statement as the row and monotone. That makes
+    ``created_after=<MAX(recorded_at) of the last load>`` a complete delta, exactly as on
+    the transactions and returns routes (t_6d2ebc52, t_5d2e2ab0).
+
+    Both windows are optional and independent, and either side of a window may be given
+    on its own.
+
+    **Pagination ends on the primary key.** ``recorded_at`` alone is not a total order —
+    realtime ticks and backfilled rows can share a stamp — and a tie cluster straddling a
+    page boundary is returned twice or never while ``total`` still matches (t_d7892e10).
+
+    ``last_n_ticks`` is kept for existing readers (the UI dashboard and data-lab's
+    readiness sensor both pass it) and now means the page size rather than the ceiling on
+    the relation, so ``limit``/``offset`` can walk past it. Passing it *and* a different
+    ``limit`` is a 400 rather than a silent preference.
+    """
     pool_for(industry)
+    # Both page sizes are optional so that "was limit actually given?" is answerable.
+    # With `limit` defaulted to a number, a caller passing only `last_n_ticks` (the UI
+    # dashboard and data-lab's readiness sensor both do) would trip the conflict check
+    # against a default it never asked for. Resolve to the old default when neither is
+    # given, so a bare GET still returns the newest 100 rows it always did.
+    if last_n_ticks is not None and limit is not None and last_n_ticks != limit:
+        raise HTTPException(
+            400,
+            f"last_n_ticks={last_n_ticks} conflicts with limit={limit}; pass one or the other",
+        )
+    page_size = next(n for n in (limit, last_n_ticks, DEFAULT_PAGE_SIZE) if n is not None)
+
     if industry == "support":
-        return query("""
-            SELECT stat_id, recorded_at, tickets_generated,
-                   calls_generated, chat_sessions_generated, surveys_generated,
-                   scenario_tag, simulation_dt, wall_clock_ms
-            FROM control.generation_stats
-            ORDER BY recorded_at DESC LIMIT %s
-        """, [last_n_ticks], industry)
-    if industry == "grocery":
-        return query("""
-            SELECT stat_id, recorded_at, pos_transactions_generated,
-                   timeclock_events_generated, orders_generated,
-                   scenario_tag, simulation_dt, wall_clock_ms
-            FROM control.generation_stats
-            ORDER BY recorded_at DESC LIMIT %s
-        """, [last_n_ticks], industry)
-    return query("""
-        SELECT stat_id, recorded_at, pos_transactions_generated,
-               fuel_transactions_generated, inventory_receipts_generated,
-               scenario_tag, simulation_dt, wall_clock_ms
-        FROM control.generation_stats
-        ORDER BY recorded_at DESC LIMIT %s
-    """, [last_n_ticks], industry)
+        select = ("stat_id, recorded_at, tickets_generated, calls_generated, "
+                  "chat_sessions_generated, surveys_generated, scenario_tag, "
+                  "simulation_dt, wall_clock_ms")
+    elif industry == "grocery":
+        select = ("stat_id, recorded_at, pos_transactions_generated, "
+                  "timeclock_events_generated, orders_generated, scenario_tag, "
+                  "simulation_dt, wall_clock_ms")
+    else:
+        select = ("stat_id, recorded_at, pos_transactions_generated, "
+                  "fuel_transactions_generated, inventory_receipts_generated, "
+                  "scenario_tag, simulation_dt, wall_clock_ms")
+
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("simulation_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("simulation_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("recorded_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("recorded_at <= %s"); params.append(created_before)
+    where = " AND ".join(filters)
+
+    total = query(f"SELECT COUNT(*) AS n FROM control.generation_stats WHERE {where}",
+                  params, industry)[0]["n"]
+
+    rows = query(f"""
+        SELECT {select}
+        FROM control.generation_stats WHERE {where}
+        ORDER BY recorded_at DESC, stat_id DESC LIMIT %s OFFSET %s
+    """, params + [page_size, offset], industry)
+    return {"data": rows, "total": total, "limit": page_size, "offset": offset}
 
 
 @app.get("/{industry}/stats/today", tags=["Stats"])
