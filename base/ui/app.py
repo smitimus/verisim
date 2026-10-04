@@ -1577,8 +1577,24 @@ SCENARIOS_BY_INDUSTRY = {
 # thing anyone would do is learn to ignore it.
 #
 # The factor is dimensionless, so the same reading means the same thing on a fast
-# machine and a slow one: 1.0 is realtime, and below ~0.95 means ticks are costing
-# more than a tenth of the interval.
+# machine and a slow one: 1.0 is realtime.
+#
+# The green/red boundary is 0.80, and it is MEASURED rather than picked for
+# tidiness (t_35b4d860). Over the dev slot's whole 37k-row tick ledger, every
+# trailing-100-tick `realtime_factor` window was recomputed and the trip rate
+# read off the distribution:
+#
+#   below 0.95 -> 4.88% of windows     below 0.90 -> 2.35%     below 0.80 -> 1.10%
+#
+# The generator is not slow — p50 tick cost is 72ms against a 30s cadence — but
+# the tail is real: 3.29% of ticks cost over a second and the slowest cost 95.7s,
+# so any window containing a spike reads low for as long as that spike stays
+# inside the trailing 100. A boundary at 0.95 would therefore paint the badge
+# red on roughly one window in twenty of a HEALTHY day, which is the definition
+# of an alert nobody reads; 0.80 holds the false-trip rate to about 1% while
+# still firing long before the generator is meaningfully behind. 0.80 at a 30s
+# cadence means ticks are collectively costing more than a fifth of the
+# interval, which is a box that genuinely needs a look.
 #
 # Module level, not inside a fragment, per the tab rules in AGENTS.md: fragment
 # bodies are a local scope, so a helper defined in one is invisible to the next.
@@ -1598,10 +1614,12 @@ def _tick_health_panel(path: str):
 
     if factor is None:
         h1.metric("Realtime Factor", "—", help="Not enough ticks in the window yet.")
-    elif factor >= 0.95:
+    elif factor >= 0.80:
         h1.metric("Realtime Factor", f"{factor:.3f}",
-                  help="1.0 is realtime. Below 0.95 means ticks are costing more "
-                       "than ~10% of the interval.")
+                  help="1.0 is realtime. Below 0.80 the ticks in the window are "
+                       "collectively costing more than a fifth of the interval. "
+                       "Short spikes dip this temporarily — the trailing window "
+                       "carries them for ~100 ticks.")
     else:
         h1.metric("Realtime Factor", f"{factor:.3f}",
                   delta=f"{(1 - factor) * 100:.0f}% behind realtime", delta_color="inverse",

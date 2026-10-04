@@ -204,14 +204,31 @@ Three consequences, and the repo depends on all three:
 
 * **`verisim_realtime_factor` is the number to alert on** —
   `interval / mean_period`, dimensionless, so one threshold works on a fast box
-  and a slow one. 1.0 is realtime.
+  and a slow one. 1.0 is realtime. **Threshold it at 0.80, not 0.95** (t_35b4d860).
+  The trip rate is set by the tick-cost TAIL, not the median: on the dev slot the
+  median tick costs 72ms against a 30s cadence, yet 3.29% cost over a second and
+  the slowest cost 95.7s, so any trailing window containing a spike reads low for
+  as long as that spike stays inside it. Recomputing every trailing-100 window
+  over the whole 37,313-row ledger puts **4.88% below 0.95, 2.35% below 0.90 and
+  1.10% below 0.80** — so 0.95 fires on one window in twenty of an ordinary
+  healthy day, and an alert that does that trains people to dismiss it. Widen
+  `window` before lowering the threshold if one slow tick keeps tripping you;
+  note 0.90 is *worse* at `window=200` (3.92%), so widening does not rescue it.
+  `grocery/api/tests/test_realtime_factor_threshold.py` pins the numbers and
+  this repo's own UI boundary.
 * **`verisim_data_staleness_seconds` is suppressed when the clock skews.** The
   generator writes `simulation_dt` from a *naive* `datetime.now()`, which
-  Postgres reads in the DATABASE's timezone — when the two containers' `TZ`
-  differ (compose sets it per service) the column lands hours off. Measured on
-  the dev slot: the newest `simulation_dt` was 3.71h in the *future*, and a naive
-  subtraction reported `-13412s`. A negative staleness is not a measurement, so it
-  is omitted and `simulation_clock_skew_seconds` explains why.
+  Postgres resolves in the SESSION's timezone; `get_connection` now pins that
+  session to the generator's own `TZ` (t_35b4d860), so the column is right on
+  every topology and this block is the backstop for rows written before that fix.
+  Note the shape of the failure, because it is not what it looks like: a genuine
+  timezone mismatch produces a CONSTANT offset (whole hours, stddev ~0). The
+  3.71h reading that originally motivated this block does NOT have that shape —
+  over all 37,407 dev rows `recorded_at - simulation_dt` is mean 0.200s, stddev
+  1.21s, max 95.73s, because `simulation_dt` is stamped at tick start and
+  `recorded_at` at tick end, so the gap IS the tick's wall clock. Do not read
+  this suppression as evidence a skew is present: `simulation_clock_skew_seconds`
+  reports one, and on a correctly wired stack it stays absent.
   `verisim_tick_staleness_seconds` and `realtime_factor` are unaffected —
   `recorded_at` is `DEFAULT NOW()`, written by Postgres itself.
 * **`lagging` never fires on a stopped, paused or backfilling generator.** A
