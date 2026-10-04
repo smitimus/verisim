@@ -173,15 +173,28 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
+      # The tag convention lives in ONE script, shared with the gas-station
+      # workflow, because it used to be duplicated here and the two could drift.
+      #
+      # What it changed: a main push used to publish `:${GITHUB_SHA}` and nothing
+      # else, so the registry filled with 40-character tags and the only version
+      # tags were the v* tag pushes — 18 of the 28 tags on smiti/verisim-grocery
+      # were bare SHAs on 2026-10-04, and the last versioned release was v1.3.3
+      # on 2026-09-21 (t_4b05829c). A version you can read in the registry is now
+      # the tracked VERSION file at the repo root, and the script refuses to
+      # publish rather than falling back to the SHA: no VERSION, a malformed one,
+      # a pyproject drift, or a v* tag that disagrees with VERSION all fail the
+      # job by name.
       - name: Compute tags
         id: meta
         if: github.event_name != 'pull_request'
         run: |
-          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+          bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"
+          {
+            echo "::notice title=Published version::${IMAGE_NAME} will be tagged :${VERSION}"
+            echo "tags:"
+            echo "${tags}"
+          }
 
       - name: Push to Docker Hub
         if: github.event_name != 'pull_request'

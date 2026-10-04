@@ -43,6 +43,56 @@ bash build-and-push.sh gas-station        # builds smiti/verisim-gas-station:lat
 - Platform: `linux/amd64`
 - Build context is `verisim/` (needs access to both `base/` and industry source)
 
+### The published tag is the VERSION file, not the commit SHA
+
+**Every publish tags the image with a version number that we track.** The source of
+truth is the `VERSION` file at the repo root; `pyproject.toml`'s `version` must match
+it, and a mismatch fails the publish rather than picking a winner.
+
+A publish pushes three (or four) tags:
+
+| tag | when | purpose |
+|---|---|---|
+| `latest` | always | moving pointer — what `switch.sh release` pulls |
+| `<VERSION>` e.g. `1.3.4` | always | **the tracked version** — the readable tag |
+| `<full commit sha>` | always | traceability back to the commit |
+| `v<VERSION>` e.g. `v1.3.4` | v* tag push only | the release event, historic shape |
+
+The convention lives in **one** script, `.github/scripts/compute-push-tags.sh`, which
+both workflows call. Do not compute tags inline in a workflow — that duplication is
+exactly how the two workflows drifted and how the SHA tag survived.
+
+`compute-push-tags.sh` **refuses to publish** (exit 1, naming the file in an
+`::error::` annotation) rather than falling back to a SHA when:
+
+- there is no `VERSION` file, or it is not `MAJOR.MINOR.PATCH`;
+- `VERSION` and `pyproject.toml` disagree;
+- the push is a `v*` tag that disagrees with `VERSION` — shipping it would put a
+  version in the registry that the repo does not claim;
+- the ref is neither `refs/heads/main` nor `refs/tags/v*`.
+
+**To cut a release:** bump `VERSION` *and* `pyproject.toml` in one commit (the gate
+fails otherwise). A main push then publishes the new version automatically; if you
+also want a git tag, `git tag -a v<VERSION>` must match `VERSION` or the tag push fails.
+
+**This gate is real** (t_4b05829c, which found 18 of 28 tags on
+`smiti/verisim-grocery` were bare 40-char SHAs and the last versioned release was
+v1.3.3 on 2026-09-21):
+
+- `tools/check_publish_tags.py` runs from `gas-station/generator/tests/test_build_checks.py`,
+  asserts `VERSION` ↔ `pyproject.toml` agree, asserts **both** workflows route through
+  the shared script and inline no `tags=` from `GITHUB_SHA`/`GITHUB_REF_NAME`, and
+  *executes* the script for a main push and a `v*` push to assert every emitted tag is
+  a version or the commit sha;
+- `.github/scripts/publish-tag-tests.sh` is the convention's own harness (19 cases),
+  run as part of that checker;
+- `test_publish_tag_gate_has_teeth` plants the old `:${GITHUB_SHA}` computation in a
+  repo copy and **requires the gate to fail** — a gate nobody has watched fail is a
+  gate that does not work.
+
+Never reintroduce a `:${GITHUB_SHA}`-only publish, and never make a missing VERSION
+degrade quietly to the SHA: an unreadable tag is what this section exists to prevent.
+
 ### Build Troubleshooting
 
 | Symptom | Likely Cause | Fix |
