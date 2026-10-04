@@ -209,6 +209,13 @@ combo_deals:
   valid_duration_days: 7
   combo_use_rate: 0.15             # probability a transaction triggers a deal
 
+observability:
+  # Seconds of LAG past which each tick is logged at WARNING instead of INFO.
+  # Measured against a fixed-rate schedule, so a fast tick repays debt and being
+  # ahead of schedule is never reported. 120 = four default-cadence ticks
+  # (t_196d8da2). Same value and meaning as grocery/config.yaml.
+  tick_lag_alert_seconds: 120
+
 online:
   orders_per_day:                  # the channel's own baseline day, drawn once per
     min: 90                        # date (like pos_transactions_per_day). The

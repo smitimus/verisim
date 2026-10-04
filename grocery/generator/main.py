@@ -35,6 +35,7 @@ from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
 from models import shrinkage, promotions, scheduling, returns, online, weather, customers
 from elasticity import seed_elasticity_columns
+from observability import DEFAULT_ALERT_LAG_SECONDS, TickCadence
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
 logging.basicConfig(
@@ -43,6 +44,44 @@ logging.basicConfig(
     datefmt='%Y-%m-%dT%H:%M:%S',
 )
 log = logging.getLogger('grocery-generator')
+
+
+# ---------------------------------------------------------------------------
+# Tick observability (t_196d8da2)
+# ---------------------------------------------------------------------------
+
+# ONE cadence for the process, and the only place a tick is timed. `run_tick`
+# takes it as an argument rather than reaching for a module global so the
+# measurement cannot silently start counting from a different anchor than the one
+# the log line reports — and so a test can hand it a fake clock.
+cadence = TickCadence()
+
+
+def alert_threshold(cfg) -> float:
+    """Seconds of deadline lag past which a tick is worth a WARNING.
+
+    Read through `getattr` at both levels rather than as `cfg.observability.…`:
+    every install generated before this card has a config.yaml with no
+    `observability:` block, and a generator that raised on the missing attribute
+    would turn a metrics addition into a boot failure discovered on upgrade. The
+    default is the same 120s the dataclass and both shipped config.yaml files
+    carry.
+
+    A non-numeric or negative value also degrades to the default rather than
+    being coerced: `float("soon")` becoming 0.0 would alert on every single tick,
+    and a negative threshold matches everything by construction. Both turn a typo
+    into an alert nobody can turn off, which is worse than a slightly wrong
+    default.
+    """
+    block = getattr(cfg, 'observability', None)
+    value = getattr(block, 'tick_lag_alert_seconds', None)
+    if value is None:
+        return DEFAULT_ALERT_LAG_SECONDS
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ALERT_LAG_SECONDS
+    return value if value >= 0 else DEFAULT_ALERT_LAG_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +589,9 @@ def _weather_for_tick(conn, cfg, sim_date: date, weather_cache: Dict[str, object
 
 
 def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
-             products, trucks, members, coupons, deals, weather_cache=None):
+             products, trucks, members, coupons, deals, weather_cache=None,
+             tick_cadence=None):
+    tick_cadence = tick_cadence if tick_cadence is not None else cadence
     scenario_names = get_active_scenario_names(conn, sim_dt)
     if weather_cache is None:
         weather_cache = {}
@@ -575,7 +616,15 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     sim_date = sim_dt.date()
     pos_count = compute_pos_count(cfg, scenario, tick_seconds, sim_date)
     online_count = compute_online_count(cfg, scenario, tick_seconds, sim_date)
-    tick_start = time.monotonic()
+    # One timing for the whole tick, started before the first write and ended
+    # after the ledger row, so `wall_clock_ms` and the log line can never
+    # disagree about what a tick cost (t_196d8da2). `begin` also reads this tick's
+    # lateness against its deadline, which is `tick_seconds` plus what this
+    # generator's recent ticks have actually been costing — the loop sleeps
+    # `tick_seconds` unconditionally, so a tick's own cost is ADDED to the
+    # interval rather than absorbed by it. See observability.py for why a plain
+    # `tick_seconds` schedule cannot carry an absolute alert threshold.
+    tick_cadence.begin(tick_seconds)
 
     # This week's ad prices: the price of record for ad items, and therefore
     # the key of the demand curve for them (t_08deeddf). One read per tick,
@@ -707,12 +756,60 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         if restock:
             returns.restock_returns(conn, restock)
 
-    elapsed_ms = round((time.monotonic() - tick_start) * 1000)
+    # `tick_cadence.end()` is the tick's own measurement, started in `begin`
+    # above, so `wall_clock_ms` on the ledger and the number in this log line are
+    # the same value by construction rather than by two timers agreeing.
+    elapsed_ms = tick_cadence.end()
     record_stats(conn, pos_count, tc_count, orders_count,
                  scenario.scenario_tag, sim_dt, elapsed_ms)
-    log.info("Tick done %dms | POS: %d | Online: %d | TC: %d | Orders: %d | Stockouts: %d | Scenario: %s",
-             elapsed_ms, pos_count, online_count, tc_count, orders_count,
-             stockouts, scenario.scenario_tag)
+    _log_tick(cfg, tick_cadence, sim_dt, elapsed_ms,
+              counts=dict(pos=pos_count, online=online_count, tc=tc_count,
+                          orders=orders_count, stockouts=stockouts),
+              scenario_tag=scenario.scenario_tag)
+
+
+def _log_tick(cfg, tick_cadence, sim_dt, elapsed_ms, counts, scenario_tag):
+    """The one log line per tick, carrying the tick's identity and lateness.
+
+    Every line begins `[tick N][sim_dt]` (t_196d8da2), so a `docker logs` filter
+    or a grep for one tick is enough to find every line that tick produced — the
+    thing that turned "the container crash-loops after an upgrade" into
+    log-archaeology before. The second bracket is the SIMULATED stamp, not the
+    wall clock: during a backfill the two differ, and only the simulated one
+    says which historical hour the line is about.
+
+    The level is the alert. A tick within `observability.tick_lag_alert_seconds`
+    of its schedule is ordinary business at INFO; past it, the same line is
+    repeated at WARNING with the lag spelled out, because "behind realtime" is
+    the signal an operator needs and burying it at INFO is what made it
+    undiscoverable. One line, not two, at INFO — the warning is the level, not an
+    extra emission.
+    """
+    prefix = tick_cadence.prefix(sim_dt)
+    summary = (f"{prefix} done {elapsed_ms}ms | POS: {counts['pos']} | "
+               f"Online: {counts['online']} | TC: {counts['tc']} | "
+               f"Orders: {counts['orders']} | Stockouts: {counts['stockouts']} | "
+               f"Scenario: {scenario_tag}")
+    lag = tick_cadence.lag_seconds
+    log.info("%s | lag: %.1fs", summary, lag)
+
+    threshold = alert_threshold(cfg)
+    if tick_cadence.lagging(threshold):
+        log.warning(
+            "%s BEHIND REALTIME: %.1fs past schedule "
+            "(threshold %.1fs, cadence %ds, tick cost %dms). Every further tick "
+            "stays this far behind until a tick runs under its interval.",
+            prefix, lag, threshold, tick_cadence.snapshot()['interval_seconds'],
+            elapsed_ms)
+    if tick_cadence.overran:
+        # Distinct from the lag: this is the one tick that alone blew its own
+        # budget, which is a different diagnosis from being behind.
+        log.warning("%s OVERRAN: tick cost %dms against a %ds interval "
+                    "(%.1fx) — the loop sleeps the interval afterwards, so this "
+                    "is added to the lag above.",
+                    prefix, elapsed_ms,
+                    tick_cadence.snapshot()['interval_seconds'],
+                    elapsed_ms / max(1, tick_cadence.snapshot()['interval_seconds'] * 1000))
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +894,17 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
         log.info("Backfilling %s%s (hours %d–%d)",
                  cur_date, " [partial — up to current hour]" if is_partial else "", start_hour, end_hour)
 
+        # Per-hour timings for this day's summary line, in wall-clock ms.
+        # NOT the realtime cadence: a backfill sleeps nothing between simulated
+        # hours, so "lateness" against tick_interval_seconds is undefined here —
+        # pretending otherwise would report a backfill as hours behind realtime
+        # when it is simply working through history (t_196d8da2). Duration is the
+        # meaningful number, and it was being written to the ledger as a hardcoded
+        # 0: a backfill hour that took 90s to write, and one that took 9s, both
+        # recorded "0ms", which is a false measurement rather than a missing one.
+        hour_ms = []
+        day_start = time.monotonic()
+
         for hour in range(start_hour, end_hour + 1):
             # For the last hour of a partial day, use the exact current time so
             # the final backfill tick aligns with where realtime picks up.
@@ -805,6 +913,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 sim_dt = datetime.now()
             else:
                 sim_dt = datetime(cur_date.year, cur_date.month, cur_date.day, hour, 0, 0)
+            hour_start = time.monotonic()
             scenario_names = get_active_scenario_names(conn, sim_dt)
             scenario = get_scenario_context(
                 scenario_names,
@@ -878,8 +987,23 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             #
             # Counts are what landed (`len(depletion)`), not `pos_count`: a
             # stockout-capped hour (t_959cd040) writes fewer rows than it planned for.
+            # `wall_clock_ms` is this hour's REAL cost, measured across the hour's
+            # own writes and not a literal 0 — the same column the realtime path
+            # fills, so a consumer reading the ledger cannot tell the two writers
+            # apart by which one reports zero (t_196d8da2).
+            hour_elapsed_ms = int(round((time.monotonic() - hour_start) * 1000))
+            hour_ms.append(hour_elapsed_ms)
             record_stats(conn, len(depletion), tc_count, len(online_depletion),
-                         scenario.scenario_tag, sim_dt, 0, bump_state_clock=False)
+                         scenario.scenario_tag, sim_dt, hour_elapsed_ms,
+                         bump_state_clock=False)
+            # Per-hour progress, on the same `[tick N][sim_dt]` convention as the
+            # realtime path so one grep pattern reads both. No lag here: the
+            # backfill owes realtime nothing while it writes history.
+            log.info("[tick %d][%s] backfill hour done %dms | POS: %d | "
+                     "Online: %d | TC: %d | Scenario: %s",
+                     len(hour_ms), sim_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                     hour_elapsed_ms, len(depletion), len(online_depletion),
+                     tc_count, scenario.scenario_tag)
 
         if not is_partial:
             # Full day: run all end-of-day events in one pass.
@@ -949,6 +1073,17 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 eod_scenario)
             if restock:
                 returns.restock_returns(conn, restock)
+
+        # One line per backfilled day (t_196d8da2). A 30-day backfill is the
+        # operator's longest unattended wait in the whole product, and before
+        # this there was no way to tell a slow one from a stuck one short of
+        # querying the DB by hand. Total, slowest hour, and how far the day is
+        # through — enough to answer "is it making progress and roughly how
+        # long is left".
+        day_total_ms = int(round((time.monotonic() - day_start) * 1000))
+        log.info("[tick %d][%s] backfill day done in %dms (%d hours, slowest %dms)",
+                 len(hour_ms), cur_date.strftime('%Y-%m-%d'),
+                 day_total_ms, len(hour_ms), max(hour_ms, default=0))
 
         with conn.cursor() as cur:
             cur.execute("""
@@ -1030,14 +1165,26 @@ def main():
             state = read_state(conn)
 
             if state['mode'] == 'stopped' or not state['is_running']:
+                # A stopped generator owes realtime nothing, so the schedule is
+                # dropped rather than carried forward: after an overnight stop the
+                # first tick back would otherwise report eight hours of "lag"
+                # that describes the stop rather than the generator's health
+                # (t_196d8da2).
+                cadence.reset()
                 time.sleep(state['tick_interval_seconds'])
                 continue
 
             if state['is_paused']:
+                cadence.reset()
                 time.sleep(state['tick_interval_seconds'])
                 continue
 
             if state['mode'] == 'backfill':
+                # Same reasoning. A backfill is deliberately writing history, so
+                # it is not behind realtime and must not be reported as though it
+                # were — that would read as a false alarm on every fresh install,
+                # which is how an alert gets ignored for the rest of its life.
+                cadence.reset()
                 members = pos.fetch_loyalty_members(conn)
                 coupons = pos.fetch_active_coupons(conn)
                 deals = pos.fetch_active_deals(conn)
