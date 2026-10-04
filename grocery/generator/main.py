@@ -26,14 +26,14 @@ import os
 import random
 import time
 from datetime import datetime, timedelta, date
-from typing import Dict
+from typing import Dict, Optional
 
 import psycopg2
 import psycopg2.extras
 
 from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
-from models import shrinkage, promotions, scheduling, returns, online, customers
+from models import shrinkage, promotions, scheduling, returns, online, weather, customers
 from elasticity import seed_elasticity_columns
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
@@ -308,12 +308,16 @@ def seed_all(conn, cfg):
     # an install generated before t_08deeddf keeps its old `pos.products` and
     # the demand curve has nothing to key on. Idempotent and additive.
     seed_elasticity_columns(conn, cfg)
-    # Same trap, same remedy, for the customer dimension: a `schema.sql`
-    # change only reaches a fresh bootstrap, so an install generated before
-    # this card has no `pos.customers` and no `loyalty_members.customer_id`.
-    # Idempotent and additive, and it must run BEFORE seed_loyalty_members
-    # so the seeded cards are dimensioned in the same pass.
+    # Same trap, same remedy, for the customer dimension: a `schema.sql` change
+    # only reaches a fresh bootstrap, so an install generated before this card
+    # has no `pos.customers` and no `loyalty_members.customer_id`. Idempotent and
+    # additive, and it must run BEFORE seed_loyalty_members so the seeded cards
+    # are dimensioned in the same pass.
     customers.ensure_tables(conn)
+    # Same trap, same remedy, for `weather.daily` (t_2ab1fb0a): a schema.sql
+    # change only reaches a fresh bootstrap, so an install generated before this
+    # card has no `weather` schema at all. Idempotent and additive.
+    weather.ensure_table(conn)
     locations = hr.seed_locations(conn, cfg)
     employees = hr.seed_employees(conn, cfg, locations)
     departments = pos.seed_departments(conn, cfg)
@@ -502,15 +506,47 @@ def get_ad_product_prices(conn, sim_date: date) -> Dict[str, float]:
         """, (sim_date, sim_date))
         return {r[0]: float(r[1]) for r in cur.fetchall()}
 
+def _weather_for_tick(conn, cfg, sim_date: date, weather_cache: Dict[str, object]) -> Optional[dict]:
+    """The day's weather effect, generated once and cached (t_2ab1fb0a).
+
+    Realtime writes 2880 ticks a day at the default 30 s cadence, and
+    `ensure_day` is a per-store upsert — running it every tick would be 2880
+    redundant round trips. The day's row set does not change, so it is written
+    once when the date changes and read back from the table for every tick after
+    that, which is also what makes the modifier applied to a tick provably the
+    same row a forecasting model would join on.
+
+    `weather_cache` is a single mutable dict holding the cached date and effect
+    rather than two arguments plus a return value, so the three call sites stay
+    one line each. The DB read is cheap and deliberately NOT cached across a
+    date change: a fresh day must be re-read after `ensure_day` writes it.
+    """
+    if not cfg.weather.enabled:
+        return None
+    if weather_cache.get('date') != sim_date:
+        weather.ensure_day(conn, cfg, sim_date)
+        weather_cache['date'] = sim_date
+        weather_cache['effect'] = None  # force a read-back of the rows just written
+    if weather_cache.get('effect') is None:
+        weather_cache['effect'] = weather.day_effect(conn, cfg, sim_date)
+    return weather_cache.get('effect')
+
+
 
 def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
-             products, trucks, members, coupons, deals):
+             products, trucks, members, coupons, deals, weather_cache=None):
     scenario_names = get_active_scenario_names(conn, sim_dt)
+    if weather_cache is None:
+        weather_cache = {}
     scenario = get_scenario_context(
         scenario_names,
         float(state['volume_multiplier']),
         sim_dt,
         cfg,
+        # The synthetic weather covariate, read back from weather.daily (None
+        # when the series is off or the day has no rows, in which case the
+        # context is left exactly as it was pre-t_2ab1fb0a).
+        weather_effect=_weather_for_tick(conn, cfg, sim_dt.date(), weather_cache),
     )
     # Write merged tag back for API display
     with conn.cursor() as cur:
@@ -618,6 +654,24 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         # Phase 4: labor scheduling (generate next week) + resolve yesterday's actuals
         scheduling.resolve_schedule_actuals(conn, sim_dt.date(), scenario)
         scheduling.generate_weekly_schedule(conn, sim_dt.date(), locations, employees, scenario)
+        # Yesterday's shifts, so they are resolved under YESTERDAY's weather —
+        # `attendance_modifier` is a per-day covariate now (t_2ab1fb0a), and
+        # scoring yesterday's attendance with today's storm would write the
+        # call-outs on the wrong shift rows. Read yesterday's own effect rather
+        # than reusing this tick's; a day with no rows (the series was off, or
+        # the row predates the backfill) leaves the shift resolution exactly as
+        # it was pre-t_2ab1fb0a.
+        yesterday_ctx = scenario
+        if cfg.weather.enabled:
+            yesterday = sim_dt.date() - timedelta(days=1)
+            yesterday_effect = weather.day_effect(conn, cfg, yesterday)
+            if yesterday_effect:
+                yesterday_ctx = get_scenario_context(
+                    get_active_scenario_names(conn, sim_dt),
+                    1.0, sim_dt, cfg,
+                    weather_effect=yesterday_effect,
+                )
+        scheduling.resolve_schedule_actuals(conn, sim_dt.date(), yesterday_ctx)
 
         # Phase 5: coupon + combo deal lifecycle — deactivate expired, top up
         # active set so the API always serves a current batch (freshness
@@ -669,6 +723,15 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
         # for slow backfills that span midnight.
         now_dt = datetime.now()
         today = date.today()
+
+        # The day's weather, written BEFORE any of its hours (t_2ab1fb0a).
+        # One upsert per day rather than one per simulated hour, and a re-run
+        # of a resumed day rewrites the identical values because the series is a
+        # pure function of (store, date) — so a gap-filled backfill converges
+        # instead of accumulating a second, different weather history.
+        weather_cache = {}
+        if cfg.weather.enabled:
+            weather.ensure_day(conn, cfg, cur_date)
 
         # For past dates, check if this day is fully generated using max txn timestamp.
         # Resume from the hour AFTER the last recorded transaction instead of hour 0.
@@ -731,6 +794,10 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 scenario_names,
                 float(state['volume_multiplier']),
                 sim_dt, cfg,
+                # Read back from the rows `ensure_day` wrote for cur_date, so
+                # a backfilled hour sees the same weather a realtime hour on
+                # that date would — the whole reason the series is pure.
+                weather_effect=_weather_for_tick(conn, cfg, cur_date, weather_cache),
             )
             # One tick per simulated hour here, so the whole hour's demand is
             # written at once — the same law realtime applies 120 times an hour,
@@ -791,6 +858,10 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 eod_scenario_names,
                 1.0,
                 eod_dt, cfg,
+                # The SAME day's weather the hourly loop above sampled, so
+                # end-of-day models (scheduling, shrinkage, transport) see the
+                # covariate the day's transactions were written under.
+                weather_effect=_weather_for_tick(conn, cfg, cur_date, weather_cache),
             )
 
             order_ids = ordering.check_and_create_orders(
@@ -817,6 +888,17 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             promotions.ensure_current_ad(conn, cur_date, products)
             scheduling.resolve_schedule_actuals(conn, cur_date, eod_scenario)
             scheduling.generate_weekly_schedule(conn, cur_date, locations, employees, eod_scenario)
+            # Yesterday's shifts resolved under YESTERDAY's weather, exactly as
+            # the realtime midnight path does (t_2ab1fb0a). Inside a backfilled
+            # day the wrong day's storm here would be invisible in the day's own
+            # transactions, and still put the call-outs on the wrong rows.
+            prev_effect = (weather.day_effect(conn, cfg, cur_date - timedelta(days=1))
+                           if cfg.weather.enabled else None)
+            prev_ctx = get_scenario_context(
+                eod_scenario_names, 1.0, eod_dt, cfg,
+                weather_effect=prev_effect or weather_cache.get('effect'),
+            )
+            scheduling.resolve_schedule_actuals(conn, cur_date, prev_ctx)
 
             # Coupon + combo deal lifecycle (same as realtime Phase 5) —
             # a 30-day backfill must not leave deals expired at the end.
@@ -901,6 +983,11 @@ def main():
     members = pos.fetch_loyalty_members(conn)
     coupons = pos.fetch_active_coupons(conn)
     deals = pos.fetch_active_deals(conn)
+    # Survives across ticks, not across a restart: the day's weather rows are
+    # written once when the date changes and then read back from the table, so
+    # a 30 s tick does not re-upsert 2880 times a day (t_2ab1fb0a). A restart
+    # re-derives it from the same pure seed, so the values are unchanged.
+    weather_cache = {}
 
     while True:
         try:
@@ -926,7 +1013,8 @@ def main():
                 continue
 
             run_tick(conn, cfg, state, datetime.now(), locations, employees,
-                     departments, products, trucks, members, coupons, deals)
+                     departments, products, trucks, members, coupons, deals,
+                     weather_cache=weather_cache)
 
             tick_count += 1
             if tick_count % REFRESH_EVERY == 0:

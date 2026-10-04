@@ -12,14 +12,31 @@ Multiple scenarios can be active simultaneously. Their effects are merged:
   - active_promotions : union of all departments
   - coupon_multiplier : max across all active scenarios
   - scenario_tag      : joined with '+' (e.g. 'promotion+holiday_week')
+
+AUTOMATIC CALENDAR. Two automatic layers, both computed from `simulation_dt`
+rather than from a human switching a scenario on:
+
+  - the holiday calendar (`_get_holiday_multiplier`, below)
+  - the synthetic weather series (t_2ab1fb0a), passed in as
+    `weather_effect` — the day's aggregate read back from `weather.daily` by
+    `models.weather.day_effect`. It is a parameter, not a database read: this
+    is the one volume law both channels sample from, and the covariate must be
+    the row an analyst joins on, not a second derivation of it.
 """
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict
+from typing import List, Optional, Tuple, Dict
 from datetime import datetime, date
 
 import psycopg2.extras
 
 from config import Config
+
+
+# How far a day's demand modifier must sit below 1.0 before the day is worth
+# tagging as weather-driven (t_2ab1fb0a). A front's edge days land at ~0.9 and
+# the heat term nudges even a clear summer day off 1.0, so an exact test would
+# tag most of the calendar and make the tag useless for isolating real storms.
+WEATHER_TAG_EPSILON = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +190,20 @@ class ScenarioContext:
     loyalty_engagement_modifier: float = 1.0  # scale coupon/deal usage probability
     per_store_multipliers: Dict[str, float] = field(default_factory=dict)  # per-store volume overrides
 
+    # Synthetic weather (t_2ab1fb0a). The day's WEATHER volume response, which
+    # is NOT the same number as the manual `severe_weather` scenario's: a mild
+    # front and a total storm both move demand, and the automatic series scales
+    # it continuously where the scenario applies one flat factor. Kept in its
+    # own field so the two effects stay distinguishable — folding weather into
+    # volume_multiplier would make a weather day indistinguishable from a
+    # promotion day in `scenario_tag`, and the covariate is the whole point of
+    # the table.
+    weather_volume_modifier: float = 1.0
+    # The day's condition (`clear`, `rain`, `severe_storm`, …) and its mean
+    # severity, kept for the scenario tag and for downstream attribution.
+    weather_condition: str = ''
+    weather_severity: float = 0.0
+
 
 def _apply_single_scenario(
     scenario_name: str,
@@ -232,10 +263,20 @@ def get_scenario_context(
     volume_multiplier_override: float,
     simulation_dt: datetime,
     cfg: Config,
+    weather_effect: Optional[Dict[str, float]] = None,
 ) -> ScenarioContext:
     """
     Build a ScenarioContext for this tick from a list of active scenario names.
     Scenarios are merged multiplicatively for volume; promotions are unioned.
+
+    `weather_effect` is the day's aggregate read back from `weather.daily`
+    (`models.weather.day_effect`, or None when the series is off or the day has
+    no rows). It is a PARAMETER rather than a database read because this
+    function is the single volume law both channels sample from and every
+    caller already holds a connection: reading the covariate here would put a
+    second source of it in the scenario layer, and the row that scales a tick
+    must be the row an analyst joins on. main.py reads it once per tick and
+    passes it down, exactly as it passes `volume_multiplier_override`.
     """
     ctx = ScenarioContext()
 
@@ -275,5 +316,31 @@ def get_scenario_context(
     # Day-of-week multiplier
     dow = simulation_dt.strftime('%A').lower()
     ctx.volume_multiplier *= cfg.volumes.day_of_week_multipliers.get(dow, 1.0)
+
+    # Automatic weather (t_2ab1fb0a) — stacks on top of everything above, and
+    # multiplicative like the rest. The persisted row's own modifier is
+    # authoritative: recomputing it here would be exactly the second source of
+    # truth the row exists to prevent, and the number that scales a tick must
+    # be the number an analyst joins on.
+    if weather_effect:
+        demand = float(weather_effect.get('demand_modifier', 1.0))
+        ctx.weather_volume_modifier = demand
+        ctx.volume_multiplier *= demand
+        # `min`, not assignment: a day can only remove attendance, and a
+        # manual scenario already on the books (severe_weather → 0.75) must
+        # win over a milder automatic day.
+        ctx.attendance_modifier = min(
+            ctx.attendance_modifier,
+            float(weather_effect.get('attendance_modifier', 1.0)))
+        ctx.weather_condition = str(weather_effect.get('condition_code', ''))
+        ctx.weather_severity = float(weather_effect.get('severity_index', 0.0))
+        # Only a day that actually cost footfall is tagged, so a reader can
+        # still isolate real weather days with one string test. A clear day
+        # stays `normal` — the covariate lives in weather.daily, not in a tag,
+        # and tagging every day would drown the tag column.
+        if demand < 1.0 - WEATHER_TAG_EPSILON and weather_effect.get('is_severe_day'):
+            ctx.scenario_tag = (
+                'weather_severe' if ctx.scenario_tag == 'normal'
+                else f'{ctx.scenario_tag}+weather_severe')
 
     return ctx

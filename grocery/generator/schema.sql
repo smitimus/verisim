@@ -761,3 +761,68 @@ CREATE TABLE inv.sku_demand_daily (
 
 CREATE INDEX idx_sku_demand_date     ON inv.sku_demand_daily (demand_date);
 CREATE INDEX idx_sku_demand_product  ON inv.sku_demand_daily (product_id, demand_date);
+
+-- ---------------------------------------------------------------------------
+-- Synthetic weather — the continuous external covariate (t_2ab1fb0a)
+-- ---------------------------------------------------------------------------
+-- Before this table weather reached the simulation only when a human switched
+-- the `severe_weather` scenario on (`scenario_engine`, the manual-only branch
+-- at lines 209-211); the automatic calendar covered holidays alone. So grocery
+-- demand had no weather covariate a forecasting model could regress on —
+-- only a scenario_tag that was either `normal` or `severe_weather`.
+--
+-- ONE ROW PER STORE PER DAY, and the day's weather is a PURE FUNCTION of
+-- (location, date, config) — `models/weather.py`. That purity is the same
+-- requirement that made `main.daily_volume_target()` a pure function of the
+-- date: the backfill replays a day an hour at a time and realtime writes it
+-- 2880 times a day, so a series that redrew per call would give one date
+-- different weather depending on who wrote it, and a re-seeded backfill would
+-- not reproduce the series it replaced.
+--
+-- The series is SYNTHETIC on purpose (generator ADR: stdlib + psycopg2 +
+-- pyyaml, no third-party weather client): a seasonal cosine in temperature
+-- scaled by latitude, seeded synoptic fronts shared across a region, and a
+-- per-store local deviation.
+--
+-- `demand_modifier` / `attendance_modifier` are persisted WITH the row rather
+-- than recomputed at read time, so the number that scales a tick is the number
+-- a downstream analyst joins on. The tick reads the row back
+-- (`weather.day_effect`), it does not re-derive it.
+--
+-- The two loss terms in the demand law are DERIVED from the `severe_weather`
+-- scenario constants (`weather.modifiers_for`), so a full-severity day
+-- reproduces exactly `scenarios.severe_weather.volume_multiplier` (0.7) and
+-- `attendance_modifier` (0.75). A second, independently tuned set of weather
+-- coefficients would let the automatic path and the manual scenario disagree
+-- about what a total storm does to the shop — the two-sources-of-truth defect
+-- in a new costume.
+--
+-- Declared last: it references hr.locations, and nothing references it.
+CREATE SCHEMA IF NOT EXISTS weather;
+
+CREATE TABLE weather.daily (
+    location_id         UUID         NOT NULL REFERENCES hr.locations(location_id),
+    weather_date        DATE         NOT NULL,
+    temp_high_f         NUMERIC(5,1) NOT NULL,
+    temp_low_f          NUMERIC(5,1) NOT NULL,
+    precipitation_in    NUMERIC(5,2) NOT NULL CHECK (precipitation_in >= 0),
+    cloud_cover_pct     NUMERIC(5,1) NOT NULL CHECK (cloud_cover_pct BETWEEN 0 AND 100),
+    severity_index      NUMERIC(5,3) NOT NULL CHECK (severity_index >= 0 AND severity_index <= 1),
+    is_severe           BOOLEAN      NOT NULL,
+    condition_code      VARCHAR(20)  NOT NULL
+                           CHECK (condition_code IN ('clear', 'cloudy', 'rain',
+                                                     'snow', 'severe_storm')),
+    demand_modifier     NUMERIC(7,4) NOT NULL CHECK (demand_modifier > 0),
+    attendance_modifier NUMERIC(7,4) NOT NULL CHECK (attendance_modifier > 0
+                                                     AND attendance_modifier <= 1),
+    -- The seed that produced this row. Persisted so an analyst can re-derive
+    -- the series (and prove it is reproducible) without the generator's code.
+    seed_key            VARCHAR(120) NOT NULL,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (location_id, weather_date),
+    -- A day's low cannot sit above its high, whatever the generator drew.
+    CONSTRAINT weather_temp_ordering CHECK (temp_low_f <= temp_high_f)
+);
+
+CREATE INDEX idx_weather_date     ON weather.daily (weather_date);
+CREATE INDEX idx_weather_location ON weather.daily (location_id, weather_date);
