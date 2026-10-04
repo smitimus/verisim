@@ -289,6 +289,80 @@ class WeatherConfig:
     demand_modifier_ceiling: float = 1.80
     # Attendance floors at the scenario's own value, never below this.
     attendance_modifier_floor: float = 0.30
+class VendorConfig:
+    """
+    Vendors (t_57b1a1ab).
+
+    Before this the vendor list was a hardcoded 6-element Python literal inside
+    `models.inventory.seed_inventory` — unconfigurable without a code change, and
+    with no properties: every vendor was equally good, because the only
+    behaviour that hung off a vendor was `random.choice(SUPPLIERS)`.
+
+    `vendors` is the catalogue: name, fulfilment model, and the three numbers
+    that make one vendor behave differently from another — promised lead time
+    and its spread, and the short-ship rate. Everything the rest of the model
+    reads (whether a short-ship is creditable, how long a claim window is, how
+    long the vendor takes to pay) travels with the vendor row so the numbers a
+    mart measures are the numbers a manager can also tune.
+
+    Defaults are the names the old literal carried, so a stock image with no
+    `vendors:` block in config.yaml behaves like the pre-t_57b1a1ab generator's
+    *catalogue* — though no longer like its flat 5% short rate.
+    """
+    vendors: List[Dict] = field(default_factory=lambda: [
+        # Warehouse-shipped broadline vendors: longer lead times, and they
+        # carry the majority of the catalogue.
+        {'name': 'UNFI', 'code': 'UNFI', 'fulfillment_model': 'warehouse',
+         'lead_time_mean_days': 2.0, 'lead_time_stddev_days': 0.6,
+         'short_ship_rate': 0.06, 'credit_eligible': True, 'credit_window_days': 14},
+        {'name': 'McLane Company', 'code': 'MCLN', 'fulfillment_model': 'warehouse',
+         'lead_time_mean_days': 2.5, 'lead_time_stddev_days': 0.8,
+         'short_ship_rate': 0.09, 'credit_eligible': True, 'credit_window_days': 14},
+        {'name': 'C&S Wholesale Grocers', 'code': 'CSWG', 'fulfillment_model': 'warehouse',
+         'lead_time_mean_days': 3.0, 'lead_time_stddev_days': 1.0,
+         'short_ship_rate': 0.12, 'credit_eligible': False, 'credit_window_days': 10},
+        {'name': 'Supervalu', 'code': 'SVAL', 'fulfillment_model': 'warehouse',
+         'lead_time_mean_days': 2.0, 'lead_time_stddev_days': 0.5,
+         'short_ship_rate': 0.05, 'credit_eligible': True, 'credit_window_days': 21},
+        # DSD vendors own the perishable departments — they bring it to the
+        # store rather than to our warehouse, so they move faster and are
+        # credited on the spot.
+        {'name': 'FreshFields Produce', 'code': 'FRFP', 'fulfillment_model': 'dsd',
+         'lead_time_mean_days': 1.0, 'lead_time_stddev_days': 0.3,
+         'short_ship_rate': 0.08, 'credit_eligible': True, 'credit_window_days': 7},
+        {'name': "KeHE Distributors", 'code': 'KEHE', 'fulfillment_model': 'dsd',
+         'lead_time_mean_days': 1.5, 'lead_time_stddev_days': 0.4,
+         'short_ship_rate': 0.04, 'credit_eligible': True, 'credit_window_days': 14},
+        {'name': 'Nash Finch', 'code': 'NASH', 'fulfillment_model': 'warehouse',
+         'lead_time_mean_days': 3.5, 'lead_time_stddev_days': 1.2,
+         'short_ship_rate': 0.15, 'credit_eligible': False, 'credit_window_days': 7},
+    ])
+
+    # Departments whose SKUs are delivered by DSD rather than through our
+    # warehouse. Keyed by department name from `products.departments`.
+    dsd_departments: List[str] = field(default_factory=lambda: ['Produce', 'Deli'])
+
+    # How often a DSD vendor visits a store. Each DSD vendor delivers on this
+    # many weekdays a week (0 = once a week), chosen evenly — real produce
+    # vendors come far more often than a broadline DSD partner.
+    dsd_deliveries_per_week: int = 4
+
+    # What share of a DSD line a vendor fails to deliver, on top of
+    # `short_ship_rate` — a DSD truck that misses its window leaves the shelf
+    # empty the same morning, which is the perishable version of the problem.
+    dsd_short_ship_bonus: float = 0.02
+
+    # Share of a short-ship that is credited (of those that are creditable at
+    # all). The rest is written off: in real grocery the claim is not always
+    # worth the paperwork, and a mart that shows 100% recovery would be a lie.
+    credit_claim_rate: float = 0.70
+
+    # Share of submitted claims the vendor pays vs disputes.
+    credit_pay_rate: float = 0.85
+
+    # Days after submission before a claim we have not heard back on is
+    # chased. A claim older than this is chased daily.
+    credit_chase_after_days: int = 3
 
 
 @dataclass
@@ -307,6 +381,7 @@ class Config:
     customers: CustomersConfig = field(default_factory=CustomersConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
     inventory: InventoryConfig = field(default_factory=InventoryConfig)
+    vendors: VendorConfig = field(default_factory=VendorConfig)
     coupons: CouponConfig = field(default_factory=CouponConfig)
     combo_deals: ComboDealConfig = field(default_factory=ComboDealConfig)
     transport: TransportConfig = field(default_factory=TransportConfig)
@@ -501,3 +576,190 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
     for warning in validate_and_apply(cfg, data, SCHEMA, unused=KNOWN_UNUSED,
                                       path_hint=cfg.conf_path, product='grocery'):
         log.warning('config.yaml: %s', warning)
+
+    gen = data.get('generator', {})
+    if 'tick_interval_seconds' in gen:
+        cfg.generator.tick_interval_seconds = int(gen['tick_interval_seconds'])
+    if 'simulation_minutes_per_tick' in gen:
+        cfg.generator.simulation_minutes_per_tick = int(gen['simulation_minutes_per_tick'])
+    if 'backfill_lookback_days' in gen:
+        cfg.generator.backfill_lookback_days = int(gen['backfill_lookback_days'])
+
+    loc = data.get('locations', {})
+    if 'store_count' in loc:
+        cfg.locations.store_count = int(loc['store_count'])
+    if 'warehouse_count' in loc:
+        cfg.locations.warehouse_count = int(loc['warehouse_count'])
+    sepl = loc.get('store_employees_per_location', {})
+    if 'min' in sepl:
+        cfg.locations.store_employees_per_location_min = int(sepl['min'])
+    if 'max' in sepl:
+        cfg.locations.store_employees_per_location_max = int(sepl['max'])
+    wepl = loc.get('warehouse_employees_per_location', {})
+    if 'min' in wepl:
+        cfg.locations.warehouse_employees_per_location_min = int(wepl['min'])
+    if 'max' in wepl:
+        cfg.locations.warehouse_employees_per_location_max = int(wepl['max'])
+
+    vol = data.get('volumes', {})
+    pos_d = vol.get('pos_transactions_per_day', {})
+    if 'min' in pos_d:
+        cfg.volumes.pos_transactions_per_day_min = int(pos_d['min'])
+    if 'max' in pos_d:
+        cfg.volumes.pos_transactions_per_day_max = int(pos_d['max'])
+    if 'hourly_weights' in vol:
+        cfg.volumes.hourly_weights = [float(x) for x in vol['hourly_weights']]
+    if 'day_of_week_multipliers' in vol:
+        cfg.volumes.day_of_week_multipliers = {k: float(v) for k, v in vol['day_of_week_multipliers'].items()}
+
+    loy = data.get('loyalty', {})
+    if 'signup_rate' in loy:
+        cfg.loyalty.signup_rate = float(loy['signup_rate'])
+    if 'loyalty_usage_rate' in loy:
+        cfg.loyalty.loyalty_usage_rate = float(loy['loyalty_usage_rate'])
+    if 'initial_member_count' in loy:
+        cfg.loyalty.initial_member_count = int(loy['initial_member_count'])
+
+    pri = data.get('pricing', {})
+    if 'product_price_change_frequency_days' in pri:
+        cfg.pricing.product_price_change_frequency_days = float(pri['product_price_change_frequency_days'])
+    if 'tax_rate' in pri:
+        cfg.pricing.tax_rate = float(pri['tax_rate'])
+    if 'price_history_backfill_days' in pri:
+        cfg.pricing.price_history_backfill_days = int(pri['price_history_backfill_days'])
+    for key in ('default_price_elasticity', 'elasticity_jitter',
+                'price_min_ratio', 'price_market_factor_weight'):
+        if key in pri:
+            setattr(cfg.pricing, key, float(pri[key]))
+
+    inv = data.get('inventory', {})
+    if 'initial_stock_per_product' in inv:
+        cfg.inventory.initial_stock_per_product = int(inv['initial_stock_per_product'])
+    if 'restock_threshold_pct' in inv:
+        cfg.inventory.restock_threshold_pct = float(inv['restock_threshold_pct'])
+    for key in ('reorder_demand_window_days', 'restock_check_frequency_hours'):
+        if key in inv:
+            setattr(cfg.inventory, key, int(inv[key]))
+    for key in ('reorder_qty_max_multiple',):
+        if key in inv:
+            setattr(cfg.inventory, key, float(inv[key]))
+    if 'enforce_stock_availability' in inv:
+        cfg.inventory.enforce_stock_availability = bool(inv['enforce_stock_availability'])
+
+    # Vendors (t_57b1a1ab). Keyed off the same defaults the dataclass declares,
+    # so a config.yaml that carries only some of a vendor's fields keeps the
+    # defaults for the rest instead of zeroing them — a missing
+    # `short_ship_rate` must not become "this vendor never shorts".
+    ven = data.get('vendors', {})
+    if 'vendors' in ven and ven['vendors']:
+        merged = []
+        by_code = {
+            str(v.get('code') or v.get('name')): v
+            for v in cfg.vendors.vendors
+        }
+        for entry in ven['vendors']:
+            if not isinstance(entry, dict):
+                continue
+            base = dict(by_code.get(str(entry.get('code') or entry.get('name')), {}))
+            base.update({k: v for k, v in entry.items() if v is not None})
+            merged.append(base)
+        if merged:
+            cfg.vendors.vendors = merged
+    if 'dsd_departments' in ven:
+        cfg.vendors.dsd_departments = list(ven['dsd_departments'])
+    if 'dsd_deliveries_per_week' in ven:
+        cfg.vendors.dsd_deliveries_per_week = int(ven['dsd_deliveries_per_week'])
+    for key in ('dsd_short_ship_bonus', 'credit_claim_rate', 'credit_pay_rate'):
+        if key in ven:
+            setattr(cfg.vendors, key, float(ven[key]))
+    if 'credit_chase_after_days' in ven:
+        cfg.vendors.credit_chase_after_days = int(ven['credit_chase_after_days'])
+
+    cpn = data.get('coupons', {})
+    if 'active_at_any_time' in cpn:
+        cfg.coupons.active_at_any_time = int(cpn['active_at_any_time'])
+    if 'valid_duration_days' in cpn:
+        cfg.coupons.valid_duration_days = int(cpn['valid_duration_days'])
+    if 'coupon_use_rate' in cpn:
+        cfg.coupons.coupon_use_rate = float(cpn['coupon_use_rate'])
+
+    cdl = data.get('combo_deals', {})
+    if 'active_at_any_time' in cdl:
+        cfg.combo_deals.active_at_any_time = int(cdl['active_at_any_time'])
+    if 'valid_duration_days' in cdl:
+        cfg.combo_deals.valid_duration_days = int(cdl['valid_duration_days'])
+    if 'combo_use_rate' in cdl:
+        cfg.combo_deals.combo_use_rate = float(cdl['combo_use_rate'])
+
+    trp = data.get('transport', {})
+    if 'cost_per_mile' in trp:
+        cfg.transport.cost_per_mile = float(trp['cost_per_mile'])
+
+    onl = data.get('online', {})
+    opd = onl.get('orders_per_day', {})
+    if 'min' in opd:
+        cfg.online.orders_per_day_min = int(opd['min'])
+    if 'max' in opd:
+        cfg.online.orders_per_day_max = int(opd['max'])
+    for key in ['pickup_share', 'service_fee_delivery', 'cancel_rate', 'noshow_rate']:
+        if key in onl:
+            setattr(cfg.online, key, float(onl[key]))
+
+    sc = data.get('scenarios', {})
+    rh = sc.get('rush_hour', {})
+    if 'volume_multiplier' in rh:
+        cfg.scenarios.rush_hour_multiplier = float(rh['volume_multiplier'])
+    if 'hours' in rh:
+        cfg.scenarios.rush_hour_hours = list(rh['hours'])
+
+    # Existing scenarios
+    we = sc.get('weekend', {})
+    if 'volume_multiplier' in we:
+        cfg.scenarios.weekend_multiplier = float(we['volume_multiplier'])
+    if 'labor_multiplier' in we:
+        cfg.scenarios.weekend_labor_multiplier = float(we['labor_multiplier'])
+
+    hw = sc.get('holiday_week', {})
+    if 'volume_multiplier' in hw:
+        cfg.scenarios.holiday_week_multiplier = float(hw['volume_multiplier'])
+    if 'labor_multiplier' in hw:
+        cfg.scenarios.holiday_labor_multiplier = float(hw['labor_multiplier'])
+
+    pro = sc.get('promotion', {})
+    if 'labor_multiplier' in pro:
+        cfg.scenarios.promotion_labor_multiplier = float(pro['labor_multiplier'])
+
+    dc = sc.get('double_coupons', {})
+    if 'coupon_multiplier' in dc:
+        cfg.scenarios.double_coupon_multiplier = float(dc['coupon_multiplier'])
+
+    # New scenarios (verisim#12)
+    inf = sc.get('inflation_pressure', {})
+    if 'price_modifier' in inf:
+        cfg.scenarios.inflation_price_modifier = float(inf['price_modifier'])
+    if 'loyalty_modifier' in inf:
+        cfg.scenarios.inflation_loyalty_modifier = float(inf['loyalty_modifier'])
+
+    sw = sc.get('severe_weather', {})
+    if 'volume_multiplier' in sw:
+        cfg.scenarios.weather_volume_multiplier = float(sw['volume_multiplier'])
+    if 'attendance_modifier' in sw:
+        cfg.scenarios.weather_attendance_modifier = float(sw['attendance_modifier'])
+
+    sd = sc.get('supplier_disruption', {})
+    if 'shrinkage_modifier' in sd:
+        cfg.scenarios.supply_disruption_shrinkage_modifier = float(sd['shrinkage_modifier'])
+
+    rp = sc.get('regional_peak', {})
+    if 'stores' in rp:
+        cfg.scenarios.regional_peak_stores = {str(k): float(v) for k, v in rp['stores'].items()}
+
+    dd = sc.get('deep_discount', {})
+    if 'price_modifier' in dd:
+        cfg.scenarios.deep_discount_price_modifier = float(dd['price_modifier'])
+
+    prods = data.get('products', {})
+    if 'initial_count' in prods:
+        cfg.initial_product_count = int(prods['initial_count'])
+    if 'departments' in prods:
+        cfg.departments = prods['departments']
