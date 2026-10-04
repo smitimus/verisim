@@ -47,7 +47,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install test deps
-        run: pip install pytest httpx
+        # pyyaml is not optional here: the API contract tests import
+        # `base/api/main.py`, which has done `import yaml` since dc641bd (to read
+        # the mounted config.yaml). Without it those tests die on collection with
+        # `ModuleNotFoundError: No module named 'yaml'` — which reads like a
+        # broken test rather than a missing dependency, and took a CI run to
+        # diagnose. The `test` job above already installs pyyaml for the same
+        # reason.
+        run: pip install pytest httpx pyyaml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
