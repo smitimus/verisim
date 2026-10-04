@@ -227,12 +227,11 @@ def ensure_tables(conn) -> bool:
     generated before this card has neither `pos.customers` nor
     `loyalty_members.customer_id`. Two statements, and the ORDER matters:
 
-    1. `CREATE TABLE IF NOT EXISTS pos.customers` (+ its index). The generator's
-       role holds CREATE on the `pos` schema, so this always works — on a
-       non-owner role as much as on the owner.
+    1. `CREATE TABLE IF NOT EXISTS pos.customers` (+ its index).
     2. `ALTER TABLE pos.loyalty_members ADD COLUMN IF NOT EXISTS customer_id`
-       (+ its index). This one is conditional on the role being able to ALTER,
-       because it is **not** a no-op when it cannot.
+       (+ its index).
+
+    Both are guarded, and neither is allowed to raise.
 
     Why the ALTER is guarded
     -----------------------
@@ -254,27 +253,35 @@ def ensure_tables(conn) -> bool:
     reads, which would bury the one case that matters. Hence: probe the column
     first, and only attempt the ALTER when it is genuinely missing.
 
-    This is a pre-existing blocker, not one this card introduces.
-    `elasticity.seed_elasticity_columns` (t_08deeddf) issues exactly the same
-    unguarded ALTER on every boot, and on CT106 the `pos.products.reference_price`
-    column it is supposed to add is STILL absent from a data dir holding 525,704
-    transactions — so that migration has not been landing there either, silently.
-    This card does not crash the generator over a migration the codebase
-    already cannot perform: it logs, degrades to a no-op, and leaves the
-    supported fix (re-bootstrap the data dir from a current image) in the log
-    message. The API degrades to an empty result rather than 500ing — see
-    `base/api/main.py::_has_customers_table`.
+    Why the CREATE is now guarded too (t_b17da778)
+    ----------------------------------------------
+    The docstring used to claim "the generator's role holds CREATE on the `pos`
+    schema, so this always works". Whatever the truth of that claim on some slot,
+    relying on it was the actual bug: nothing checked that the CREATE had
+    landed, so the function returned True and logged "Created pos.customers"
+    purely because it had *issued* a statement. On CT106 the log said that and
+    the table did not exist. (Measured on the dev data dir 2026-10-04: `verisim`
+    does hold CREATE on `pos` — the ACL is `verisim=UC/postgres`, granted by
+    entrypoint.sh — so a CREATE there does land; the failure the card saw was
+    on a data dir where that grant is absent. Which is exactly why "it always
+    works" was the wrong thing to rely on.)
 
-    Returns True when `pos.customers` was created by this call.
+    So the outcome is now VERIFIED rather than assumed: probe the catalog before
+    and after, and report only what is true. A refusal degrades to a warning
+    instead of propagating.
+
+    And the CREATE is COMMITTED on its own before the ALTER is attempted.
+    Sharing one transaction meant the ALTER's `conn.rollback()` discarded the
+    CREATE too, so the non-owner path ended with no `pos.customers` at all —
+    degrading to exactly the state the call was meant to fix, after having
+    first claimed it had succeeded.
+
+    Returns True when `pos.customers` was ABSENT before this call and EXISTS
+    after it. Verified, not assumed — but still "created by this call", so a
+    data dir that already had the table keeps returning False (that no-op
+    contract is what keeps `seed_all` from logging about it every boot).
     """
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COUNT(*) FROM information_schema.tables
-            WHERE table_schema = 'pos' AND table_name = 'customers'
-        """)
-        created = not cur.fetchone()[0]
-        if created:
-            cur.execute(DDL)
+    created = _ensure_customers_table(conn)
 
     # Only attempt the ALTER when the column is genuinely absent. See the
     # docstring: on a non-owner role the statement raises even as a no-op.
@@ -284,22 +291,70 @@ def ensure_tables(conn) -> bool:
             with conn.cursor() as cur:
                 cur.execute(CUSTOMER_ID_DDL)
             conn.commit()
-        except psycopg2.errors.InsufficientPrivilege:
+        except psycopg2.Error as exc:
             conn.rollback()
             log.warning(
-                "Cannot add pos.loyalty_members.customer_id: the generator's "
-                "role (%s) does not own the table (owner is %s) — on the "
-                "standalone image schema.sql is applied by the postgres role "
-                "while the generator connects as %s. pos.customers was created "
-                "but will stay EMPTY on this data dir, and "
-                "/grocery/pos/customers serves an empty result. Re-bootstrap the "
-                "database from a current image to get the dimension, or run the "
-                "ALTER as the table owner. See models/customers.py::ensure_tables.",
-                role, owner, role,
+                "Cannot add pos.loyalty_members.customer_id (%s): the "
+                "generator's role (%s) does not own the table (owner is %s) "
+                "— on the standalone image schema.sql is applied by the "
+                "postgres role while the generator connects as %s. "
+                "pos.customers was created but will stay EMPTY on this data "
+                "dir, and /grocery/pos/customers serves an empty result. Run "
+                "the ALTER as the table owner, or re-bootstrap the data dir "
+                "from a current image. See models/customers.py::ensure_tables.",
+                exc.__class__.__name__, role, owner, role,
             )
     if created:
-        log.info("Created pos.customers (this data dir predates the customer dimension).")
+        log.info("pos.customers exists now (this data dir predated the "
+                 "customer dimension).")
     return created
+
+
+def _ensure_customers_table(conn) -> bool:
+    """Create `pos.customers` when absent. True when this call created it.
+
+    The return value is VERIFIED, not assumed: the previous implementation
+    returned True because it had issued a CREATE, which on a postgres-owned
+    schema means it had reported success for a statement that raised — the log
+    said "Created pos.customers" and the table did not exist.
+
+    So: probe before, attempt, then probe again, and report True only when the
+    table was genuinely absent before AND is genuinely present after.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_schema = 'pos' AND table_name = 'customers'
+        """)
+        already = cur.fetchone()[0]
+        if already:
+            return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(DDL)
+        # Committed on its own, before any later statement: the ALTER below is
+        # attempted in a separate transaction precisely so its refusal cannot
+        # roll this CREATE back out of existence.
+        conn.commit()
+    except psycopg2.Error as exc:
+        conn.rollback()
+        log.warning(
+            "Cannot create pos.customers (%s): the generator's role (%s) could "
+            "not create it, so /grocery/pos/customers serves an empty result "
+            "on this data dir. This needs either CREATE on the `pos` schema or "
+            "ownership of it (the standalone image's entrypoint.sh applies "
+            "schema.sql as postgres, and whatever that grants is what this "
+            "role has). Run the DDL as the schema owner, or re-bootstrap from "
+            "a current image. See models/customers.py::ensure_tables.",
+            exc.__class__.__name__, _current_role(conn),
+        )
+        return False
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_schema = 'pos' AND table_name = 'customers'
+        """)
+        return bool(cur.fetchone()[0])
 
 
 def _current_role(conn) -> str:
