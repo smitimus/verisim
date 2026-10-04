@@ -342,13 +342,92 @@ CREATE TABLE transport.load_items (
 -- Inventory Schema — stock management
 -- ---------------------------------------------------------------------------
 
+-- Vendors (t_57b1a1ab). Before this, a supplier was a free-text
+-- supplier_name VARCHAR(200) stamped onto inv.products and inv.receipts: no row
+-- to join to, so "how reliable is Nash Finch" and "which vendor keeps shorting
+-- us" were unanswerable, and lead_time_days was a single static integer per
+-- product rather than a distribution around a vendor's promise.
+--
+-- Declared BEFORE inv.products because that table now carries the FK.
+--
+-- fulfillment_model is the one field that decides the shape of the whole
+-- inbound story:
+--   'warehouse' — goods are palletised onto transport.loads and arrive as
+--                 inv.receipts. This is what the generator models today.
+--   'dsd'       — Direct Store Delivery: the vendor's own truck restocks the
+--                 shelf. There is no pallet on our truck and no receiving
+--                 dock, so a DSD line is delivered, not received: it gets a
+--                 delivery event and a shorter lead time, but no
+--                 inv.receipts row. See `delivery_schedules` below.
+CREATE TABLE inv.suppliers (
+    supplier_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    supplier_name      VARCHAR(200) NOT NULL UNIQUE,
+    supplier_code      VARCHAR(20)  NOT NULL UNIQUE,
+    fulfillment_model  VARCHAR(20)  NOT NULL DEFAULT 'warehouse'
+                          CHECK (fulfillment_model IN ('warehouse', 'dsd')),
+    -- What the vendor PROMISES. lead_time_stddev_days is what makes the
+    -- realised lead time vary: the generator draws around this mean per
+    -- product per order rather than shipping inv.products.lead_time_days as a
+    -- constant, so a vendor-performance mart can measure a vendor against its
+    -- own promise instead of against a number it made up.
+    lead_time_mean_days     NUMERIC(4,1) NOT NULL DEFAULT 2.0,
+    lead_time_stddev_days   NUMERIC(4,1) NOT NULL DEFAULT 0.5,
+    -- Share of units a short-ship is expected to fill at this vendor. The
+    -- realised short rate is drawn around it (see
+    -- models.suppliers.short_probability_for), so a "good" vendor is genuinely
+    -- better than a bad one rather than every vendor shorting at 5%.
+    short_ship_rate     NUMERIC(4,3) NOT NULL DEFAULT 0.05
+                          CHECK (short_ship_rate >= 0 AND short_ship_rate <= 1),
+    -- Whether a short-ship is credited to the vendor at all. A credit memo is a
+    -- commercial event, not a physical return, so it belongs to the vendor's
+    -- terms: a warehouse vendor with no returns agreement (produce vendors
+    -- typically credit, dairy vendors typically do not) never produces one.
+    credit_eligible    BOOLEAN      NOT NULL DEFAULT TRUE,
+    -- Days the store has to submit a credit claim before it lapses.
+    credit_window_days  SMALLINT     NOT NULL DEFAULT 14,
+    -- Mean days from a credit memo to the vendor paying it, with its own
+    -- spread — so inv.supplier_credit_memos.resolved_dt is a real distribution.
+    credit_settle_mean_days  SMALLINT NOT NULL DEFAULT 10,
+    credit_settle_stddev_days SMALLINT NOT NULL DEFAULT 4,
+    is_active          BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    -- A zero spread would make the realised lead time a second static column,
+    -- which is the defect this table exists to remove.
+    CONSTRAINT supplier_lead_time_nonneg CHECK (
+        lead_time_mean_days >= 0 AND lead_time_stddev_days >= 0
+    ),
+    CONSTRAINT supplier_credit_window_positive CHECK (credit_window_days > 0)
+);
+
+CREATE TABLE inv.supplier_delivery_schedules (
+    schedule_id        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    supplier_id        UUID        NOT NULL REFERENCES inv.suppliers(supplier_id),
+    location_id        UUID        NOT NULL REFERENCES hr.locations(location_id),
+    delivery_weekday   SMALLINT    NOT NULL
+                           CHECK (delivery_weekday BETWEEN 0 AND 6),
+    delivery_window_start TIME     NOT NULL,
+    delivery_window_end   TIME     NOT NULL,
+    is_active          BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (supplier_id, location_id, delivery_weekday)
+);
+
 CREATE TABLE inv.products (
     inv_product_id  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     product_id      UUID         NOT NULL REFERENCES pos.products(product_id) UNIQUE,
     reorder_point   INTEGER      NOT NULL DEFAULT 20,
     reorder_qty     INTEGER      NOT NULL DEFAULT 100,
     unit_of_measure VARCHAR(20)  NOT NULL DEFAULT 'each',
+    -- First-class vendor reference (t_57b1a1ab). supplier_name is KEPT as the
+    -- denormalised display string and is written from sup.supplier_name in the
+    -- same statement, so every existing reader of the column keeps working and
+    -- the two can never disagree; a new consumer should join supplier_id.
+    supplier_id     UUID         REFERENCES inv.suppliers(supplier_id),
     supplier_name   VARCHAR(200),
+    -- The per-product realised/planned lead time, as before. The vendor's
+    -- promise (lead_time_mean_days) is the mean this is drawn around, so the
+    -- two are comparable and a vendor-performance mart can measure slippage.
     lead_time_days  INTEGER      NOT NULL DEFAULT 2,
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -370,6 +449,11 @@ CREATE TABLE inv.receipts (
     location_id     UUID          NOT NULL REFERENCES hr.locations(location_id),
     received_by     UUID          REFERENCES hr.employees(employee_id),
     received_dt     TIMESTAMPTZ   NOT NULL,
+    -- First-class vendor reference (t_57b1a1ab); supplier_name is the
+    -- denormalised display copy written in the same INSERT. NULL supplier_id
+    -- means the receipt did not come from a known vendor — which, for a
+    -- warehouse load carrying our own stock, is a legitimate state.
+    supplier_id     UUID          REFERENCES inv.suppliers(supplier_id),
     supplier_name   VARCHAR(200),
     po_number       VARCHAR(50),
     load_id         UUID          REFERENCES transport.loads(load_id),
@@ -826,3 +910,185 @@ CREATE TABLE weather.daily (
 
 CREATE INDEX idx_weather_date     ON weather.daily (weather_date);
 CREATE INDEX idx_weather_location ON weather.daily (location_id, weather_date);
+-- Inbound short-ships and the credit-memo lifecycle (t_57b1a1ab)
+-- ---------------------------------------------------------------------------
+-- The generator already recorded a short-pick: `fulfillment.items` carries
+-- `pick_status = 'short'` with `quantity_picked < quantity_requested`, and
+-- `transport.receive_delivered_loads` simply EXCLUDED those lines from the
+-- receipt (`WHERE fi.pick_status = 'picked'`). So a warehouse that could not
+-- fill a line was invisible — the store's shelf came up short with no
+-- shortage record, no vendor blamed, and no money recovered. The chain closed
+-- ordering → fulfillment → transport → receipt but stopped one step short of
+-- the vendor relationship.
+--
+-- This is that step, in two tables:
+--
+--   inv.short_ship_events     — what the vendor did NOT send, at the moment the
+--                               line was found short. Creditable or not.
+--   inv.supplier_credit_memos — the commercial claim: which vendor, how many
+--                               units, at what cost, submitted inside the claim
+--                               window or not, and whether it has been paid.
+--
+-- A credit memo is worth its own lifecycle rather than a boolean because a
+-- vendor-performance mart needs to measure exactly what a procurement analyst
+-- asks about: fill rate, dollars credited per vendor, and DAYS TO PAY. A memo
+-- that never resolves is a real finding (the vendor is not paying), so
+-- `resolved_dt IS NULL` is a legitimate state, not a defect — see the CHECK.
+--
+-- Declared AFTER fulfillment.items because the short event references the pick
+-- that was short, and the memo references the short event.
+CREATE TABLE inv.short_ship_events (
+    short_ship_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    fulfillment_item_id  UUID         NOT NULL REFERENCES fulfillment.items(item_id),
+    fulfillment_id       UUID         NOT NULL REFERENCES fulfillment.orders(fulfillment_id),
+    supplier_id          UUID         NOT NULL REFERENCES inv.suppliers(supplier_id),
+    product_id           UUID         NOT NULL REFERENCES pos.products(product_id),
+    -- The store the shortfall hits. For a DSD vendor this is the store the
+    -- vendor restocked directly; for a warehouse vendor it is the load's
+    -- destination.
+    location_id          UUID         NOT NULL REFERENCES hr.locations(location_id),
+    -- DSD vendors deliver to the shelf and are credited on the spot; a
+    -- warehouse vendor's short-ship is discovered at the receiving dock.
+    detected_source      VARCHAR(20)  NOT NULL
+                            CHECK (detected_source IN ('receiving', 'dsd_delivery')),
+    quantity_requested   NUMERIC(8,3) NOT NULL CHECK (quantity_requested > 0),
+    quantity_picked      NUMERIC(8,3) NOT NULL CHECK (quantity_picked >= 0),
+    quantity_short       NUMERIC(8,3) NOT NULL CHECK (quantity_short > 0),
+    unit_cost            NUMERIC(8,4) NOT NULL,
+    short_value          NUMERIC(12,2) NOT NULL,
+    -- The vendor promised this many days; this is what it took. Recorded per
+    -- event because inv.products.lead_time_days is a static per-product
+    -- integer: the promise and the slippage are only comparable when the
+    -- realised figure lands in an event row.
+    promised_lead_time_days  INTEGER   NOT NULL,
+    realized_lead_time_days  INTEGER   NOT NULL,
+    is_creditable        BOOLEAN      NOT NULL,
+    event_dt             TIMESTAMPTZ  NOT NULL,
+    scenario_tag         VARCHAR(50),
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT short_ship_quantities_balance CHECK (
+        quantity_short = quantity_requested - quantity_picked
+    ),
+    CONSTRAINT short_ship_within_request CHECK (
+        quantity_picked <= quantity_requested
+    ),
+    -- A credit can only be claimed on an actual shortfall, and only if the
+    -- vendor's terms allow it. Both are CHECKs rather than application logic
+    -- because this is the invariant a mart would otherwise silently violate.
+    CONSTRAINT short_ship_creditable_requires_short CHECK (
+        NOT is_creditable OR quantity_short > 0
+    )
+);
+
+CREATE TABLE inv.supplier_credit_memos (
+    credit_memo_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    credit_memo_number  VARCHAR(50)  NOT NULL UNIQUE,
+    short_ship_id       UUID         NOT NULL UNIQUE REFERENCES inv.short_ship_events(short_ship_id),
+    supplier_id         UUID         NOT NULL REFERENCES inv.suppliers(supplier_id),
+    product_id          UUID         NOT NULL REFERENCES pos.products(product_id),
+    location_id         UUID         NOT NULL REFERENCES hr.locations(location_id),
+    credit_quantity     NUMERIC(8,3) NOT NULL CHECK (credit_quantity > 0),
+    unit_cost           NUMERIC(8,4) NOT NULL,
+    credit_amount       NUMERIC(12,2) NOT NULL CHECK (credit_amount >= 0),
+    -- Why the vendor shorted. The reason mix is what makes a vendor
+    -- recoverable: a `warehouse_shortage` is the vendor's problem and usually
+    -- credited; a `quality_reject` is ours and usually written off.
+    short_reason        VARCHAR(30)  NOT NULL
+                          CHECK (short_reason IN ('warehouse_shortage','out_of_stock',
+                                                  'quality_reject','weather_carrier_delay',
+                                                  'delivery_missed')),
+    memo_status         VARCHAR(20)  NOT NULL DEFAULT 'open'
+                          CHECK (memo_status IN ('open','submitted','paid','rejected',
+                                                 'expired','written_off')),
+    -- Claim deadline, set from the supplier's credit_window_days. A memo past
+    -- it cannot be submitted — it expires, and that is the accounting reality
+    -- the mart is meant to surface, so the column exists rather than being
+    -- resolved away at write time.
+    claim_deadline      DATE         NOT NULL,
+    submitted_dt        TIMESTAMPTZ,
+    resolved_dt         TIMESTAMPTZ,
+    resolved_by         VARCHAR(40),
+    rejection_reason    VARCHAR(200),
+    scenario_tag        VARCHAR(50),
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT credit_submitted_requires_dt CHECK (
+        memo_status <> 'submitted' OR submitted_dt IS NOT NULL
+    ),
+    CONSTRAINT credit_resolved_requires_dt CHECK (
+        memo_status NOT IN ('paid', 'rejected') OR resolved_dt IS NOT NULL
+    ),
+    CONSTRAINT credit_claim_before_deadline CHECK (
+        submitted_dt IS NULL OR submitted_dt::date <= claim_deadline
+    ),
+    -- An expired or written-off memo is settled by NOT paying; those two must
+    -- not also claim to have been resolved by the vendor.
+    CONSTRAINT credit_terminal_has_no_vendor_resolution CHECK (
+        memo_status NOT IN ('expired', 'written_off')
+        OR (submitted_dt IS NULL AND resolved_dt IS NULL)
+    )
+);
+
+CREATE INDEX idx_suppliers_active            ON inv.suppliers (is_active);
+CREATE INDEX idx_suppliers_model             ON inv.suppliers (fulfillment_model);
+CREATE INDEX idx_supplier_schedules_location ON inv.supplier_delivery_schedules (location_id, delivery_weekday);
+CREATE INDEX idx_supplier_schedules_supplier ON inv.supplier_delivery_schedules (supplier_id);
+
+CREATE INDEX idx_inv_products_supplier       ON inv.products (supplier_id);
+CREATE INDEX idx_inv_receipts_supplier       ON inv.receipts (supplier_id);
+
+CREATE INDEX idx_short_ship_supplier         ON inv.short_ship_events (supplier_id, event_dt);
+CREATE INDEX idx_short_ship_product          ON inv.short_ship_events (product_id, event_dt);
+CREATE INDEX idx_short_ship_location         ON inv.short_ship_events (location_id, event_dt);
+CREATE INDEX idx_short_ship_event_dt         ON inv.short_ship_events (event_dt);
+CREATE INDEX idx_short_ship_fulfillment      ON inv.short_ship_events (fulfillment_id);
+
+CREATE INDEX idx_credit_memo_supplier        ON inv.supplier_credit_memos (supplier_id, created_at);
+CREATE INDEX idx_credit_memo_status          ON inv.supplier_credit_memos (memo_status);
+CREATE INDEX idx_credit_memo_product         ON inv.supplier_credit_memos (product_id, created_at);
+CREATE INDEX idx_credit_memo_location        ON inv.supplier_credit_memos (location_id, created_at);
+CREATE INDEX idx_credit_memo_deadline        ON inv.supplier_credit_memos (claim_deadline);
+CREATE INDEX idx_credit_memo_short_ship      ON inv.supplier_credit_memos (short_ship_id);
+
+-- ---------------------------------------------------------------------------
+-- Direct Store Delivery (t_57b1a1ab)
+-- ---------------------------------------------------------------------------
+-- A DSD vendor brings its own truck to the store. There is no pallet on one of
+-- our transport.loads and no receiving dock, so the inbound leg of the chain
+-- looks different: it is a DELIVERY, and there is no inv.receipts row behind
+-- it. Modelling it as a receipt would double-count the goods (once on our
+-- truck, once on the vendor's), and leaving it out would leave produce and deli
+-- — the perishable half of the catalogue — arriving by a mechanism no table
+-- describes.
+--
+-- The short-ship path for a DSD line therefore reads detected_source =
+-- 'dsd_delivery' rather than 'receiving', and credits on the spot.
+CREATE TABLE inv.dsd_deliveries (
+    dsd_delivery_id  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_id      UUID         NOT NULL REFERENCES inv.supplier_delivery_schedules(schedule_id),
+    supplier_id      UUID         NOT NULL REFERENCES inv.suppliers(supplier_id),
+    location_id      UUID         NOT NULL REFERENCES hr.locations(location_id),
+    delivery_date    DATE         NOT NULL,
+    delivered_at     TIMESTAMPTZ  NOT NULL,
+    scheduled_window TIME,
+    total_units      NUMERIC(12,3) NOT NULL DEFAULT 0,
+    total_value      NUMERIC(14,2) NOT NULL DEFAULT 0,
+    line_count       INTEGER      NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE inv.dsd_delivery_items (
+    dsd_item_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    dsd_delivery_id  UUID         NOT NULL REFERENCES inv.dsd_deliveries(dsd_delivery_id),
+    product_id       UUID         NOT NULL REFERENCES pos.products(product_id),
+    quantity_delivered NUMERIC(8,3) NOT NULL CHECK (quantity_delivered >= 0),
+    unit_cost        NUMERIC(8,4) NOT NULL,
+    line_total       NUMERIC(12,2) NOT NULL,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (dsd_delivery_id, product_id)
+);
+
+CREATE INDEX idx_dsd_deliveries_supplier ON inv.dsd_deliveries (supplier_id, delivery_date);
+CREATE INDEX idx_dsd_deliveries_location ON inv.dsd_deliveries (location_id, delivery_date);
+CREATE INDEX idx_dsd_deliveries_date     ON inv.dsd_deliveries (delivery_date);
+CREATE INDEX idx_dsd_delivery_items_prod ON inv.dsd_delivery_items (product_id);
