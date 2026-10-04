@@ -25,10 +25,15 @@ import uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent.parent))
 
-GENERATOR_SCHEMAS = (
-    "hr", "pos", "timeclock", "ordering", "fulfillment",
-    "transport", "inv", "pricing", "online", "control",
-)
+# Derived from the file, never hand-listed: a hardcoded list goes stale the
+# moment a card adds a schema (t_2ab1fb0a added `weather`), and then that schema
+# is applied under its ORIGINAL name while the rest are renamed, so it collides
+# with a real one — `relation "daily" already exists`, which reads like a
+# schema.sql bug and is not one.
+GENERATOR_SCHEMAS = tuple(sorted(set(re.findall(
+    r"CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*;",
+    (HERE.parent / "schema.sql").read_text(encoding="utf-8"),
+    flags=re.IGNORECASE))))
 
 
 def _psycopg2():

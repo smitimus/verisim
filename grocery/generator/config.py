@@ -289,6 +289,9 @@ class WeatherConfig:
     demand_modifier_ceiling: float = 1.80
     # Attendance floors at the scenario's own value, never below this.
     attendance_modifier_floor: float = 0.30
+
+
+@dataclass
 class VendorConfig:
     """
     Vendors (t_57b1a1ab).
@@ -441,6 +444,22 @@ SCHEMA = (
     (('inventory', 'reorder_demand_window_days'), ('inventory', 'reorder_demand_window_days')),
     (('inventory', 'reorder_qty_max_multiple'), ('inventory', 'reorder_qty_max_multiple')),
     (('inventory', 'enforce_stock_availability'), ('inventory', 'enforce_stock_availability')),
+    # vendors (t_57b1a1ab)
+    #
+    # `vendors.vendors` is a LIST OF DICTS and needs no per-field rules: a plain
+    # rule owns its whole subtree and the coercer validates the inside (rule 2 in
+    # config_schema's design notes), which is also how `products.departments` is
+    # handled. `_set_path` REPLACES the attribute wholesale, so the merge onto
+    # the declared defaults — so an omitted per-vendor key keeps its default
+    # instead of silently becoming 0 — is done by `_merge_vendor_defaults`
+    # below, which runs after validation and before the value is read.
+    (('vendors', 'vendors'), ('vendors', 'vendors')),
+    (('vendors', 'dsd_departments'), ('vendors', 'dsd_departments')),
+    (('vendors', 'dsd_deliveries_per_week'), ('vendors', 'dsd_deliveries_per_week')),
+    (('vendors', 'dsd_short_ship_bonus'), ('vendors', 'dsd_short_ship_bonus')),
+    (('vendors', 'credit_claim_rate'), ('vendors', 'credit_claim_rate')),
+    (('vendors', 'credit_pay_rate'), ('vendors', 'credit_pay_rate')),
+    (('vendors', 'credit_chase_after_days'), ('vendors', 'credit_chase_after_days')),
     # coupons / combo deals
     (('coupons', 'active_at_any_time'), ('coupons', 'active_at_any_time')),
     (('coupons', 'valid_duration_days'), ('coupons', 'valid_duration_days')),
@@ -570,6 +589,50 @@ def reload_config(cfg: 'Config') -> 'Config':
     return new_cfg
 
 
+def _merge_vendor_defaults(cfg: 'Config', block: dict) -> None:
+    """
+    Fold config.yaml's vendor entries onto the declared defaults.
+
+    `validate_and_apply` assigns through `_set_path`, which REPLACES the
+    attribute wholesale — correct for every other key, and wrong here. A config
+    that tweaks one vendor's `credit_window_days` would otherwise arrive with
+    that vendor's `short_ship_rate` reset to whatever `_coerce` made of an
+    absent key, and the failure is silent and invisible: the vendor simply never
+    shorts again.
+
+    Entries are matched to a default by `code` (falling back to `name`), so a
+    partial edit keeps every other field. An entry that matches no default is
+    taken as-is — a brand-new vendor is a legitimate thing to add.
+
+    Called from `_apply_yaml` AFTER validation, so this only ever sees a
+    document the validator already accepted.
+    """
+    entries = block.get('vendors')
+    if not entries:
+        return
+    # The DEFAULTS, not whatever `validate_and_apply` just wrote onto the
+    # attribute. It replaces the field wholesale with the raw YAML list, so
+    # reading cfg.vendors.vendors here would merge every entry against itself and
+    # the "keep the declared default" behaviour this function exists for would
+    # silently do nothing.
+    defaults = VendorConfig().vendors
+    by_key = {
+        str(vendor.get('code') or vendor.get('name')): dict(vendor)
+        for vendor in defaults
+    }
+    merged = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get('code') or entry.get('name'))
+        vendor = dict(by_key.get(key, {}))
+        # A key present but null means "unset this one", not "set it to null".
+        vendor.update({k: v for k, v in entry.items() if v is not None})
+        merged.append(vendor)
+    if merged:
+        cfg.vendors.vendors = merged
+
+
 def _apply_yaml(cfg: 'Config', data: dict) -> None:
     if not data:
         return
@@ -646,34 +709,7 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
     if 'enforce_stock_availability' in inv:
         cfg.inventory.enforce_stock_availability = bool(inv['enforce_stock_availability'])
 
-    # Vendors (t_57b1a1ab). Keyed off the same defaults the dataclass declares,
-    # so a config.yaml that carries only some of a vendor's fields keeps the
-    # defaults for the rest instead of zeroing them — a missing
-    # `short_ship_rate` must not become "this vendor never shorts".
-    ven = data.get('vendors', {})
-    if 'vendors' in ven and ven['vendors']:
-        merged = []
-        by_code = {
-            str(v.get('code') or v.get('name')): v
-            for v in cfg.vendors.vendors
-        }
-        for entry in ven['vendors']:
-            if not isinstance(entry, dict):
-                continue
-            base = dict(by_code.get(str(entry.get('code') or entry.get('name')), {}))
-            base.update({k: v for k, v in entry.items() if v is not None})
-            merged.append(base)
-        if merged:
-            cfg.vendors.vendors = merged
-    if 'dsd_departments' in ven:
-        cfg.vendors.dsd_departments = list(ven['dsd_departments'])
-    if 'dsd_deliveries_per_week' in ven:
-        cfg.vendors.dsd_deliveries_per_week = int(ven['dsd_deliveries_per_week'])
-    for key in ('dsd_short_ship_bonus', 'credit_claim_rate', 'credit_pay_rate'):
-        if key in ven:
-            setattr(cfg.vendors, key, float(ven[key]))
-    if 'credit_chase_after_days' in ven:
-        cfg.vendors.credit_chase_after_days = int(ven['credit_chase_after_days'])
+    _merge_vendor_defaults(cfg, data.get('vendors', {}))
 
     cpn = data.get('coupons', {})
     if 'active_at_any_time' in cpn:

@@ -44,13 +44,16 @@ import pytest
 SCHEMA_PATH = os.path.join(
     os.path.dirname(__file__), "..", "schema.sql")
 
-# Every schema schema.sql creates. The prefix rewrite covers exactly these, so a
-# dotted word that is not one of them (`dateutil.something` in a COMMENT, say)
-# is left alone rather than mangled.
-GENERATOR_SCHEMAS = (
-    "hr", "pos", "timeclock", "ordering", "fulfillment",
-    "transport", "inv", "pricing", "online", "control",
-)
+# Every schema schema.sql creates.
+#
+# DERIVED from the file, not hand-listed: a hand-maintained list silently goes
+# stale the moment a card adds a schema, and the symptom is not a failed test —
+# it is `relation "daily" already exists`, because the new schema is applied
+# under its ORIGINAL name while the others are renamed, so it collides with a
+# real one. That is exactly what happened when t_2ab1fb0a added `weather`.
+GENERATOR_SCHEMAS = tuple(sorted(set(re.findall(
+    r"CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*;",
+    open(SCHEMA_PATH, encoding="utf-8").read(), flags=re.IGNORECASE))))
 
 # The live sandbox prefix, set by the module-scoped `sandbox` fixture.
 #

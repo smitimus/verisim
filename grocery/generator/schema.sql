@@ -910,6 +910,8 @@ CREATE TABLE weather.daily (
 
 CREATE INDEX idx_weather_date     ON weather.daily (weather_date);
 CREATE INDEX idx_weather_location ON weather.daily (location_id, weather_date);
+
+-- ---------------------------------------------------------------------------
 -- Inbound short-ships and the credit-memo lifecycle (t_57b1a1ab)
 -- ---------------------------------------------------------------------------
 -- The generator already recorded a short-pick: `fulfillment.items` carries

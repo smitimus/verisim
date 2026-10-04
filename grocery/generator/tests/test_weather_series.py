@@ -763,6 +763,33 @@ def _schema_sql() -> str:
         return fh.read()
 
 
+
+
+def _weather_block(schema: str, from_table: bool = False) -> str:
+    """
+    Weather's own slice of schema.sql — NOT to EOF.
+
+    Every card appends its tables to the end of schema.sql, so a
+    `schema[index('weather'):]` slice silently grew to compare weather against
+    whichever card landed next (t_57b1a1ab appended the vendor tables below
+    weather and made this fail on a table it had never heard of). Bounded at the
+    next section header instead.
+
+    The file carries TWO header styles — a `#`-ruled one from the older phases
+    and a `-`-ruled one from the later appends — so both are matched; a bound
+    that only knew one of them would still run to EOF on the other.
+    """
+    anchor = ('CREATE TABLE weather.daily' if from_table
+              else 'CREATE SCHEMA IF NOT EXISTS weather;')
+    block = schema[schema.index(anchor):]
+    # The rule line is itself commented — `-- ---------------` — so the pattern
+    # has to allow that leading `-- `, not just a run of dashes. Two styles are
+    # in the file: `-- ` for the later appends and `# ` for the older phases.
+    header = re.compile(r'\n--\s*-{40,}\n-- \S|\n#\s*-{40,}\n# \S')
+    match = header.search(block)
+    return block[:match.start()] if match else block
+
+
 def test_ddl_matches_schema_sql():
     """`models.weather.DDL` is the copy that reaches an EXISTING data dir (a
     schema.sql change only hits a fresh bootstrap), so the two must declare the
@@ -771,7 +798,7 @@ def test_ddl_matches_schema_sql():
     match what the generator writes.
     """
     schema = _schema_sql()
-    block = schema[schema.index('CREATE SCHEMA IF NOT EXISTS weather;'):]
+    block = _weather_block(schema)
     normalise = lambda text: re.sub(r'\s+', ' ', text).strip()  # noqa: E731
     # schema.sql declares without IF NOT EXISTS (it runs once, on a fresh DB);
     # the module's copy adds it so the upgrade path is idempotent.
@@ -784,7 +811,7 @@ def test_every_column_the_generator_writes_is_declared():
     to one and not the other fails at runtime, on a customer's data dir, not in
     CI."""
     schema = _schema_sql()
-    block = schema[schema.index('CREATE TABLE weather.daily'):]
+    block = _weather_block(schema, from_table=True)
     # Column lines only: the table also contains PRIMARY KEY and CONSTRAINT
     # clauses at the same indent, which are not columns.
     declared = set(re.findall(r'^\s{4}(?!PRIMARY\b|CONSTRAINT\b|CHECK\b|FOREIGN\b|REFERENCES\b)'
@@ -802,7 +829,7 @@ def test_table_has_the_integrity_constraints_the_law_relies_on():
     that a DATABASE invariant rather than a convention, and
     `pos.transaction_items`' own `quantity > 0` is the precedent for it."""
     schema = _schema_sql()
-    block = schema[schema.index('CREATE TABLE weather.daily'):]
+    block = _weather_block(schema, from_table=True)
     for constraint in ('weather_temp_ordering',
                        'CHECK (demand_modifier > 0)',
                        'CHECK (attendance_modifier > 0',
