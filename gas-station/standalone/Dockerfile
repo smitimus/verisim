@@ -60,7 +60,10 @@ COPY --from=deps /app/venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-COPY base/ui/app.py /app/ui/app.py
+# Whole directory, not just app.py — the panel is a package since t_c2eca5dd
+# (app.py + ui_lib/ + tabs/) and Streamlit resolves those by name off the
+# script's own directory.
+COPY base/ui/ /app/ui/
 
 # ── Generator (schema.sql ships with it — self-bootstrapping) ─────────────────
 COPY gas-station/generator/ /app/generator/
