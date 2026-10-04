@@ -200,6 +200,35 @@ def main(root: pathlib.Path | None = None) -> int:
     else:
         print(f"OK — {proc.stdout.strip().splitlines()[-1]}")
 
+    # ── Both halves of the dual-registry/version merge are still intact ─────
+    # This checker guards the tag NAMES (t_4b05829c). It cannot by itself see the
+    # dual-registry publish (t_ff5a70ec), because that lives in the workflow and
+    # the credential gate — and those two rewrote the same workflow hunk, so one
+    # of them could have been merged away without this file noticing (t_e1b1de67).
+    # reconciliation-tests.sh asserts both behaviours against the shipped
+    # workflow and scripts, so run it here rather than leaving it as a script
+    # nobody ever executes.
+    reconciliation = root / ".github" / "scripts" / "reconciliation-tests.sh"
+    if not reconciliation.exists():
+        print(f"FAIL — no {reconciliation.relative_to(root)}: the merge of the "
+              f"dual-registry publish and the tracked version tag has no gate, so "
+              f"one of them can be silently dropped again (t_e1b1de67)")
+        rc = 1
+    else:
+        proc = subprocess.run(
+            ["bash", str(reconciliation), str(root)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            for line in proc.stdout.strip().splitlines():
+                if line.startswith("  FAIL"):
+                    print(f"reconciliation-tests.sh: {line.strip()}")
+            tail = proc.stdout.strip().splitlines()[-1:]
+            print(f"reconciliation-tests.sh: FAIL — {tail}")
+            rc = 1
+        else:
+            print(f"OK — {proc.stdout.strip().splitlines()[-1]}")
+
     return rc
 
 
