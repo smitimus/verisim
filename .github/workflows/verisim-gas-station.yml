@@ -39,10 +39,16 @@ jobs:
         with:
           python-version: '3.11'
 
+      # fastapi/uvicorn/pydantic are here for one reason: tools/check_strip_scripts
+      # imports each stripped API to prove the output is loadable, and reports the
+      # route set as unverified if those are missing (t_a6ecb731 — it failed the
+      # first CI run of this branch for exactly that reason). Installing them keeps
+      # the check at full strength instead of half-skipped.
       - name: Install test deps
         run: |
           pip install pytest pytest-cov httpx \
-            "psycopg2-binary==2.9.10" "faker==24.0.0" "pyyaml==6.0.1"
+            "psycopg2-binary==2.9.10" "faker==24.0.0" "pyyaml==6.0.1" \
+            "fastapi==0.115.6" "uvicorn[standard]==0.34.0" "pydantic==2.10.4"
 
       # Blocking, and the gas-station suite now carries the build/config
       # consistency checks (tools/check_*.py) as tests of its own — the strip

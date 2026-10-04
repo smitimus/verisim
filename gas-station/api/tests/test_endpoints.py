@@ -68,7 +68,13 @@ def test_health(client):
 
 
 def test_docs_is_gas_station_only(client):
-    """/docs must describe a gas-station API, not a multi-industry one."""
+    """/docs must describe a gas-station API, not a multi-industry one.
+
+    The paths are checked in the form FastAPI documents them: the shared routes
+    appear as `/{industry}/...` templates, not as `/gas-station/...`. The
+    expanded paths are still callable (asserted below), they are just not what
+    /docs lists.
+    """
     spec = client.get("/openapi.json").json()
     assert "Gas Station" in spec["info"]["title"], (
         f"expected a gas-station title, got {spec['info']['title']!r} — the strip "
@@ -81,6 +87,23 @@ def test_docs_is_gas_station_only(client):
 
     foreign = sorted(p for p in paths if p.startswith(("/grocery/", "/support/")))
     assert not foreign, f"another industry's routes survived the strip: {foreign[:5]}"
+
+
+def test_the_templated_status_route_answers_for_gas_station(client):
+    """`/{industry}/status` must resolve for gas-station, not just be documented.
+
+    The OpenAPI spec proves the route is registered; this proves the industry
+    name in the path reaches the right database. A `/{industry}` route that
+    resolves for grocery and 500s or 404s for gas-station passes every static
+    check in the repo — it is only visible on a live container.
+    """
+    resp = client.get("/gas-station/status")
+    assert resp.status_code == 200, (
+        f"/gas-station/status returned {resp.status_code}; the route is declared as "
+        f"a {{industry}} template, so this also proves the industry name is bound "
+        f"correctly: {resp.text[:200]}"
+    )
+    assert "state" in resp.json(), f"/gas-station/status has no state: {resp.text[:200]}"
 
 
 # ── every route answers ──────────────────────────────────────────────────────

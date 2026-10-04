@@ -26,15 +26,34 @@ SETTLE_CANARY = "/gas-station/fuel/transactions"
 SETTLE_TIMEOUT_SECONDS = 300.0
 SETTLE_SAMPLE_SECONDS = 1.5
 
+# The canary route *requires* a time window — start_dt/end_dt are `Query(...)`, so
+# a bare request is a 422 and the response has no `total` at all. The settle
+# fixture's first version omitted them and died with `KeyError: 'total'`, which
+# reads like a broken API rather than a broken test. The window is wide enough to
+# hold everything the 30-day backfill writes.
+SETTLE_WINDOW = {"start_dt": "2000-01-01T00:00:00", "end_dt": "2100-01-01T00:00:00"}
+
 # The routes the gas-station image is supposed to serve. Anything else answering
 # 200 means the strip script kept another industry's section.
+#
+# Note the form: the shared routes are declared as `/{industry}/...` templates, and
+# FastAPI's OpenAPI document carries the *template* path, not the expanded one.
+# `/gas-station/status` is served by the route declared `/{industry}/status`, so
+# /docs lists it as `/{industry}/status`. Asserting the expanded form fails against
+# a correct image — which is exactly what the first CI run of t_a6ecb731 did.
 GAS_STATION_ROUTES = (
-    "/gas-station/status",
+    "/{industry}/status",
     "/gas-station/fuel/grades",
     "/gas-station/fuel/pumps",
     "/gas-station/fuel/price-history",
     "/gas-station/fuel/transactions",
     "/gas-station/fuel/transactions/summary",
+)
+
+# Routes a consumer actually calls with the industry spelled out — these are what
+# the live-request tests below use, and they are the paths the README documents.
+GAS_STATION_CALLABLE = tuple(
+    r.replace("{industry}", "gas-station") for r in GAS_STATION_ROUTES
 )
 
 
@@ -53,7 +72,21 @@ def client():
 
 
 def row_total(c, path=SETTLE_CANARY):
-    return c.get(path, params={"limit": 1}).json()["total"]
+    """The canary row count. Fails loudly if the route stops answering."""
+    resp = c.get(path, params={**SETTLE_WINDOW, "limit": 1})
+    if resp.status_code != 200:
+        pytest.fail(
+            f"the settle canary {path} returned {resp.status_code}: {resp.text[:200]} "
+            f"— the generator is not answering, so nothing can be settled"
+        )
+    body = resp.json()
+    if "total" not in body:
+        pytest.fail(
+            f"{path} answered 200 but returned no 'total': {sorted(body)}. The route "
+            f"is supposed to be paginated — if its shape changed, the settle logic "
+            f"and the pagination tests both need updating."
+        )
+    return body["total"]
 
 
 @pytest.fixture(scope="session")

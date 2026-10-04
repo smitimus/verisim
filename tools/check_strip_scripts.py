@@ -52,6 +52,49 @@ def import_env() -> dict:
 
 IMPORT_ENV = import_env()
 
+# Sentinel: the API's own dependencies are not importable here, so the import
+# check cannot run. Distinct from "imported fine" (None) and from a real
+# failure (a string).
+_NO_API_DEPS = object()
+
+# What the API module needs at import time, and what its absence means.
+_API_DEPS = ("fastapi", "uvicorn", "psycopg2", "pydantic")
+
+
+def _api_deps_available() -> bool:
+    """True when the stripped API's own dependencies can be imported here.
+
+    Checked in a child process rather than in-process because the check itself
+    may be running with a PYTHONPATH the child inherits — and because importing
+    fastapi into the test process to answer the question would be a side effect
+    in a program that is otherwise just reading files.
+    """
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import " + ", ".join(_API_DEPS)],
+        capture_output=True, text=True, env=IMPORT_ENV,
+    )
+    return probe.returncode == 0
+
+
+def _try_import(module_path: pathlib.Path):
+    """Import the stripped API in a child process.
+
+    Returns None if it imported, _NO_API_DEPS if its dependencies are missing,
+    or the last stderr line if it failed for a real reason.
+    """
+    if not _api_deps_available():
+        return _NO_API_DEPS
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         f"import sys; sys.path.insert(0, {str(module_path.parent)!r}); "
+         f"import main; print(len(main.app.router.routes))"],
+        capture_output=True, text=True, env=IMPORT_ENV,
+    )
+    if proc.returncode == 0:
+        return None
+    return proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "unknown error"
+
 
 def industry_of(path: str) -> str:
     """Which industry a route belongs to.
@@ -104,21 +147,31 @@ def main() -> int:
             stripped = out.read_text()
             kept = route_paths(stripped)
 
-            # 1. It must parse and import with no dangling references.
-            compile(stripped, str(out), "exec")
-            imp = subprocess.run(
-                [sys.executable, "-c",
-                 f"import sys; sys.path.insert(0, {str(out.parent)!r}); "
-                 f"import main; print(len(main.app.router.routes))"],
-                capture_output=True, text=True, env=IMPORT_ENV,
-            )
-            if imp.returncode != 0:
-                tail = imp.stderr.strip().splitlines()[-1]
-                print(f"{industry}: FAIL — stripped API does not import: {tail}")
+            # 1. It must at least *parse*. This is the check that needs no
+            #    dependencies, so it runs everywhere — including the generator
+            #    test job, which installs psycopg2/faker/pyyaml but NOT fastapi.
+            try:
+                compile(stripped, str(out), "exec")
+            except SyntaxError as exc:
+                print(f"{industry}: FAIL — stripped API does not parse: {exc}")
                 rc = 1
                 continue
 
-            # 2. It must keep this industry's routes plus the shared/platform
+            # 2. Where the API's own dependencies are importable, also prove the
+            #    module imports — that is what catches a strip that deleted a
+            #    section a later route still calls (a NameError at import).
+            #    Without fastapi we cannot run that half, and saying so beats
+            #    reporting a failure that is really a missing dev dependency.
+            imp = _try_import(out)
+            if imp is _NO_API_DEPS:
+                print(f"{industry}: SKIP import check — fastapi/uvicorn/psycopg2 not "
+                      f"installed here (route set still verified)")
+            elif imp is not None:
+                print(f"{industry}: FAIL — stripped API does not import: {imp}")
+                rc = 1
+                continue
+
+            # 3. It must keep this industry's routes plus the shared/platform
             #    ones, and drop every other industry's.
             wanted = set(by_industry.get(industry, [])) | SHARED
             dropped_wrong = sorted(wanted - set(kept))
@@ -135,9 +188,11 @@ def main() -> int:
             else:
                 title = re.search(r'title="([^"]+)"', stripped)
                 shared = len(SHARED)
+                import_note = ("imports clean" if imp is None
+                               else "import check skipped")
                 print(f"{industry}: OK — {len(kept)} routes kept "
                       f"({len(wanted) - shared} industry + {shared} shared/platform), "
-                      f"imports clean, title={title.group(1) if title else '?'!r}")
+                      f"{import_note}, title={title.group(1) if title else '?'!r}")
 
     return rc
 

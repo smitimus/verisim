@@ -124,7 +124,14 @@ def test_config_check_fails_when_a_config_is_missing(tmp_path):
 # ── the other checkers, on the real tree ─────────────────────────────────────
 
 def test_strip_scripts_keep_only_their_own_industry():
-    """Each strip script keeps its routes, drops the others', and imports."""
+    """Each strip script keeps its routes, drops the others', and parses.
+
+    The import half of the check needs fastapi, which the generator test job
+    does not install — so the checker skips that half when the dependencies are
+    absent, and this asserts the parts that always run: that the scripts exist,
+    that their output parses, and that the kept route set is exactly right. A
+    wrong route set fails here regardless of what is installed.
+    """
     check_strip = _load("check_strip_scripts")
     assert check_strip.main() == 0
 

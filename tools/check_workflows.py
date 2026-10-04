@@ -18,6 +18,9 @@ from __future__ import annotations
 import pathlib
 import sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _offline_deps  # noqa: E402  (needs the sys.path insert above)
+
 # The repo root, derived from this file's location — NOT from sys.argv. This
 # module is imported by the test suite, where sys.argv belongs to pytest and
 # argv[1] is whatever path pytest was pointed at (t_a6ecb731, caught in CI).
@@ -29,7 +32,12 @@ REQUIRED_JOBS = ("test", "integration", "publish")
 
 
 def main() -> int:
-    import yaml  # noqa: PLC0415  (imported here so the module is importable bare)
+    # yaml is a declared dependency of this project (pyproject/requirements), so
+    # CI has it; the offline helper only matters on hosts that cannot pip install.
+    for archive in _offline_deps.archive_paths():
+        if archive not in sys.path:
+            sys.path.append(archive)
+    import yaml  # noqa: PLC0415
 
     rc = 0
     files = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
