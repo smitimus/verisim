@@ -522,6 +522,7 @@ def get_ad_product_prices(conn, sim_date: date) -> Dict[str, float]:
         """, (sim_date, sim_date))
         return {r[0]: float(r[1]) for r in cur.fetchall()}
 
+
 def _weather_for_tick(conn, cfg, sim_date: date, weather_cache: Dict[str, object]) -> Optional[dict]:
     """The day's weather effect, generated once and cached (t_2ab1fb0a).
 
@@ -546,7 +547,6 @@ def _weather_for_tick(conn, cfg, sim_date: date, weather_cache: Dict[str, object
     if weather_cache.get('effect') is None:
         weather_cache['effect'] = weather.day_effect(conn, cfg, sim_date)
     return weather_cache.get('effect')
-
 
 
 def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
@@ -668,7 +668,6 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         promotions.ensure_current_ad(conn, sim_dt.date(), products)
 
         # Phase 4: labor scheduling (generate next week) + resolve yesterday's actuals
-        scheduling.resolve_schedule_actuals(conn, sim_dt.date(), scenario)
         scheduling.generate_weekly_schedule(conn, sim_dt.date(), locations, employees, scenario)
         # Yesterday's shifts, so they are resolved under YESTERDAY's weather —
         # `attendance_modifier` is a per-day covariate now (t_2ab1fb0a), and
@@ -921,7 +920,6 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             shrinkage.generate_shrinkage_events(conn, sim_day_end, locations['stores'], eod_scenario)
             promotions.expire_old_ads(conn, cur_date)
             promotions.ensure_current_ad(conn, cur_date, products)
-            scheduling.resolve_schedule_actuals(conn, cur_date, eod_scenario)
             scheduling.generate_weekly_schedule(conn, cur_date, locations, employees, eod_scenario)
             # Yesterday's shifts resolved under YESTERDAY's weather, exactly as
             # the realtime midnight path does (t_2ab1fb0a). Inside a backfilled
