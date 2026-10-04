@@ -210,6 +210,24 @@ def test_count_and_page_share_one_where_clause(path):
         f"clause (found {uses} uses of `WHERE {{where}}`)")
 
 
+@pytest.mark.parametrize("path", PATHS)
+def test_route_declares_the_page_ceiling_a_consumer_can_read(path):
+    """Every paginated route must publish the ceiling on its `limit`.
+
+    A consumer cannot pick a valid page size unless the route says what the
+    largest one is: FastAPI's generated OpenAPI carries `maximum`, but nothing
+    asserted it was present, so the first live paging check wrote one number for
+    every route and the `le=2000` route answered 422 (t_bed5eab3). `_max_limit`
+    failing here is a clearer statement of the same thing than a KeyError
+    inside the live check.
+    """
+    m = re.search(r"limit:\s*int\s*=\s*Query\([^)]*?le=(\d+)",
+                  _route_source(_params(path)[1]))
+    assert m, (
+        f"{path}: `limit` carries no `le=` ceiling, so a consumer has no way to "
+        f"know a valid page size — declare `Query(<default>, le=<max>)`")
+
+
 # ---------------------------------------------------------------------------
 # 3. The columns a consumer joins on must be in the payload
 # ---------------------------------------------------------------------------
