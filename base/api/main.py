@@ -1219,6 +1219,32 @@ def pos_departments():
 
 @app.get("/grocery/pos/coupons", tags=["Grocery — POS"])
 def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
+    """Coupons. `active_only=false` serves retired-but-referenced coupons too.
+
+    `pos.transaction_items.coupon_id` carries a real FK to this table, so every
+    coupon a line item references is guaranteed to exist here — but
+    `seed_coupons` sets `is_active = FALSE` once `valid_until` passes
+    (models/pos.py) and never deletes the row, precisely because the redemptions
+    it earned are still on disk. An EDW that mirrors only the active set
+    therefore holds items whose `coupon_id` it cannot resolve. Measured on the
+    dev slot 2026-10-04: 8 coupons, 8 active, 308,543 coupon-tagged items, 0
+    orphans — nothing is broken yet only because every window still runs to
+    2027-09-21, so this is the same latent shape combo-deals had before
+    t_27c2dcf7, on the route that mirrors deals.
+
+    A consumer resolving an FK wants the full relation, not the active slice, so
+    it can pass `active_only=false`. `is_active` is in the projection so that
+    consumer can still tell retired from current — without it a full load is
+    indistinguishable from an active one.
+
+    No `offset`, unlike most list routes: `limit` alone caps this response at
+    1000 rows. That is above the relation's size (8 named coupons plus whatever
+    `seed_coupons` tops the active set up to, which retires the expired ones
+    rather than accumulating), so the whole relation fits in one request. It is
+    a ceiling rather than a page — a consumer that ever needed row 1001 would
+    get the first 1000 on every request instead of a `total` to reconcile
+    against. Pinned by grocery/api/tests/test_coupon_resolvability.py.
+    """
     filters, params = ["TRUE"], []
     if active_only:
         filters.append("c.is_active = TRUE AND c.valid_until >= CURRENT_DATE")
