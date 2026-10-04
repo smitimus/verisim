@@ -294,3 +294,81 @@ scenarios:
     stores: {}          # e.g. {"store-uuid-1": 1.4, "store-uuid-2": 1.2}
   deep_discount:
     price_modifier: 0.8
+
+# =============================================================================
+# Synthetic weather covariate (t_2ab1fb0a)
+# -----------------------------------------------------------------------------
+# Weather used to apply only when a human switched the `severe_weather` scenario
+# on by hand; the automatic calendar covered holidays alone. Grocery demand —
+# famously weather-correlated — had no continuous covariate, so a forecasting
+# model had nothing to regress on. This section describes the seeded series that
+# feeds `weather.daily`.
+#
+# EVERY key below is OPTIONAL: the dataclass defaults in
+# grocery/generator/config.py (WeatherConfig) are the working configuration, and
+# this section exists to document and tune them, not to restate them. Setting
+# `enabled: false` turns the whole series off and every hook becomes a no-op —
+# the pre-t_2ab1fb0a generator, reachable at runtime with no code change and no
+# restart.
+#
+# Note what is NOT here: a second set of volume/attendance loss coefficients.
+# The demand law derives those from `scenarios.severe_weather` at use time, so
+# the automatic series and the manual scenario cannot drift apart.
+weather:
+  enabled: true
+
+  # --- The temperature model ---------------------------------------------
+  # Annual mean temperature at the equator; the US band this produces is 48F
+  # (45N) to 58F (26N) before the seasonal swing. Half the seasonal peak-to-
+  # trough swing at 40N, solved so a 45N July high reaches ~89F (above comfort,
+  # so the heat term is live) and a 45N January low drops near 5F.
+  mean_temp_f: 72.0
+  seasonal_amplitude_f: 29.0
+  # °F the annual MEAN falls per degree of |latitude|. Without this the swing
+  # alone left a 45N store bottoming out near 28F — "cold" indistinguishable
+  # from mild, i.e. no covariate at all for the stores that need it most.
+  latitude_temp_gradient_f: 0.55
+  diurnal_range_f: 18.0      # high = mean + range/2
+  daily_anomaly_std_f: 6.0   # seeded day-to-day synoptic noise
+  default_latitude: 39.8     # used when a location row has no usable latitude
+
+  # --- The fronts --------------------------------------------------------
+  # Storms per region-year, their length in days, and the severity band a peak
+  # is drawn from. A front covers a whole REGION, so every store in a state is
+  # under the same storm — that cross-store correlation is the point; keying
+  # fronts per store would destroy it.
+  fronts_per_year: 18
+  front_length_min_days: 1
+  front_length_max_days: 3
+  front_peak_min: 0.35
+  front_peak_max: 0.95
+  # How much of a front's peak still shows on its first and last day. It is what
+  # makes severity(tomorrow) readable BEFORE the storm, which is where the
+  # pre-buy signal comes from. 0 would make a front invisible until the day it
+  # lands and the pre-buy term unreachable.
+  front_edge_fraction: 0.25
+  winter_severity_boost: 0.35   # ±; storm seasons are real
+  local_severity_jitter: 0.20   # per-store wobble, ± fraction
+
+  # --- Precipitation / cloud ---------------------------------------------
+  precip_base_chance: 0.25
+  precip_severity_gain: 0.45
+  precip_min_in: 0.05
+  precip_max_in: 1.80
+  precip_significant_in: 0.10  # at or above this it is rain/snow, not drizzle
+  snow_temp_f: 34.0            # high at or below this and it falls as snow
+  cloud_cover_std_pct: 12.0
+  cloudy_threshold_pct: 55.0
+
+  # --- The demand law ----------------------------------------------------
+  comfort_temp_f: 78.0         # heat starts here
+  heat_demand_gain: 0.018      # demand per degree above comfort
+  pre_buy_gain: 0.25           # demand added when TOMORROW is severe
+  severe_threshold: 0.70       # at or above this a store is flagged is_severe
+  # Clamps on the demand multiplier. The ceiling binds on extreme heat; the
+  # floor does NOT bind at the configured gains (the worst day the law can
+  # produce is a full storm at 0.7) and exists for a future retune of the
+  # scenario constants.
+  demand_modifier_floor: 0.40
+  demand_modifier_ceiling: 1.80
+  attendance_modifier_floor: 0.30
