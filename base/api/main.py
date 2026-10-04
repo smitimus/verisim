@@ -3509,6 +3509,47 @@ def update_coupon(coupon_id: str, req: CouponPatch):
 
 @app.delete("/grocery/pos/coupons/{coupon_id}", tags=["Grocery — POS"])
 def delete_coupon(coupon_id: str):
+    """Delete a coupon, unless the sales history still depends on it.
+
+    Why the guard exists (t_f963eeb1)
+    ---------------------------------
+    `pos.transaction_items.coupon_id` is a real FK to `pos.coupons`
+    (`generator/schema.sql:230`), and this route used to DELETE unconditionally.
+    That is not safe, because the FK only bites once a line references the
+    coupon: a DELETE against a coupon whose redemptions have not been written
+    yet succeeds, returns 200, and leaves the generator holding a coupon_id
+    that no longer exists. The generator keeps its coupon set in memory and
+    refreshes it every 20 ticks, so it then tags a line with a dangling id and
+    the whole insert fails.
+
+    Measured on CT106 2026-10-04: this exact route, called eight times by
+    airflow-worker (data-lab's EDW, resetting coupon fixtures), returned 200 OK
+    each time. At 08:11:05 the generator hit
+    `transaction_items_coupon_id_fkey` and stopped writing — and because the
+    main loop never rolled the transaction back, one FK violation became 446
+    permanent failures and 74 minutes of silence behind a healthy
+    `docker ps`.
+
+    So a routine consumer action, with a success code as its receipt, took the
+    generator down. Retire the coupon instead — `PATCH is_active=false` is what
+    the generator itself does when a coupon's window passes
+    (`models/pos.py::seed_coupons`), precisely because "the redemptions it
+    earned are still on disk". An unreferenced coupon is still deletable, so
+    this does not take the capability away.
+    """
+    referencing = query("""
+        SELECT count(*) AS n
+        FROM pos.transaction_items
+        WHERE coupon_id = %s::uuid
+    """, [coupon_id], "grocery")
+    if referencing and int(referencing[0]['n']) > 0:
+        raise HTTPException(
+            409,
+            f"Coupon {coupon_id} is referenced by {referencing[0]['n']} "
+            f"pos.transaction_items row(s) and cannot be deleted — those rows "
+            f"record what the shopper actually paid. Retire it with "
+            f"PATCH /grocery/pos/coupons/{coupon_id} is_active=false instead."
+        )
     rows = execute("DELETE FROM pos.coupons WHERE coupon_id = %s::uuid", [coupon_id], "grocery")
     if rows == 0:
         raise HTTPException(404, "Coupon not found")

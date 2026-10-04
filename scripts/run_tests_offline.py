@@ -18,17 +18,24 @@ ARCHIVES = [
 
 # Distribution -> importable top-level name(s), so we only pull in the archives
 # that carry something we actually need.
+#
+# The list must include TRANSITIVE dependencies, not just the four modules the
+# suite imports by name: `pytest` pulls in `pygments`, `faker` pulls in
+# `dateutil`/`six`, and each of those lives in its own archive. Leaving them
+# out makes this script report "MISSING DEPS" for a machine whose archives are
+# perfectly complete — which is what it did on 2026-10-04, blocking every agent
+# from running the suite locally.
 WANTED = {
-    '_pytest': '_pytest',
-    'pytest': 'pytest',
-    'faker': 'faker',
-    'yaml': 'yaml',
-    'psycopg2': 'psycopg2',
-    'iniconfig': 'iniconfig',
-    'pluggy': 'pluggy',
-    'packaging': 'packaging',
-    'py': 'py',
+    '_pytest', 'pytest', 'faker', 'yaml', 'psycopg2', 'iniconfig', 'pluggy',
+    'packaging', 'py', 'pygments', 'dateutil', 'attr', 'attrs',
+    'typing_extensions', 'pytz', 'tzdata',
+    # For the API suite (httpx is what its conftest imports).
+    'httpx', 'httpcore', 'h11', 'anyio', 'sniffio', 'certifi', 'idna',
 }
+
+# Modules shipped as a bare `.py` at the archive root rather than a package
+# directory. `six` is the one this needs (faker imports it).
+WANTED_FILES = {'six.py'}
 
 
 def _found():
@@ -39,8 +46,11 @@ def _found():
         for d in sorted(glob.glob(os.path.join(root, '*'))):
             if not os.path.isdir(d):
                 continue
-            entries = os.listdir(d)
-            if any(name in entries for name in WANTED):
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                continue
+            if WANTED & set(entries) or WANTED_FILES & set(entries):
                 paths.append(d)
     return paths
 

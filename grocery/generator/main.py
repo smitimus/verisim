@@ -196,6 +196,32 @@ def read_state(conn):
         return dict(cur.fetchone())
 
 
+def _safe_rollback(conn, context: str) -> bool:
+    """Clear an aborted transaction, and never raise while doing it.
+
+    psycopg2 has no autocommit-by-default: a failed statement leaves the
+    connection in a state where every later command fails with
+    `InFailedSqlTransaction` until a ROLLBACK. So any handler that swallows an
+    error and retries MUST roll back first, or the retry is theatre.
+
+    It is called from the main loop's failure path, where the connection is by
+    definition in a bad state — so a rollback that itself raises would escape
+    the `except` block and kill the process, converting a recoverable error
+    into the outage this exists to prevent. Hence the blanket guard: log and
+    report failure, do not propagate. The loop reconnects on its own schedule.
+
+    `context` is the caller's label so the log says which path rolled back.
+    """
+    try:
+        conn.rollback()
+        return True
+    except Exception as exc:                          # noqa: BLE001
+        log.warning("Rollback after %s failed (%s: %s) — the connection is "
+                    "being reconnected by the main loop", context,
+                    type(exc).__name__, exc)
+        return False
+
+
 def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms,
                  bump_state_clock=True):
     """Write one tick's ledger row.
@@ -1128,6 +1154,7 @@ def main():
 
         except psycopg2.OperationalError as e:
             log.error("DB connection lost: %s — reconnecting...", e)
+            _safe_rollback(conn, "OperationalError")
             time.sleep(10)
             try:
                 conn = get_connection(cfg)
@@ -1135,6 +1162,48 @@ def main():
                 pass
         except Exception as e:
             log.exception("Unexpected error in main loop: %s", e)
+            # Roll back or the loop is dead for the life of the container
+            # (t_f963eeb1). This is not a defensive nicety — it is the whole
+            # bug. Measured on CT106 2026-10-04: one FK violation at 08:11:05
+            # was followed by 446 consecutive failures that all read
+            # "current transaction is aborted, commands ignored until end of
+            # transaction block", because psycopg2 leaves a connection aborted
+            # after a failed statement and every later command inherits that
+            # state. The original error appeared exactly once; the noise after
+            # it hid it. Nothing was written for the remaining 74 minutes of
+            # the container's life while `docker ps` stayed healthy, because
+            # the healthcheck probes Postgres and never asks whether the
+            # generator is still generating.
+            #
+            # The rollback must not itself be able to kill the loop: it runs
+            # on the failure path, so a connection that is already unusable is
+            # the expected case, not an exception.
+            _safe_rollback(conn, "main-loop exception")
+
+            # Re-read the caches immediately, or the rollback above only buys
+            # one more failing tick. The in-memory promo/member sets are a
+            # snapshot taken at boot and refreshed every REFRESH_EVERY ticks —
+            # and `tick_count` is only incremented AFTER a successful tick, so
+            # while a bad id is causing failures the counter never reaches the
+            # next refresh and the stale id is never dropped. That is how the
+            # delete of a coupon the generator had cached turns into repeated
+            # FK violations rather than a single one. Re-reading here drops the
+            # vanished row on the very next tick, deterministically, whether or
+            # not the loop happens to reach a refresh multiple.
+            #
+            # A failure here must not mask the original error or end the loop,
+            # so it is best-effort: the caches stay as they were and the next
+            # tick retries with the old snapshot.
+            try:
+                members = pos.fetch_loyalty_members(conn)
+                coupons = pos.fetch_active_coupons(conn)
+                deals = pos.fetch_active_deals(conn)
+                employees = hr.fetch_active_employees(conn)
+                locations = hr.fetch_locations(conn)
+            except Exception as refresh_exc:              # noqa: BLE001
+                log.warning("Cache refresh after error failed (%s: %s) — "
+                            "retrying the next tick with the previous snapshot",
+                            type(refresh_exc).__name__, refresh_exc)
             time.sleep(10)
 
 
