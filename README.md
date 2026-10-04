@@ -103,7 +103,25 @@ bash build-and-push.sh grocery 1.1.0
 
 ## Gas Station
 
-The gas station generator source is preserved in `gas-station/`. It targets the shared `verisim-base` platform (postgres + api + ui) and generates fuel pump transactions, convenience store POS, and pricing data. Development is currently paused — grocery standalone is the active product.
+The gas station generator lives in `gas-station/` and generates fuel pump
+transactions, convenience store POS, and pricing data. It is **self-contained** —
+its own postgres + api + ui, exactly like grocery — and no longer needs the shared
+`verisim-base` stack. Grocery remains the primary product; gas-station is the
+second industry that validates the multi-industry abstraction.
+
+```bash
+docker run -d --name verisim-gas-station \
+  -p 5500:5432 -p 8011:8000 -p 8502:8501 \
+  smiti/verisim-gas-station:latest
+
+./switch.sh dev gas-station      # multi-container from source
+./switch.sh test gas-station     # build + run the local standalone image
+```
+
+Ports are offset from grocery's (5499/8010/8501) so both stacks can run side by
+side. CI builds, smoke-tests, contract-tests and publishes this image
+(`.github/workflows/verisim-gas-station.yml`) on the same terms as grocery's.
+See [gas-station/README.md](gas-station/README.md) for the schema and behaviour.
 
 ---
 

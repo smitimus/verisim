@@ -6,12 +6,14 @@ Multi-industry mock data generation platform. Primary product: `smiti/verisim-gr
 
 | Directory | Purpose |
 |-----------|---------|
-| `/opt/verisim/base/` | Shared platform: postgres + FastAPI + Streamlit UI |
-| `/opt/verisim/grocery/` | Grocery generator — **active, primary product** |
-| `/opt/verisim/gas-station/` | Gas station generator — **paused, source preserved** |
+| `/opt/verisim/base/` | Shared platform source: the API every image is built from, plus the legacy shared stack |
+| `/opt/verisim/grocery/` | Grocery generator — **primary product** |
+| `/opt/verisim/gas-station/` | Gas station generator — self-contained, **active** (t_a6ecb731) |
+| `/opt/verisim/support/` | Customer-support generator — self-contained |
 | `*/standalone/` | All-in-one Docker build (postgres + api + ui + generator via supervisord) |
 | `*/generator/` | Data generation logic + models |
-| `*/api/` | FastAPI endpoints (grocery has its own stripped-down API) |
+| `*/api/` | Per-industry Dockerfile that builds the stripped-down API |
+| `/opt/verisim/tools/` | Build/consistency checkers, run as part of the test suites |
 
 ## switch.sh — Dev Mode Management
 
@@ -75,6 +77,22 @@ If the old data must be preserved (it's mock data — usually not), pull a PG16-
 Base API (`base/api/main.py`) contains routes for all industries. At build time:
 - `grocery/standalone/strip_gas_station.py` removes gas-station routes for the grocery image
 - `gas-station/standalone/strip_grocery.py` removes grocery routes for the gas-station image
+- `support/standalone/strip_support.py` removes the other two for the support image
+
+**This coupling is fragile by construction, and worth knowing before you touch a
+banner comment.** Each script deletes a route *section* by matching the comment header
+above it, so renaming or reordering that header silently changes which routes the
+image serves — while the script still exits 0, the image still builds, and `/docs`
+still loads. Nothing about the failure is loud.
+
+`tools/check_strip_scripts.py` is the guard (run by
+`gas-station/generator/tests/test_build_checks.py`): it runs each script for real,
+asserts the output imports with no dangling references, and asserts the kept routes
+are exactly that industry's plus the shared `/{industry}` and platform ones. If you
+change a banner, that test is the thing that will tell you.
+
+The structural fix is a capability table — one place that declares which routes an
+industry serves, replacing three scripts that each re-guess it from prose.
 
 ## Testing Infrastructure
 
@@ -410,11 +428,22 @@ The data-lab dbt project expects these 27 source tables from the generator. If y
 | `grocery/generator/models/pos.py` | ~520 | All POS logic (seeding, transactions, coupons, deals, loyalty) in one file |
 
 ### Tooling Gaps
-- **No pyproject.toml** — no type checker, no linter config
-- **No pytest** — no test runner, no conftest, no test files
-- **No pre-commit hooks** — no automated quality gates
-- **No CI/CD** — no GitHub Actions, no automated builds/tests
-- **Unvalidated config** — `config.py` reads YAML without schema validation (pydantic or similar)
+
+Mostly closed — this list used to describe a repo with no tooling at all, which
+stopped being true some time before it was read. What is actually here:
+
+| Tooling | State |
+|---------|-------|
+| `pyproject.toml` | present: pytest config, coverage floor (`fail_under`), ruff line length |
+| pytest | 350+ generator tests + API contract suites per industry |
+| CI | two workflows (grocery, gas-station), each test + integration gated before publish |
+| config validation | every `config.yaml` is validated against a schema and **rejects unknown keys** (t_6081478a) |
+
+Still open:
+- **No type checker** — ruff is configured but there is no mypy/pyright gate.
+- **No pre-commit hooks** — quality gates live in CI, so a mistake is caught at push rather than at commit.
+- **The strip scripts still match on comment text** (see "Route Stripping at Build Time") — the coupling is
+  commented and tested, not removed; a capability table would remove the class of failure.
 
 ## Known Bugs (Fixed — Do Not Revert)
 
@@ -424,7 +453,49 @@ Both confirmed fixed on fresh backfill data:
 
 ## Gas Station Status
 
-Source preserved in `gas-station/`. Requires verisim-base running (base/ contains shared postgres + api + ui). Not active development — grocery standalone is primary product.
+**Self-contained and active** (revived in t_a6ecb731). `gas-station/` brings its own
+postgres + api + ui, like grocery — it does not require `verisim-base` to be running.
+Grocery remains the primary product; gas-station is the second industry, and its
+standing is the evidence that the multi-industry abstraction holds.
+
+What it ships: a dev stack (`switch.sh dev gas-station`, ports 5500/8011/8502), a
+local standalone image (`switch.sh test gas-station`), an API contract suite, and a
+CI workflow that builds, smoke-tests, contract-tests and publishes
+`smiti/verisim-gas-station` on the same terms as grocery's.
+
+The `verisim-base` stack in `base/compose.yaml` still exists and is still the shared
+API source every image is built from, but no industry depends on it *running*.
+
+### Where its own gaps are
+
+Parity with grocery is about the *stack*, not the feature set. gas-station
+deliberately has no shrinkage, scheduling, or loyalty-ledger models, no seasonal
+holiday calendar in its `scenario_engine`, and fewer tables than grocery — those are
+scope decisions, not defects. The parity it now has is the build and test surface:
+
+| | grocery | gas-station |
+|---|---|---|
+| dev / test / standalone stack | yes | yes |
+| generator unit tests | yes | yes |
+| API contract tests against a live image | yes | yes (t_a6ecb731) |
+| CI builds + smoke-tests the image | yes | yes (t_a6ecb731) |
+| CI publishes to Docker Hub | yes | yes (t_a6ecb731) |
+
+### The silent build-time failures, and what now catches them
+
+Most of what used to break gas-station broke *inside* `docker build`, where a green
+exit and a running image are not evidence of a correct one. The checkers in `tools/`
+each turn one of those into a test failure; they run as part of
+`gas-station/generator/tests/test_build_checks.py`:
+
+| Checker | The failure it exists for |
+|---------|--------------------------|
+| `check_strip_scripts.py` | The strip scripts delete route sections by matching the **banner comment** above them, so a renamed banner silently changes which routes an image serves — while the script still exits 0 and the image still builds. Checks each output imports, and keeps exactly its own routes. |
+| `check_schema_grants.sh` | A schema added to `schema.sql` but not to the entrypoint's granted list means the generator dies on its first write with `permission denied for schema X` (t_ac80c514 killed grocery's image this way). Grocery derives the list from the DDL; the check keeps the other two honest. |
+| `check_configs.py` | Two copies of one config drift, and the copy that drifts is the one nothing reads — grocery's had fallen 117 lines behind while the published image kept shipping it. There is now **one config per industry**, and a second is a hard failure. |
+| `check_api_schema_agreement.py` | A route querying a table no `schema.sql` creates passes the strip check and 500s on a real container. |
+| `check_switch_status.sh` | `switch.sh status` reported `none` for the gas-station dev stack, because it looked for a container name no mode creates. |
+| `check_workflows.py` | Publish must stay gated on test + integration, and the credential guard must stay ungated — a value-gated guard is the t_44f5663e regression (green publish, nothing published). |
 
 ## Streamlit UI Architecture (`base/ui/app.py`)
 
