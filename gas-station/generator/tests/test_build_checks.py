@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 REPO = pathlib.Path(__file__).resolve().parents[3]
 TOOLS = REPO / "tools"
 
@@ -152,3 +154,39 @@ def test_workflows_gate_publish_on_both_test_jobs():
     credential guard ungated (the t_44f5663e regression)."""
     check = _load("check_workflows")
     assert check.main() == 0
+
+
+@pytest.mark.parametrize(
+    "name", ["check_strip_scripts", "check_api_schema_agreement", "check_workflows"]
+)
+def test_checkers_do_not_read_sys_argv_at_import(name):
+    """A checker must find the repo from its own location, not from argv.
+
+    This is a real regression, caught in CI on the first run of this branch:
+    all three bound `CHECKOUT` from `sys.argv[1]`, so under `python -m pytest`
+    — where argv belongs to pytest — they resolved paths *inside the tests
+    directory*. `check_workflows` then reported "no workflows under
+    .../tests/.github/workflows" and exited 2.
+
+    The local runner used during development chdir'd and rewrote argv itself,
+    so it reproduced the intended behaviour and never the real one. The check
+    is on the source text rather than a rerun, and it looks for argv being
+    *used* rather than merely mentioned — these checkers explain the rule in
+    their own comments, and a bare substring match would fail on that.
+    """
+    src = (TOOLS / f"{name}.py").read_text(encoding="utf-8")
+
+    # Strip comments and docstrings, then look for a real attribute access.
+    code = []
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        code.append(line.split("  # ", 1)[0])
+    body = "\n".join(code)
+
+    assert "argv[" not in body, (
+        f"tools/{name}.py indexes argv — under `python -m pytest` that is the "
+        f"path pytest was given, not the repo root. Derive CHECKOUT from "
+        f"pathlib.Path(__file__).resolve().parents[1] instead."
+    )

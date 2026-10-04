@@ -18,7 +18,10 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _offline_deps  # noqa: E402  (needs the sys.path insert above)
 
-CHECKOUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+# The repo root, derived from this file's location — NOT from sys.argv. These
+# modules are imported by the test suite, where sys.argv belongs to pytest and
+# argv[1] is whatever path pytest was pointed at (t_a6ecb731, caught in CI).
+CHECKOUT = pathlib.Path(__file__).resolve().parents[1]
 API_SRC = CHECKOUT / "base" / "api" / "main.py"
 
 SCRIPTS = {

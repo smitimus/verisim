@@ -18,12 +18,10 @@ from __future__ import annotations
 import pathlib
 import sys
 
-for archive in sorted(pathlib.Path("/home/smitimus/.cache/uv/archive-v0").glob("*/")):
-    sys.path.append(str(archive))
-
-import yaml  # noqa: E402
-
-CHECKOUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+# The repo root, derived from this file's location — NOT from sys.argv. This
+# module is imported by the test suite, where sys.argv belongs to pytest and
+# argv[1] is whatever path pytest was pointed at (t_a6ecb731, caught in CI).
+CHECKOUT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOWS = CHECKOUT / ".github" / "workflows"
 
 # Every workflow must build-and-gate before it publishes.
@@ -31,6 +29,8 @@ REQUIRED_JOBS = ("test", "integration", "publish")
 
 
 def main() -> int:
+    import yaml  # noqa: PLC0415  (imported here so the module is importable bare)
+
     rc = 0
     files = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
     if not files:
