@@ -1313,7 +1313,7 @@ def pos_customers(
 
 
 @app.get("/grocery/pos/customers/summary", tags=["Grocery — Customers"])
-def pos_customers_summary(industry: str):
+def pos_customers_summary():
     """The dimension's shape: household count and mix by segment and age band.
 
     The page a data engineer opens first when sizing an RFM or cohort build —
@@ -1322,6 +1322,11 @@ def pos_customers_summary(industry: str):
     age band together because those two are drawn *conditionally* on the
     segment (models/customers.py), so the pair is what the generator actually
     produced; a segment-only marginal would hide that.
+
+    No `industry` parameter: this route is grocery-specific (the literal in the path),
+    and the body already used `"grocery"` explicitly. Declaring it anyway made FastAPI
+    require it as a *query* parameter, so every consumer that called the documented URL
+    got a 422 for a value the route ignored (t_2ffb43a0).
     """
     if not _has_customers_table("grocery"):
         return {"data": [], "total": 0, "customers_dimension_present": False}
