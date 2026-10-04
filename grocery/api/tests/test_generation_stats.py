@@ -47,7 +47,33 @@ import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 API_SOURCE = REPO_ROOT / "base" / "api" / "main.py"
-GENERATOR_MAIN = REPO_ROOT / "grocery" / "generator" / "main.py"
+GENERATOR_DIR = REPO_ROOT / "grocery" / "generator"
+# `main.py` is the entry point and re-export facade; `run_backfill` and
+# `record_stats` live in sibling modules (t_c2eca5dd). These guards care about
+# the symbols and their callers, not which file happens to hold them, so they
+# resolve the defining module by name — a hardcoded `main.py` here would pass
+# vacuously (or fail on a moved function) after any further split.
+GENERATOR_MAIN = GENERATOR_DIR / "main.py"
+
+
+def _generator_module_with(definition: str):
+    """The generator module that defines `definition` (e.g. `"def run_backfill"`).
+
+    Raises AssertionError if it is missing or defined more than once — a second
+    writer is exactly the drift these guards exist to catch.
+    """
+    hits = [p for p in sorted(GENERATOR_DIR.glob("*.py"))
+            if definition in p.read_text()]
+    assert len(hits) == 1, (
+        f"expected exactly one generator module defining {definition!r}, found "
+        f"{[p.name for p in hits]}"
+    )
+    return hits[0]
+
+
+def _record_stats_source() -> str:
+    """The body of `record_stats`, wherever the entry point re-exports it from."""
+    return _generator_module_with("def record_stats").read_text()
 
 ROUTE_SOURCE_PATH = "/{industry}/stats/generation"
 FAR_PAST = "2000-01-01T00:00:00+00:00"
@@ -64,10 +90,16 @@ def _route_source() -> str:
 
 
 def _backfill_source() -> str:
-    """The body of `run_backfill` in the grocery generator."""
-    source = GENERATOR_MAIN.read_text()
+    """The body of `run_backfill` in the grocery generator.
+
+    Sliced to the next top-level `def`, or to the end of the file: the split put
+    `run_backfill` last in `backfill.py`, so there is no following definition to
+    stop at (t_c2eca5dd). `.index()` on a missing terminator used to raise here.
+    """
+    source = _generator_module_with("def run_backfill").read_text()
     start = source.index("def run_backfill")
-    return source[start:source.index("\ndef ", start + 10)]
+    nxt = source.find("\ndef ", start + 10)
+    return source[start:] if nxt == -1 else source[start:nxt]
 
 
 def _backfill_record_stats_call() -> str:
@@ -293,7 +325,7 @@ def test_backfill_records_a_ledger_row():
     left no telemetry. A consumer asking whether the generator was up during a dip found
     the answer only for realtime ticks."""
     backfill = _backfill_source()
-    assert "generation_stats" in GENERATOR_MAIN.read_text() and \
+    assert "generation_stats" in _record_stats_source() and \
         "record_stats(" in backfill, (
         "run_backfill writes no control.generation_stats row: a backfilled day is "
         "invisible in the tick ledger, which is how 30 days of transactions came to "
@@ -381,10 +413,11 @@ def test_record_stats_is_reachable_from_both_generation_paths():
     will later ask about, so it has to reach the same writer rather than open-coding a
     second INSERT that can drift from the first (as gas-station and support's inline
     INSERTs can)."""
-    source = GENERATOR_MAIN.read_text()
+    source = _record_stats_source()
     assert source.count("def record_stats") == 1, "more than one record_stats writer"
-    start = source.index("def run_backfill")
-    backfill = source[start:source.index("\ndef ", start + 10)]
+    # `run_backfill` is its own module since t_c2eca5dd; before the split this
+    # body was sliced out of the same file that held `record_stats`.
+    backfill = _backfill_source()
     assert "record_stats(" in backfill, (
         "run_backfill writes its own INSERT instead of calling record_stats: the two "
         "writers will drift, and record_stats also bumps the state clock that the "

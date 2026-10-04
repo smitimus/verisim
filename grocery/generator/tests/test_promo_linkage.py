@@ -7,12 +7,13 @@ asserts the applied IDs are propagated onto the relevant line items (no schema
 change — just population of the existing columns).
 """
 from datetime import datetime, date
-from unittest.mock import patch
 
 import random
 
 import grocery.generator.models.pos as pos
 from grocery.generator.config import Config
+
+from .conftest import patch_all_pos_writes
 
 
 class _FakeConn:
@@ -114,7 +115,7 @@ def test_coupon_deal_linkage(monkeypatch):
     ]
 
     _captured_items.clear()
-    with patch("grocery.generator.models.pos.execute_values", side_effect=_fake_execute_values):
+    with patch_all_pos_writes(_fake_execute_values):
         pos.generate_pos_transactions(
             conn, cfg, sim_dt, 5, scenario, stores, products, employees, members, coupons, deals
         )

@@ -1,8 +1,9 @@
 from datetime import datetime
-from unittest.mock import patch
 
 import grocery.generator.models.pos as pos
 from grocery.generator.config import Config
+
+from .conftest import patch_all_pos_writes
 
 
 class _DummyScenario:
@@ -62,7 +63,7 @@ def test_transaction_total_calculation(monkeypatch):
         captured.append(list(records))
         return None
 
-    with patch('grocery.generator.models.pos.execute_values', side_effect=fake_execute_values):
+    with patch_all_pos_writes(fake_execute_values):
         pos.generate_pos_transactions(fake_conn, cfg, sim_dt, 1, scenario,
                                     store_locations, products, employees, members, coupons, deals)
 

@@ -60,7 +60,11 @@ COPY --from=deps /app/venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-COPY base/ui/app.py /app/ui/app.py
+# The whole base/ui directory, not just app.py: the control panel is a package
+# since t_c2eca5dd (app.py + ui_lib/ + tabs/), and app.py imports ui_lib and
+# tabs by name — Streamlit puts the script's own directory on sys.path, so both
+# must land beside it.
+COPY base/ui/ /app/ui/
 
 # ── Generator ─────────────────────────────────────────────────────────────────
 COPY grocery/generator/ /app/generator/

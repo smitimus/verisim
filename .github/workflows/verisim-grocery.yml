@@ -24,12 +24,25 @@ jobs:
       - name: Install test deps
         run: |
           pip install pytest pytest-cov httpx \
-            "psycopg2-binary==2.9.10" "faker==24.0.0" "pyyaml==6.0.1"
+            "psycopg2-binary==2.9.10" "faker==24.0.0" "pyyaml==6.0.1" \
+            "pandas==2.2.3" "plotly==5.24.1" "requests==2.32.3"
 
       # Hard-fail: any generator test failure or coverage regression blocks the build.
       # Coverage floor lives in pyproject.toml [tool.coverage.report] fail_under.
       # Grocery suite carries the coverage gate; gas-station + support suites
       # run blocking without their own coverage floor.
+      #
+      # pandas + plotly are here for `test_ui_smoke.py`, which executes the
+      # Streamlit control panel against stubs. Nothing else in this job touches
+      # the UI, and without them that test would skip — which is precisely the
+      # case it exists to catch (t_c2eca5dd split app.py into a package and no
+      # other job would have noticed a broken tab).
+      #
+      # `requests` is not a stub dependency — `ui_lib/api.py` really imports it
+      # at module scope, and it is pinned in `base/ui/requirements.txt` because
+      # the standalone image installs it for the real UI. Without it here the
+      # same test failed in CI with `ModuleNotFoundError: No module named
+      # 'requests'` while passing locally, where it happens to be present.
       - name: Run grocery generator tests (blocking, with coverage floor)
         run: python -m pytest grocery/generator/tests/ -v --cov=grocery/generator --cov-report=term
 

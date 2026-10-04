@@ -52,6 +52,8 @@ from grocery.generator.models import inventory, ordering
 from grocery.generator.models.inventory import StockAllowance
 from grocery.generator.config import Config
 
+from .conftest import patch_all_pos_writes
+
 SIM_DT = datetime(2026, 9, 26, 10, 0, 0)
 SKU_A = 'aaaaaaaa-0000-0000-0000-000000000001'
 SKU_B = 'bbbbbbbb-0000-0000-0000-000000000002'
@@ -414,7 +416,7 @@ def _run_pos(cfg, conn, count=1, allowance=None):
         if 'transaction_items' in sql and records:
             conn.items.extend(records)
 
-    with patch('grocery.generator.models.pos.execute_values', side_effect=_capture):
+    with patch_all_pos_writes(_capture):
         with patch('grocery.generator.models.hr.execute_values'):
             pos.generate_pos_transactions(
                 conn, cfg, SIM_DT, count, _Scenario(),
