@@ -12,11 +12,13 @@ import random
 import logging
 import math
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 from uuid import uuid4
 
 from faker import Faker
 from psycopg2.extras import execute_values
+
+from models import suppliers
 
 log = logging.getLogger(__name__)
 fake = Faker('en_US')
@@ -147,7 +149,8 @@ def dispatch_loads(
     return load_ids
 
 
-def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
+def receive_delivered_loads(conn, sim_dt: datetime, scenario=None,
+                            vendor_cfg=None) -> int:
     """
     Mark in-transit loads as delivered (simulated arrival = dispatch + 1 day).
     For each delivered load, create inv.receipts + receipt_items and restock.
@@ -155,6 +158,17 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
 
     When scenario.supply_disruption is True, delivery cutoff is extended
     from 18h to 36h (deliveries take longer to arrive).
+
+    SHORT LINES (t_57b1a1ab). Before this, the item query filtered
+    `pick_status = 'picked'` and the short lines were simply not there: a
+    vendor who could not fill an order left no trace at all — no shortage, no
+    vendor, no credit. The query below selects BOTH statuses and splits them,
+    so the receipt carries what arrived and `suppliers.record_short_ships`
+    writes `inv.short_ship_events` for what did not.
+
+    `vendor_cfg` is the `cfg.vendors` block (passed as a whole Config's
+    vendors, or None to skip the short-ship path entirely). It is optional so
+    this function's existing callers and tests keep working unchanged.
     """
     # Loads dispatched more than N simulated hours ago are considered delivered
     delay_hours = 36 if (scenario is not None and getattr(scenario, 'supply_disruption', False)) else 18
@@ -171,6 +185,21 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
     if not pending:
         return 0
 
+    # One vendor lookup for the whole pass, not one per short line — see
+    # suppliers.vendor_by_product.
+    vendor_by_product: Optional[Dict[str, Dict]] = None
+    if vendor_cfg is not None:
+        try:
+            vendor_by_product = suppliers.vendor_by_product(conn)
+        except Exception:
+            # A data dir generated before t_57b1a1ab has no inv.suppliers at all.
+            # Receiving is still the most important thing this function does, so
+            # a failure here must not stop the receipt.
+            log.warning("Vendor lookup unavailable — short-ships not recorded "
+                        "(pre-t_57b1a1ab data dir?)")
+            vendor_by_product = None
+
+    short_ships = 0
     with conn.cursor() as cur:
         for load_id, dest_loc_id in pending:
             load_id = str(load_id)
@@ -183,14 +212,20 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
                 WHERE load_id = %s::uuid
             """, (sim_dt, load_id))
 
-            # Get fulfillment items for this load
+            # Get fulfillment items for this load. BOTH pick statuses: the short
+            # lines are what the receipt must NOT contain and what the
+            # short-ship event must describe.
             cur.execute("""
-                SELECT fi.product_id, fi.quantity_picked
+                SELECT fi.item_id, fi.fulfillment_id, fi.product_id,
+                       fi.quantity_requested, fi.quantity_picked, fi.pick_status
                 FROM transport.load_items li
                 JOIN fulfillment.items fi ON fi.fulfillment_id = li.fulfillment_id
-                WHERE li.load_id = %s::uuid AND fi.pick_status = 'picked'
+                WHERE li.load_id = %s::uuid
             """, (load_id,))
-            items = cur.fetchall()
+            item_rows = cur.fetchall()
+
+            items = [r for r in item_rows if r[5] == 'picked']
+            short_items = [r for r in item_rows if r[5] == 'short']
 
             if not items:
                 continue
@@ -201,12 +236,28 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
             total_cost = 0.0
 
             receipt_item_records = []
-            for prod_id, qty in items:
-                unit_cost = round(random.uniform(0.25, 10.0), 4)
+            # Unit cost per product on this load. A short line is priced at the
+            # SAME cost as the line next to it — a vendor does not quote a
+            # different price for the goods it failed to send, and the credit
+            # memo is only reconcilable against the receipt if the two agree.
+            unit_cost_by_product = {}
+
+            for row in items:
+                _, _, prod_id, _qty_req, qty, _status = row
+                unit_cost = unit_cost_by_product.get(str(prod_id))
+                if unit_cost is None:
+                    unit_cost = round(random.uniform(0.25, 10.0), 4)
+                    unit_cost_by_product[str(prod_id)] = unit_cost
                 line_total = round(unit_cost * qty, 2)
                 total_cost += line_total
                 receipt_item_records.append((receipt_id, str(prod_id), qty, unit_cost, line_total))
 
+            # The receipt's vendor. A load is our own warehouse restock, so the
+            # vendors behind the goods are the PRODUCTS' vendors rather than one
+            # vendor for the load — receipts.supplier_id is therefore left NULL
+            # here and the per-line vendor is reachable through
+            # inv.products.supplier_id. That is the honest shape: one pallet
+            # from our own DC has six vendors' worth of goods on it.
             cur.execute("""
                 INSERT INTO inv.receipts
                     (receipt_id, location_id, received_dt, po_number, load_id, total_cost)
@@ -229,6 +280,34 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
                         WHERE product_id = %s::uuid AND location_id = %s::uuid
                     """, (qty, prod_id, dest_loc_id))
 
+            # The short lines of THIS load, now that the receipt is written.
+            if short_items and vendor_by_product is not None:
+                short_rows = []
+                for item_id, fulfillment_id, prod_id, qty_req, qty_picked, _s in short_items:
+                    product_id = str(prod_id)
+                    vendor = vendor_by_product.get(product_id)
+                    if not vendor:
+                        continue
+                    short_rows.append({
+                        'item_id': str(item_id),
+                        'fulfillment_id': str(fulfillment_id),
+                        'product_id': product_id,
+                        'quantity_requested': qty_req,
+                        'quantity_picked': qty_picked,
+                        'unit_cost': unit_cost_by_product.get(
+                            product_id, round(random.uniform(0.25, 10.0), 4)),
+                    })
+                if short_rows:
+                    try:
+                        short_ships += suppliers.record_short_ships(
+                            conn, vendor_cfg, sim_dt, dest_loc_id,
+                            vendor_by_product, short_rows, scenario)
+                    except Exception:
+                        # Never fail a delivery over the shortage paperwork.
+                        conn.rollback()
+                        log.exception("Could not record short-ships for load %s",
+                                      load_id)
+
             # Update store order status to delivered
             cur.execute("""
                 UPDATE ordering.store_orders so
@@ -239,5 +318,6 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None) -> int:
             """, (sim_dt, load_id))
 
     conn.commit()
-    log.info("Received %d delivered loads", len(pending))
+    log.info("Received %d delivered loads (%d short line(s))", len(pending),
+             short_ships)
     return len(pending)
