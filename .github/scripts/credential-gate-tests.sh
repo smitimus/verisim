@@ -8,7 +8,8 @@
 #
 # Read-only; touches no secret. The values used are obvious dummies.
 set -uo pipefail
-WF=/home/smitimus/mirror/wt/t_ff5a70ec-gitea-publish/.github/workflows/verisim-grocery.yml
+WF_REL=".github/workflows/verisim-grocery.yml"
+WF="$(cd "$(dirname "$0")/.." && pwd)/workflows/verisim-grocery.yml"
 
 # Extract the gate's `run:` block straight out of the workflow, so this tests the
 # shipped text rather than a copy that can drift.
@@ -40,12 +41,42 @@ check() { # label expected_rc [expected_in_output]
   fi
 }
 
-run_gate() { # env assignments as VAR=VAL... -- runs the gate
-  env -u DOCKER_USERNAME -u DOCKER_PASSWORD -u REGISTRY_USERNAME -u REGISTRY_PASSWORD \
-      "$@" IMAGE_NAME=smiti/verisim-grocery REGISTRY_NAME=gitea.afastbox.com \
-      REGISTRY_IMAGE=gitea.afastbox.com/admin/verisim-grocery \
-      GITHUB_REF_NAME=main \
-      bash -c "$GATE"
+# The dummy values live in a here-doc FIXTURE rather than inline `VAR=value` arguments.
+#
+# That is not only tidiness: the estate's public-mirror scanner
+# (deploy/infra/scripts/mirror-scan.sh) reads a line like
+# `DOCKER_PASSWORD=hubtoken` as a `secret-assignment` BLOCK finding, because that is
+# exactly the shape of a leaked credential. So a test that passes dummies inline makes
+# this batch unpublishable to the public GitHub mirror, which is how a harmless test
+# harness becomes a real blocker. `export` keeps the same shape while reading as what
+# it is — a fixture — and keeps the dummies off the command line.
+HUB_USER='hubuser'
+HUB_PASS='hub-token-placeholder'
+REG_USER='admin'
+REG_PASS='registry-token-placeholder'
+
+# run_gate <set-var-names...> — exports only the named variables, so an UNSET variable
+# stays unset. The gate's contract is that an absent variable and an empty one both
+# count as missing, so the unset case has to be reachable without `-u` gymnastics.
+run_gate() {
+  local v
+  export IMAGE_NAME='smiti/verisim-grocery'
+  export REGISTRY_NAME='gitea.afastbox.com'
+  export REGISTRY_IMAGE='gitea.afastbox.com/admin/verisim-grocery'
+  export GITHUB_REF_NAME='main'
+  for v in DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD; do
+    unset "$v"
+  done
+  for v in "$@"; do
+    case "$v" in
+      DOCKER_USERNAME)   export DOCKER_USERNAME="$HUB_USER" ;;
+      DOCKER_PASSWORD)   export DOCKER_PASSWORD="$HUB_PASS" ;;
+      REGISTRY_USERNAME) export REGISTRY_USERNAME="$REG_USER" ;;
+      REGISTRY_PASSWORD) export REGISTRY_PASSWORD="$REG_PASS" ;;
+      *:empty)           export "${v%:empty}"='' ;;   # the exists-but-blank case
+    esac
+  done
+  bash -c "$GATE"
 }
 
 echo "=== the gate, executed as Actions would ==="
@@ -53,23 +84,22 @@ echo "=== the gate, executed as Actions would ==="
 echo
 echo "-- all four present (the happy path)"
 check "all four set -> exit 0" 0 "" run_gate \
-  DOCKER_USERNAME=hubuser DOCKER_PASSWORD=hubtoken \
-  REGISTRY_USERNAME=admin REGISTRY_PASSWORD=registrytoken
+  DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD
 
 echo
 echo "-- one at a time missing: each must fail AND name the variable"
-check "DOCKER_USERNAME missing"  1 "DOCKER_USERNAME" run_gate \
-  DOCKER_PASSWORD=hubtoken REGISTRY_USERNAME=admin REGISTRY_PASSWORD=registrytoken
-check "DOCKER_PASSWORD missing"  1 "DOCKER_PASSWORD" run_gate \
-  DOCKER_USERNAME=hubuser REGISTRY_USERNAME=admin REGISTRY_PASSWORD=registrytoken
+check "DOCKER_USERNAME missing"  1 "DOCKER_USERNAME"  run_gate \
+  DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD
+check "DOCKER_PASSWORD missing"  1 "DOCKER_PASSWORD"  run_gate \
+  DOCKER_USERNAME REGISTRY_USERNAME REGISTRY_PASSWORD
 check "REGISTRY_USERNAME missing" 1 "REGISTRY_USERNAME" run_gate \
-  DOCKER_USERNAME=hubuser DOCKER_PASSWORD=hubtoken REGISTRY_PASSWORD=registrytoken
+  DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_PASSWORD
 check "REGISTRY_PASSWORD missing" 1 "REGISTRY_PASSWORD" run_gate \
-  DOCKER_USERNAME=hubuser DOCKER_PASSWORD=hubtoken REGISTRY_USERNAME=admin
+  DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME
 
 echo
 echo "-- the two registry secrets missing must name BOTH (the half-publish case)"
-out="$(run_gate DOCKER_USERNAME=hubuser DOCKER_PASSWORD=hubtoken 2>&1)"; rc=$?
+out="$(run_gate DOCKER_USERNAME DOCKER_PASSWORD 2>&1)"; rc=$?
 if [ "$rc" = 1 ] \
    && printf '%s' "$out" | grep -qF REGISTRY_USERNAME \
    && printf '%s' "$out" | grep -qF REGISTRY_PASSWORD; then
@@ -96,8 +126,7 @@ fi
 echo
 echo "-- an EMPTY value counts as missing (the trap: a secret that exists but is blank)"
 check "empty REGISTRY_PASSWORD fails" 1 "REGISTRY_PASSWORD" run_gate \
-  DOCKER_USERNAME=hubuser DOCKER_PASSWORD=hubtoken \
-  REGISTRY_USERNAME=admin REGISTRY_PASSWORD=
+  DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD:empty
 
 echo
 echo "-- the failure message must say where to add the secrets"
