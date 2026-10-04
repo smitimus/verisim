@@ -1,0 +1,213 @@
+name: Verisim Gas Station CI/CD
+
+# Why a second workflow instead of a job in verisim-grocery.yml (t_a6ecb731).
+#
+# gas-station had a unit-test step and nothing else: its standalone image was
+# never built by CI, never smoke-tested, never contract-tested, and never
+# published. `bash build-and-push.sh gas-station` therefore only worked by hand
+# on a slot that had Docker, and Docker Hub's smiti/verisim-gas-station:latest
+# was last pushed 2026-04-05 — before the self-contained revival (7a52b9c)
+# reached main at all. A product whose only published artifact predates every
+# change made to it is not "shipped"; it is stale by construction.
+#
+# The grocery workflow keeps its own shape — this is a separate file on purpose
+# so the two do not have to be reconciled on every push, and so a gas-station
+# failure cannot block (or be blocked by) the grocery publish.
+#
+# The publish guards are the grocery ones (t_c733ea2a / t_44f5663e), restated
+# rather than shared: a missing credential must FAIL this job, and a pull
+# request is the only event that skips publishing.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: smiti/verisim-gas-station
+
+jobs:
+  test:
+    name: Generator unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # fastapi/uvicorn/pydantic are here for one reason: tools/check_strip_scripts
+      # imports each stripped API to prove the output is loadable, and reports the
+      # route set as unverified if those are missing (t_a6ecb731 — it failed the
+      # first CI run of this branch for exactly that reason). Installing them keeps
+      # the check at full strength instead of half-skipped.
+      - name: Install test deps
+        run: |
+          pip install pytest pytest-cov httpx \
+            "psycopg2-binary==2.9.10" "faker==24.0.0" "pyyaml==6.0.1" \
+            "fastapi==0.115.6" "uvicorn[standard]==0.34.0" "pydantic==2.10.4"
+
+      # Blocking, and the gas-station suite now carries the build/config
+      # consistency checks (tools/check_*.py) as tests of its own — the strip
+      # scripts and the config-fork gate that used to fail silently.
+      - name: Run gas-station generator tests (blocking)
+        run: python -m pytest gas-station/generator/tests/ -v
+
+  integration:
+    name: Build standalone image + smoke + API contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test deps
+        run: pip install pytest httpx
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build only (no Docker Hub login) — PRs and forks can validate the image
+      # without repo secrets. Publishing is a separate job.
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: gas-station/standalone/Dockerfile
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Load image
+        run: docker load --input /tmp/image.tar
+
+      # This is the step that did not exist before. build-and-push.sh has always
+      # smoke-tested the image it built; CI had never done so for gas-station, so
+      # a broken image could reach Docker Hub as long as its generator unit tests
+      # passed. The unit tests do not start postgres, do not apply schema.sql
+      # and do not run supervisord — which is where every one of this product's
+      # historical failures lived (permission denied for schema X, t_ac80c514;
+      # a stripped API that no longer imports).
+      - name: Smoke test
+        run: |
+          docker run -d --name verisim-gas-test --rm \
+            -p 8011:8000 \
+            -v /tmp/verisim_gas_data:/var/lib/postgresql/data \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          for i in $(seq 1 36); do
+            sleep 5
+            HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
+              http://localhost:8011/health 2>/dev/null || echo "000")
+            if [ "$HEALTH" = "200" ]; then
+              echo "Smoke test: PASS"
+              break
+            fi
+            if [ "$i" = "36" ]; then
+              echo "Smoke test: FAIL"
+              docker logs verisim-gas-test 2>&1 | tail -40
+              exit 1
+            fi
+          done
+
+      # /health answers as soon as uvicorn is up, long before the first-boot
+      # 30-day backfill has finished. The contract tests below compare row counts
+      # between two calls, so running them mid-backfill makes a moving row count
+      # look like pagination loss.
+      - name: Wait for the initial 30-day backfill to finish
+        run: |
+          for i in $(seq 1 180); do
+            MODE=$(curl -s http://localhost:8011/gas-station/status \
+              | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p' | head -1)
+            echo "[$i] mode=${MODE:-unknown}"
+            if [ "$MODE" = "realtime" ] || [ "$MODE" = "stopped" ]; then
+              echo "Generator is out of backfill (mode=$MODE) — contract tests can run."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error title=Backfill never finished::The generator was still in backfill mode after 15 minutes, so the contract tests could not run against a settled dataset."
+          exit 1
+
+      - name: API contract tests (blocking)
+        run: python -m pytest gas-station/api/tests/ -v
+
+      - name: Tear down test container
+        if: always()
+        run: docker rm -f verisim-gas-test 2>/dev/null || true
+
+  publish:
+    name: Push gas-station image to Docker Hub
+    runs-on: ubuntu-latest
+    needs: [test, integration]
+    # Same contract as the grocery publish: the skip is the EVENT's (a fork
+    # cannot read the secrets), never the credential's. Between 2026-08-31 and
+    # 2026-09-21 the grocery job reported success while publishing nothing, so
+    # `latest` sat frozen and the deploy shipped the stale tag. Do not
+    # reintroduce an `env.DOCKER_USERNAME != ''` gate here.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+    env:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require Docker Hub credentials
+        if: github.event_name != 'pull_request'
+        run: |
+          missing=""
+          if [ -z "${DOCKER_USERNAME}" ]; then missing="DOCKER_USERNAME"; fi
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            missing="${missing:+${missing} and }DOCKER_PASSWORD"
+          fi
+          if [ -n "${missing}" ]; then
+            echo "::error title=Missing Docker Hub credential::Cannot publish ${IMAGE_NAME} for ${GITHUB_REF_NAME}: the repository secret(s) ${missing} are not set. Add them under smitimus/verisim -> Settings -> Secrets and variables -> Actions (DOCKER_USERNAME = the Docker Hub account, DOCKER_PASSWORD = a Docker Hub access token with read/write on ${IMAGE_NAME}). Publishing on main and on version tags is required, so this run fails instead of skipping."
+            exit 1
+          fi
+          echo "Docker Hub credentials are present (DOCKER_USERNAME=${DOCKER_USERNAME})."
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+
+      - name: Compute tags
+        id: meta
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: gas-station/standalone/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+
+      - name: Publishing skipped — pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::notice title=Docker Hub publishing skipped (pull request)::Publishing runs on pushes to main and on v* tags. A pull request cannot see the repository secrets, so it builds and tests only - nothing is published and nothing needs to be."

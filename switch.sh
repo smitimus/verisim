@@ -158,26 +158,25 @@ case "$1" in
     echo ""
     echo "=== Verisim mode status ==="
     RUNNING_MODE=""
-    if docker ps --format '{{.Names}}' | grep -q "verisim-grocery-dev"; then
-      echo "  grocery: dev (multi-container from source)"
-      RUNNING_MODE="dev"
-    elif docker ps --format '{{.Names}}' | grep -q 'verisim-grocery-test'; then
-      echo "  grocery: test (local standalone image)"
-      RUNNING_MODE="test"
-    elif docker ps --format '{{.Names}}' | grep -q '^verisim-grocery$'; then
-      echo "  grocery: release (Docker Hub image)"
-      RUNNING_MODE="release"
-    else
-      echo "  grocery: none"
-    fi
-    if docker ps --format '{{.Names}}' | grep -q 'verisim-gas-station-test'; then
-      echo "  gas-station: test (local standalone image)"
-      RUNNING_MODE="test"
-    elif docker ps --format '{{.Names}}' | grep -q '^verisim-gas-station$'; then
-      echo "  gas-station: dev/legacy stack running"
-    else
-      echo "  gas-station: none"
-    fi
+    # Per industry: dev stack, test stack, release stack, else none. The
+    # gas-station branch used to look for `^verisim-gas-station$`, a container
+    # name no mode in this script ever creates — `./switch.sh dev gas-station`
+    # brings up verisim-gas-station-dev-{postgres,api,ui,generator} — so a
+    # running gas-station dev stack was reported as "none" (t_a6ecb731).
+    for ind in grocery gas-station; do
+      if docker ps --format '{{.Names}}' | grep -q "verisim-${ind}-dev"; then
+        echo "  ${ind}: dev (multi-container from source)"
+        RUNNING_MODE="dev"
+      elif docker ps --format '{{.Names}}' | grep -q "verisim-${ind}-test"; then
+        echo "  ${ind}: test (local standalone image)"
+        RUNNING_MODE="test"
+      elif docker ps --format '{{.Names}}' | grep -q "^verisim-${ind}\$"; then
+        echo "  ${ind}: release (Docker Hub image)"
+        RUNNING_MODE="release"
+      else
+        echo "  ${ind}: none"
+      fi
+    done
     _urls
     echo ""
     ;;

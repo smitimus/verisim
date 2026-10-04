@@ -66,7 +66,9 @@ COPY base/ui/app.py /app/ui/app.py
 COPY grocery/generator/ /app/generator/
 
 # ── Default config (overridable by volume mount at /config/config.yaml) ──────
-COPY grocery/standalone/config.yaml /app/config.yaml
+# The product's config.yaml, copied verbatim — see gas-station/standalone/Dockerfile
+# for why there is exactly one of it (t_a6ecb731).
+COPY grocery/config.yaml /app/config.yaml
 
 # ── supervisord + entrypoint ──────────────────────────────────────────────────
 COPY grocery/standalone/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
