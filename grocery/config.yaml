@@ -74,6 +74,33 @@ loyalty:
   loyalty_usage_rate: 0.40 # grocery loyalty cards used more often
   initial_member_count: 300 # initial members seeded at startup
 
+# Customer / household master dimension (pos.customers). The segment
+# taxonomy — which age bands and household sizes each segment skews to —
+# lives in grocery/generator/models/customers.py, because that is the
+# definition of a segment rather than a knob. These three keys shape the
+# base itself:
+customers:
+  # Relative weight per segment. Unnormalised: the draw normalises, so
+  # overriding one segment does not require rescaling the other five. An
+  # unknown segment name here is logged and ignored, never fatal.
+  # Defaults (models/customers.py SEGMENTS): value_seeker 0.22,
+  # family_stock_up 0.20, convenience 0.18, health_conscious 0.16,
+  # premium_enthusiast 0.14, budget_constrained 0.10.
+  segment_shares: {}
+  #  segment_shares:
+  #    premium_enthusiast: 0.25
+  #    budget_constrained: 0.05
+
+  # Chance a household keeps its NEXT loyalty card instead of forming a new
+  # household. 0 = every card is its own household, 1 = every card joins the
+  # same one. Real stores see a shared card per adult, so ~0.25.
+  multi_member_household_share: 0.25
+
+  # Cap on a drawn household size. The segment's size distribution is
+  # renormalised over the sizes this allows, so raising the cap does not
+  # quietly skew the mix toward small households. Max the DDL CHECK allows is 12.
+  household_size_max: 6
+
 products:
   initial_count: 500       # more SKUs than gas station
   departments:

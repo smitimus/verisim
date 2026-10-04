@@ -415,6 +415,18 @@ ASSERTIONS: List[AssertionSpec] = [
                 SELECT 1 FROM hr.locations l WHERE l.location_id = sd.location_id)
         """,
     ),
+    AssertionSpec(
+        id="HARD-29",
+        dimension="hard_fk",
+        title="pos.loyalty_members.customer_id → pos.customers",
+        sql="""
+            SELECT lm.member_id, lm.customer_id
+            FROM pos.loyalty_members lm
+            WHERE lm.customer_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM pos.customers c WHERE c.customer_id = lm.customer_id)
+        """,
+    ),
 
     # ---- SEMANTIC TYPE MISMATCHES (NOT FK-enforced) ----------------------
     AssertionSpec(
@@ -597,6 +609,32 @@ ASSERTIONS: List[AssertionSpec] = [
             FROM inv.sku_demand_daily sd
             WHERE sd.lost_units <> sd.requested_units - sd.fulfilled_units
                OR sd.requested_units < sd.fulfilled_units
+        """,
+    ),
+    AssertionSpec(
+        id="SEMA-14",
+        dimension="semantic_type",
+        title="pos.customers.household_size must be >= the number of loyalty cards the household holds",
+        sql="""
+            SELECT c.customer_id, c.household_size, card_count
+            FROM pos.customers c
+            JOIN (
+                SELECT customer_id, COUNT(*) AS card_count
+                FROM pos.loyalty_members
+                WHERE customer_id IS NOT NULL
+                GROUP BY customer_id
+            ) lm ON lm.customer_id = c.customer_id
+            WHERE c.household_size < lm.card_count
+        """,
+    ),
+    AssertionSpec(
+        id="SEMA-15",
+        dimension="semantic_type",
+        title="every loyalty card must resolve to a household (a dimension with holes is not a dimension)",
+        sql="""
+            SELECT lm.member_id, lm.signup_date
+            FROM pos.loyalty_members lm
+            WHERE lm.customer_id IS NULL
         """,
     ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------

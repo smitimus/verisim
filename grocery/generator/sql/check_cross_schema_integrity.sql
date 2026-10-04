@@ -207,6 +207,7 @@ SELECT se.stockout_id, se.location_id
 SELECT se.stockout_id, se.pos_transaction_id
             FROM inv.stockout_events se
             WHERE se.channel = 'pos'
+              AND se.pos_transaction_id IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM pos.transactions t
                 WHERE t.transaction_id = se.pos_transaction_id)
@@ -216,6 +217,7 @@ SELECT se.stockout_id, se.pos_transaction_id
 SELECT se.stockout_id, se.online_order_id
             FROM inv.stockout_events se
             WHERE se.channel = 'online'
+              AND se.online_order_id IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM online.orders o
                 WHERE o.order_id = se.online_order_id)
@@ -232,6 +234,13 @@ SELECT sd.location_id, sd.demand_date
             FROM inv.sku_demand_daily sd
             WHERE NOT EXISTS (
                 SELECT 1 FROM hr.locations l WHERE l.location_id = sd.location_id);
+
+-- [HARD-29] pos.loyalty_members.customer_id → pos.customers
+SELECT lm.member_id, lm.customer_id
+            FROM pos.loyalty_members lm
+            WHERE lm.customer_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM pos.customers c WHERE c.customer_id = lm.customer_id);
 
 -- --------------------------------------------------------------------------
 -- SEMANTIC_TYPE — ordering.store_orders.store_location_id must be a STORE location
@@ -320,12 +329,20 @@ SELECT se.stockout_id, se.channel, se.pos_transaction_id,
               AND ((se.channel = 'pos'     AND se.online_order_id IS NOT NULL)
                 OR (se.channel = 'online' AND se.pos_transaction_id IS NOT NULL));
 
--- [SEMA-12] a POS stockout's parent line must not claim more units than were rung up
+-- [SEMA-12] a parented POS stockout's product must have a rung-up line at exactly fulfilled_quantity
 SELECT se.stockout_id, se.pos_transaction_id, se.fulfilled_quantity
             FROM inv.stockout_events se
             WHERE se.channel = 'pos'
               AND se.pos_transaction_id IS NOT NULL
               AND se.event_dt::date < CURRENT_DATE
+              -- Only rows that were actually PART of the sale are checked. A
+              -- basket can be partly fulfilled: the short product's line is
+              -- dropped (quantity would be 0, which transaction_items forbids)
+              -- while the parent's other lines are written normally. That is
+              -- correct behaviour, so a stockout with fulfilled_quantity = 0
+              -- legitimately has no matching line — and demanding one would
+              -- assert the defect back into the model.
+              AND se.fulfilled_quantity > 0
               AND NOT EXISTS (
                 SELECT 1
                 FROM pos.transaction_items ti
@@ -339,6 +356,22 @@ SELECT sd.location_id, sd.product_id, sd.demand_date,
             FROM inv.sku_demand_daily sd
             WHERE sd.lost_units <> sd.requested_units - sd.fulfilled_units
                OR sd.requested_units < sd.fulfilled_units;
+
+-- [SEMA-14] pos.customers.household_size must be >= the number of loyalty cards the household holds
+SELECT c.customer_id, c.household_size, card_count
+            FROM pos.customers c
+            JOIN (
+                SELECT customer_id, COUNT(*) AS card_count
+                FROM pos.loyalty_members
+                WHERE customer_id IS NOT NULL
+                GROUP BY customer_id
+            ) lm ON lm.customer_id = c.customer_id
+            WHERE c.household_size < lm.card_count;
+
+-- [SEMA-15] every loyalty card must resolve to a household (a dimension with holes is not a dimension)
+SELECT lm.member_id, lm.signup_date
+            FROM pos.loyalty_members lm
+            WHERE lm.customer_id IS NULL;
 
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until

@@ -142,14 +142,99 @@ def grocery_conn():
     conn.close()
 
 
+# Assertions that reference a table or column a given data dir may predate.
+# The inventory is declared per assertion id, so adding a check to a table that
+# ships in a later image does not silently turn into a hard failure on every
+# slot still running the older one — which is the state a rolling deploy is in
+# by definition. A MISSING table is not an integrity failure; an assertion that
+# cannot run has nothing to report, and reporting it as a failure would train
+# everyone to ignore this file.
+#
+# An assertion whose table exists but returns orphans still fails, as it must.
+TABLE_OR_COLUMN_OPTIONAL = {
+    # t_2ffb43a0: the customer dimension. `models/customers.py::ensure_tables`
+    # creates it on boot, but on a data dir whose schema predates the card the
+    # ALTER that adds `loyalty_members.customer_id` is refused (the generator's
+    # role does not own the table), so neither is present. See
+    # docs/cross_schema_relationship_map.md §3a.
+    "HARD-29": ("pos", "customers", None),
+    "SEMA-14": ("pos", "customers", None),
+    "SEMA-15": ("pos", "loyalty_members", "customer_id"),
+}
+
+_OPTIONAL_ASSERTION_IDS = frozenset(TABLE_OR_COLUMN_OPTIONAL)
+
+
 @pytest.mark.parametrize(
     "spec",
-    ASSERTIONS,
-    ids=[a.id for a in ASSERTIONS],
+    # Assertions whose table this data dir may predate are run by
+    # `test_optional_table_assertion` below, which skips when the table is
+    # genuinely absent instead of erroring. Running them here as well would
+    # defeat that.
+    [a for a in ASSERTIONS if a.id not in _OPTIONAL_ASSERTION_IDS],
+    ids=[a.id for a in ASSERTIONS if a.id not in _OPTIONAL_ASSERTION_IDS],
 )
 def test_cross_schema_assertion(grocery_conn, spec):
     orphans = run_assertion(grocery_conn, spec)
     assert not orphans, (
         f"{spec.id} [{spec.dimension}] {spec.title}: "
         f"{len(orphans)} orphan row(s) found — first: {orphans[0]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [a for a in ASSERTIONS if a.id in _OPTIONAL_ASSERTION_IDS],
+    ids=[a.id for a in ASSERTIONS if a.id in _OPTIONAL_ASSERTION_IDS],
+)
+def test_optional_table_assertion(grocery_conn, spec):
+    """An assertion on a table this data dir may not have yet.
+
+    Skips when the table or column is genuinely absent, and otherwise asserts
+    exactly as `test_cross_schema_assertion` does — so a data dir that *does*
+    have the dimension is held to it.
+    """
+    import psycopg2
+
+    schema, table, column = TABLE_OR_COLUMN_OPTIONAL[spec.id]
+    try:
+        with grocery_conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = %s AND table_name = %s
+            """, (schema, table))
+            if not cur.fetchone()[0]:
+                pytest.skip(f"{schema}.{table} is absent on this data dir "
+                            f"({spec.id} cannot run yet)")
+            if column:
+                cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                      AND column_name = %s
+                """, (schema, table, column))
+                if not cur.fetchone()[0]:
+                    pytest.skip(f"{schema}.{table}.{column} is absent on this "
+                                f"data dir ({spec.id} cannot run yet)")
+    except psycopg2.Error:
+        grocery_conn.rollback()
+        pytest.skip(f"catalog probe failed for {spec.id}")
+
+    orphans = run_assertion(grocery_conn, spec)
+    assert not orphans, (
+        f"{spec.id} [{spec.dimension}] {spec.title}: "
+        f"{len(orphans)} orphan row(s) found — first: {orphans[0]}"
+    )
+
+
+def test_optional_assertion_inventory_is_consistent():
+    """Every id in TABLE_OR_COLUMN_OPTIONAL must be a real assertion.
+
+    Otherwise a typo would silently create a permanently-skipped test that
+    looks like coverage and is not.
+    """
+    ids = {a.id for a in ASSERTIONS}
+    unknown = set(TABLE_OR_COLUMN_OPTIONAL) - ids
+    assert not unknown, (
+        f"TABLE_OR_COLUMN_OPTIONAL names ids that do not exist: {unknown}. "
+        "A stale id here means a check that silently never runs."
     )

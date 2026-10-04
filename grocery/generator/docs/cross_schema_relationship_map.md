@@ -2,6 +2,7 @@
 
 **Ticket:** Verisim #11 — Cross-schema data connectivity & referential integrity
 **Status:** API exposure ✅ · Validation harness ✅ · Map doc ✅ · Data-lab re-ingest ⏳
+**Last updated:** 2026-10-03 (t_2ffb43a0 — customer dimension, §3a)
 
 This is the canonical map of how the grocery generator's schemas join to one
 another, plus the integrity assertions that prove those joins resolve. It is the
@@ -51,7 +52,13 @@ enforce.
   `inv.shrinkage_events`, `inv.stockout_events`, `inv.sku_demand_daily`,
   `ordering.store_order_items`, `fulfillment.items`, `pricing.ad_items`.
 - **`pos.loyalty_members`** referenced by: `pos.transactions` (`member_id`),
-  `pos.loyalty_point_transactions` (`member_id`).
+  `pos.loyalty_point_transactions` (`member_id`), and **`pos.customers`**
+  (`customer_id`, inverted — the card points at its household).
+- **`pos.customers`** referenced by: `pos.loyalty_members` (`customer_id`).
+  This is the customer/household master dimension (see §3a). It is the *parent*
+  side of the only link a grocery mart needs to segment transactions by
+  household, and the join runs `transactions → loyalty_members → customers`
+  rather than through a denormalised `transactions.customer_id`.
 - **`pos.transactions`** referenced by: `pos.transaction_items`,
   `pos.loyalty_point_transactions`, `inv.stockout_events`
   (`pos_transaction_id`, when `channel = 'pos'`).
@@ -84,6 +91,77 @@ the highest-risk gaps and are asserted explicitly in the harness:
 | `transport.loads.driver_id` | employee with `department = 'transport'` at a `warehouse` location |
 | `fulfillment.orders.assigned_to` | employee with `department = 'warehouse'` at a `warehouse` location |
 | `ordering.store_orders.created_by` / `approved_by` | employee with `department = 'management'` |
+
+### 3a. The customer dimension (`pos.customers`)
+
+`pos.loyalty_members` is a **card**. `pos.transactions.member_id` resolves to
+it or is NULL, and nothing on either side carried a demographic or household
+attribute — so the marts a grocery warehouse actually wants (RFM cohorts,
+basket affinity, segment penetration, household-size vs basket size) had no
+conformed dimension to join to. `pos.customers` is that dimension: one row per
+**household**, with `age_band`, `household_size` and `segment`.
+
+The link is `pos.loyalty_members.customer_id`, **nullable and NOT unique**:
+
+| Fact | Why |
+|---|---|
+| Nullable | a card predating the dimension, or one written mid-boot before its household exists, is legitimately NULL for an instant |
+| Not unique | a household holds several cards in the real world (two adults, a card each). A `UNIQUE` here would make `household_size > loyalty_member_count` unrepresentable |
+
+`household_size` is the household's **size**, not its card count, so it is
+legitimately larger: the children and students in the household never signed
+up. Both directions of that relationship are cross-table and therefore not
+covered by any FK or CHECK, so the harness asserts them explicitly.
+
+**Deliberately NOT columns** (both are a `LEFT JOIN` from
+`pos.loyalty_members`, and a stored copy would go stale the moment a second
+card joined the household): `loyalty_member_count`, `first_signup_date`. The API
+computes them in the query.
+
+**There is no `pos.transactions.customer_id`.** Denormalising the snowflake into
+the fact table would re-attribute every anonymous shopper — a behavioural change
+far beyond adding a dimension — and would make the dimension the same size as
+the fact table it was supposed to describe. The mart joins
+`transactions → loyalty_members → customers`.
+
+Two further properties the harness pins because the generator, not the
+database, is what makes them true:
+
+* **Attributes are drawn conditionally on the segment.** Every segment carries
+  its own age-band and household-size distribution (`SEGMENTS` in
+  `models/customers.py`), so a `family_stock_up` household skews 35–44 and 4–6
+  people. Three independent draws would give every segment identical behaviour
+  and the dimension would be decoration.
+* **The draw is deterministic per household**, seeded from the household's
+  first `member_id`. A restart or a re-seed reproduces the same profile; a
+  segment that shifts between loads cannot support a cohort at all.
+
+| Assertion | Rule |
+|---|---|
+| `HARD-29` | `pos.loyalty_members.customer_id` resolves to a `pos.customers` row |
+| `SEMA-14` | a household's `household_size` is **not less than** the number of loyalty cards it holds |
+| `SEMA-15` | every loyalty card resolves to a household — a dimension with holes is not a dimension |
+
+Verified against a real postgres (400 seeded cards): **289 households**, 82 of
+them holding more than one card, mean `household_size` 2.57, none over the cap,
+all six segments present, and all three assertions returning zero rows. A
+second backfill creates nothing; re-planning the same cards reproduces the
+dimension exactly.
+
+**Migration note.** A `schema.sql` change only reaches a *fresh* bootstrap, so
+`models/customers.py` carries an `IF NOT EXISTS` copy of the DDL and an
+`ALTER TABLE … ADD COLUMN` for the FK, run from `seed_all`. On the standalone
+image that ALTER is **refused**: `entrypoint.sh` applies `schema.sql` through
+`su … postgres -c "$PSQL -f"`, so every table is owned by `postgres` while the
+generator connects as `$POSTGRES_USER` with GRANT ALL and no ownership.
+Verified on CT106 2026-10-03, where `ALTER TABLE pos.loyalty_members ADD COLUMN`
+raises `InsufficientPrivilege` — and `IF NOT EXISTS` does **not** rescue it,
+because Postgres checks ownership before noticing there is nothing to do. So
+the generator probes the column first and only ALTERs when it is genuinely
+missing; when the ALTER is refused it logs, degrades to a no-op, and leaves the
+supported fix (re-bootstrap the data dir from a current image) in the message.
+The API serves an empty result with `customers_dimension_present: false` on such
+a data dir rather than 500ing.
 
 ### Stockouts: the sales feed must not outrun the shelf (t_959cd040)
 
@@ -173,6 +251,16 @@ No further serializer changes are required for #26–#31.
 | Inventory ↔ POS | `inventory/stock-levels`, `inventory/products` | `product_id`, `location_id` |
 | Inventory receipts ↔ Transport | `inventory/receipts` | `location_id`, `load_id` |
 | Inventory shrinkage | `grocery/inventory/shrinkage-events` | `product_id`, `location_id`, `reason`, `recorded_at` |
+| POS → Customers (household dimension) | `grocery/pos/loyalty-members`, `grocery/pos/customers` | `member_id` → `customer_id`; plus `segment`, `age_band`, `household_size` |
+| Customers → summary / sizing | `grocery/pos/customers/summary` | `segment`, `age_band` (grouping grain) |
+
+> **`customer_id` on the loyalty route (t_2ffb43a0):** `/grocery/pos/loyalty-members`
+> now serves `customer_id` (and accepts `?customer_id=`), which completes the
+> mart join chain `pos.transactions → loyalty_members → customers`. Without it
+> the dimension existed but nothing served the key that reaches it. The column
+> is absent on a data dir predating the card, so the route probes for it and
+> omits it from the projection rather than 500ing; `/grocery/pos/customers`
+> returns `{"data": [], "customers_dimension_present": false}` in that case.
 
 > **API gap for t_959cd040:** `inv.stockout_events` and `inv.sku_demand_daily`
 > are **not yet exposed** by the API. data-lab cannot read the lost-sales feed
@@ -208,7 +296,8 @@ No further serializer changes are required for #26–#31.
   them — regenerate via the module's generator snippet, or just re-run the
   pytest which reuses the module).
 
-**Assertion inventory:** 22 hard-FK checks + 10 semantic-type checks = 32.
+**Assertion inventory:** 29 hard-FK checks + 15 semantic-type checks + 2
+temporal = 46 (t_2ffb43a0 added `HARD-29`, `SEMA-14`, `SEMA-15`).
 
 **Run after a fresh backfill:**
 
@@ -228,6 +317,21 @@ Exit code is non-zero if any assertion returns orphan rows.
 
 ## 6. Open items
 
+- **Pre-existing, NOT introduced by t_2ffb43a0:** the "add a column to an
+  existing data dir" migration this codebase relies on **cannot run on an
+  existing data dir**, because the generator's role does not own the tables
+  `entrypoint.sh` created (see §3a). Measured on CT106 2026-10-03:
+  `elasticity.seed_elasticity_columns` (t_08deeddf) issues an unguarded
+  `ALTER TABLE pos.products ADD COLUMN reference_price` on every boot, and that
+  column is **still absent** from a data dir holding 525,704 transactions — so
+  the price→demand elasticity loop is not actually reading elasticity columns
+  there, and the `mart_product_price_elasticity` regression it exists to make
+  measurable is measuring something else. t_2ffb43a0 guards its own ALTER
+  (probe first, then attempt, then degrade to a no-op with the fix in the log);
+  `elasticity.py` still does not, so it raises on every boot of an old data dir.
+  **Fix:** either apply `schema.sql` as `$POSTGRES_USER` in `entrypoint.sh`, or
+  `ALTER TABLE … OWNER TO $POSTGRES_USER` for every table after applying it.
+  Until then, no card that migrates an existing data dir can rely on that path.
 - **Data-lab re-ingest (acceptance criterion 3):** after the `load_id` API
   change, data-lab should re-ingest and confirm 0 cross-schema orphans. Tracked
   under data-lab #26–#31; no Verisim generator change is pending for this.

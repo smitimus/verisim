@@ -159,6 +159,51 @@ def _has_stockout_tables(industry: str) -> bool:
     return present
 
 
+# Cache of the pos.customers dimension's presence probe, keyed by industry.
+#
+# Deliberately declared HERE, beside the stockout probe, and not in the
+# grocery-only Customers section: the SHARED `/{industry}/pos/loyalty-members`
+# route calls it to decide whether `customer_id` is in the projection, and
+# `gas-station/standalone/strip_grocery.py` deletes every "Grocery only" /
+# "Grocery —" section from the API at build time. A helper parked in one of
+# those sections would leave the shared route calling a name that no longer
+# exists in the gas-station image — a NameError on the first loyalty-members
+# request, which is exactly the class of bug the strip script is meant to
+# prevent.
+_CUSTOMER_TABLE_PRESENT: Dict[str, bool] = {}
+
+
+def _has_customers_table(industry: str) -> bool:
+    """True when this data dir carries the `pos.customers` dimension.
+
+    Same reasoning as `_has_stockout_tables` / `_products_has_elasticity_columns`:
+    a `schema.sql` change only reaches a fresh bootstrap, so a slot on an image
+    older than the customer dimension has neither `pos.customers` nor
+    `loyalty_members.customer_id`. Those routes degrade to an empty result
+    rather than 500, which is what keeps a rolling deploy serving the other
+    tables while one slot is still on the old image.
+    """
+    cached = _CUSTOMER_TABLE_PRESENT.get(industry)
+    if cached is not None:
+        return cached
+    try:
+        rows = query("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'pos' AND table_name = 'customers'
+        """, [], industry)
+        columns = query("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'pos' AND table_name = 'loyalty_members'
+              AND column_name = 'customer_id'
+        """, [], industry)
+        present = ({r['table_name'] for r in rows} >= {'customers'}
+                   and bool(columns))
+    except Exception:
+        present = False
+    _CUSTOMER_TABLE_PRESENT[industry] = present
+    return present
+
+
 def query_write(sql: str, params, industry: str) -> List[Dict]:
     """Execute a write statement with RETURNING and commit."""
     pool = pool_for(industry)
@@ -937,20 +982,45 @@ def pos_products(
 def loyalty_members(
     industry: str,
     tier: Optional[str] = None,
+    customer_id: Optional[str] = None,
     limit: int = Query(500, le=5000),
     offset: int = 0,
 ):
+    """Loyalty *cards*, with the household each belongs to.
+
+    `customer_id` is the join key to the customer dimension
+    (`/grocery/pos/customers`) and is NULL for a card whose data dir predates
+    the dimension, or for a walk-in who never signed up — which is why the
+    transactions mart reaches the segment through this column rather than
+    expecting every card to carry one. `is_active` is not here because the
+    table has no such concept: a card is valid forever, unlike a coupon or a
+    deal, so unlike `/grocery/pos/combo-deals` there is no active/retired
+    slice for a consumer to miss.
+    """
     pool_for(industry)
+    # The column is grocery-only and post-dates the gas-station feed, so probe
+    # it the same way the products/stockout routes do rather than 500ing on a
+    # slot (or a data dir) that predates it.
+    has_customer = _has_customers_table(industry) if industry == "grocery" else False
+    customer_col = "lm.customer_id, " if has_customer else ""
+
     filters, params = ["TRUE"], []
     if tier:
-        filters.append("tier = %s")
+        filters.append("lm.tier = %s")
         params.append(tier)
+    if customer_id:
+        if not has_customer:
+            return {"data": [], "total": 0, "limit": limit, "offset": offset}
+        filters.append("lm.customer_id = %s::uuid")
+        params.append(customer_id)
     where = " AND ".join(filters)
-    total = query(f"SELECT COUNT(*) AS n FROM pos.loyalty_members WHERE {where}", params, industry)[0]["n"]
+    total = query(f"SELECT COUNT(*) AS n FROM pos.loyalty_members lm WHERE {where}",
+                  params, industry)[0]["n"]
     rows = query(f"""
-        SELECT member_id, first_name, last_name, email, signup_date, points_balance, tier
-        FROM pos.loyalty_members WHERE {where}
-        ORDER BY points_balance DESC, member_id DESC LIMIT %s OFFSET %s
+        SELECT lm.member_id, lm.first_name, lm.last_name, lm.email, lm.signup_date,
+               lm.points_balance, lm.tier, {customer_col}lm.created_at
+        FROM pos.loyalty_members lm WHERE {where}
+        ORDER BY lm.points_balance DESC, lm.member_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
     return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
@@ -1159,6 +1229,107 @@ def pos_combo_deals(active_only: bool = True):
         WHERE {where}
         ORDER BY cd.valid_until DESC
     """, params, "grocery")
+
+
+# ---------------------------------------------------------------------------
+# Grocery only: Customers (household master dimension)
+# ---------------------------------------------------------------------------
+# `_has_customers_table` is defined up in the shared section beside
+# `_has_stockout_tables`, because the shared loyalty-members route needs it —
+# see the comment there.
+
+
+@app.get("/grocery/pos/customers", tags=["Grocery — Customers"])
+def pos_customers(
+    segment: Optional[str] = None,
+    age_band: Optional[str] = None,
+    min_household_size: Optional[int] = Query(None, ge=1, le=12),
+    customer_id: Optional[str] = None,
+    limit: int = Query(500, le=5000),
+    offset: int = 0,
+):
+    """The customer / household master dimension, with its loyalty rollup.
+
+    `pos.loyalty_members` is a *card*; this is the household behind it. A
+    mart builds its customer grain here — `loyalty_member_count` is how many
+    cards the household holds, `first_signup_date` when it first appeared in
+    the programme — and joins segments up through
+    `/grocery/pos/loyalty-members` on `customer_id` to reach the transactions.
+
+    Both rollup columns are computed by the join, never stored: a stored copy
+    goes stale the moment a second card joins the household. A household with
+    `loyalty_member_count = 0` cannot exist (a household is formed from cards),
+    so the LEFT JOIN is defensive rather than expected to drop rows.
+
+    `min_household_size` exists because "people in the household" is the one
+    question a segment page always asks and it is not answerable by eye on the
+    raw size column.
+    """
+    if not _has_customers_table("grocery"):
+        return {"data": [], "total": 0, "limit": limit, "offset": offset,
+                "customers_dimension_present": False}
+    filters, params = ["TRUE"], []
+    if segment:
+        filters.append("c.segment = %s"); params.append(segment)
+    if age_band:
+        filters.append("c.age_band = %s"); params.append(age_band)
+    if min_household_size is not None:
+        filters.append("c.household_size >= %s"); params.append(min_household_size)
+    if customer_id:
+        filters.append("c.customer_id = %s::uuid"); params.append(customer_id)
+    where = " AND ".join(filters)
+
+    total = query(f"""
+        SELECT COUNT(*) AS n
+        FROM pos.customers c WHERE {where}
+    """, params, "grocery")[0]["n"]
+
+    rows = query(f"""
+        SELECT c.customer_id, c.age_band, c.household_size, c.segment,
+               COUNT(lm.member_id) AS loyalty_member_count,
+               MIN(lm.signup_date) AS first_signup_date,
+               c.created_at
+        FROM pos.customers c
+        LEFT JOIN pos.loyalty_members lm ON lm.customer_id = c.customer_id
+        WHERE {where}
+        GROUP BY c.customer_id, c.age_band, c.household_size, c.segment, c.created_at
+        ORDER BY c.household_size DESC, c.segment, c.customer_id
+        LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset,
+            "customers_dimension_present": True}
+
+
+@app.get("/grocery/pos/customers/summary", tags=["Grocery — Customers"])
+def pos_customers_summary(industry: str):
+    """The dimension's shape: household count and mix by segment and age band.
+
+    The page a data engineer opens first when sizing an RFM or cohort build —
+    how many households exist, and how they are distributed — without paging
+    the whole dimension through a client to count it. Groups by segment and
+    age band together because those two are drawn *conditionally* on the
+    segment (models/customers.py), so the pair is what the generator actually
+    produced; a segment-only marginal would hide that.
+    """
+    if not _has_customers_table("grocery"):
+        return {"data": [], "total": 0, "customers_dimension_present": False}
+    rows = query("""
+        SELECT c.segment, c.age_band,
+               COUNT(*) AS household_count,
+               ROUND(AVG(c.household_size)::numeric, 2) AS avg_household_size,
+               SUM(card_count) AS loyalty_card_count
+        FROM pos.customers c
+        LEFT JOIN (
+            SELECT customer_id, COUNT(*) AS card_count
+            FROM pos.loyalty_members
+            WHERE customer_id IS NOT NULL
+            GROUP BY customer_id
+        ) lm ON lm.customer_id = c.customer_id
+        GROUP BY c.segment, c.age_band
+        ORDER BY c.segment, c.age_band
+    """, [], "grocery")
+    total = query("SELECT COUNT(*) AS n FROM pos.customers", [], "grocery")[0]["n"]
+    return {"data": rows, "total": total, "customers_dimension_present": True}
 
 
 # ---------------------------------------------------------------------------
