@@ -192,12 +192,14 @@ def _make_requests(industry, calls):
                           "orders": 12, "fuel_transactions": 5, "tickets": 3,
                           "calls": 2, "chats": 1, "surveys": 4, "ticks": 2880})
         if "/stats/generation" in url:
-            # a LIST: the dashboard does pd.DataFrame(gen_stats), and a dict
-            # envelope would become one column per envelope key
-            return _Resp([{"recorded_at": "2026-10-04T11:00:00Z",
-                           "pos_transactions_generated": 100,
-                           "timeclock_events_generated": 20,
-                           "orders_generated": 5, "scenario_tag": "normal"}])
+            # The ENVELOPE the route actually returns since t_ac80c514 — the
+            # dashboard reads `data`, and the loader calls this with `paged`.
+            # A bare list here would pass vacuously and hide a real regression.
+            return _Resp({"data": [{"recorded_at": "2026-10-04T11:00:00Z",
+                                    "pos_transactions_generated": 100,
+                                    "timeclock_events_generated": 20,
+                                    "orders_generated": 5, "scenario_tag": "normal"}],
+                          "total": 1, "limit": 200, "offset": 0})
         if "/stats/distributions" in url:
             return _Resp({"transactions_by_day": [
                 {"day": "2026-10-01", "transaction_count": 2000}],

@@ -93,8 +93,10 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
             return pd.DataFrame(), 0
         return pd.DataFrame([r.get("state", {})]), 1
     if table == "control.generation_stats":
+        # `paged`, not `flat`: the route returns the {data,total,...} envelope (t_ac80c514)
+        # so the explorer's row count is the advertised total rather than the page length.
         n = extra.get("last_n_ticks", 100)
-        return flat(f"{pfx}/stats/generation", {"last_n_ticks": n})
+        return paged(f"{pfx}/stats/generation", {"last_n_ticks": n})
 
     # --- Gas-station-only tables ---
     if table == "fuel.transactions":

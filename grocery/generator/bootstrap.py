@@ -110,7 +110,22 @@ def read_state(conn):
         return dict(cur.fetchone())
 
 
-def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms):
+def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms,
+                 bump_state_clock=True):
+    """Write one tick's ledger row.
+
+    `bump_state_clock` moves `control.generator_state.last_tick_at`, which is what the
+    `/status` route and data-lab's readiness sensor read as "the generator is alive". Only
+    a realtime tick means that: during a backfill the generator is simulating *yesterday*
+    over and over, so stamping the wall clock there would make a backfilled hour look
+    like live progress — the sensor would report the generator alive while it was writing
+    history, and `last_tick_at` would stop being comparable with `recorded_at` on the
+    ledger rows themselves. `run_backfill` therefore passes False.
+
+    Counts are the rows actually written, never the planned volume: a stockout-capped
+    tick (t_959cd040) writes strictly fewer rows than it asked for, and the ledger's
+    whole purpose is to say what landed.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO control.generation_stats
@@ -118,10 +133,11 @@ def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, s
                  orders_generated, scenario_tag, simulation_dt, wall_clock_ms)
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms))
-        cur.execute("""
-            UPDATE control.generator_state
-            SET last_tick_at = NOW(), updated_at = NOW()
-            WHERE state_id = 1
-        """)
+        if bump_state_clock:
+            cur.execute("""
+                UPDATE control.generator_state
+                SET last_tick_at = NOW(), updated_at = NOW()
+                WHERE state_id = 1
+            """)
     conn.commit()
 

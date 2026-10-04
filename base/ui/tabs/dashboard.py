@@ -23,6 +23,10 @@ def render(ctx):
         status_data = api_get(f"{pfx}/status")
         today_data = api_get(f"{pfx}/stats/today")
         gen_stats = api_get(f"{pfx}/stats/generation", {"last_n_ticks": 200})
+        # The route returns the {data,total,limit,offset} envelope, so the chart reads
+        # `data` — passing the envelope itself to DataFrame would plot the dict columns
+        # (t_ac80c514).
+        gen_rows = (gen_stats or {}).get("data", [])
 
         if status_data:
             state = status_data.get("state", {})
@@ -60,8 +64,8 @@ def render(ctx):
 
         st.divider()
 
-        if gen_stats:
-            df = pd.DataFrame(gen_stats)
+        if gen_rows:
+            df = pd.DataFrame(gen_rows)
             if not df.empty:
                 df["recorded_at"] = pd.to_datetime(df["recorded_at"])
                 df = df.sort_values("recorded_at")

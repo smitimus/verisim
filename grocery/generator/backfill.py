@@ -23,6 +23,7 @@ from scenarios.scenario_engine import get_scenario_context, get_active_scenario_
 # Loaded both as `grocery.generator.backfill` and as flat `backfill` when main.py
 # runs as a script. See the long note in `main.py`.
 if __package__:
+    from .bootstrap import record_stats
     from .volume import (
         SIM_HOUR_SECONDS,
         compute_online_count,
@@ -32,6 +33,7 @@ if __package__:
     from .tick import _weather_for_tick, get_ad_product_prices
 else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from bootstrap import record_stats
     from volume import (
         SIM_HOUR_SECONDS,
         compute_online_count,
@@ -330,7 +332,26 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # Partial day: generate timeclock events per-hour using the same
             # idempotent realtime logic (checks existing events before inserting).
             if is_partial:
-                timeclock.generate_events(conn, sim_dt, employees, locations)
+                tc_count = timeclock.generate_events(conn, sim_dt, employees, locations)
+            else:
+                # A full day writes its whole shift schedule in one pass after the
+                # hourly loop, so the per-hour timeclock count is only meaningful on a
+                # partial day. Report 0 rather than a planned number it never wrote.
+                tc_count = 0
+
+            # The tick ledger (t_ac80c514). The backfill writes one row per simulated
+            # hour, exactly as the realtime tick loop does, so a consumer asking "was the
+            # generator up, and under what regime, when these sales were written?" has
+            # an answer for every day the backfill produced — including the 30-day
+            # window of a fresh install, which used to exist in the fact tables with no
+            # telemetry at all. The holiday/rush-hour tag is `scenario.scenario_tag`,
+            # the same context this hour's transactions were generated under, so the tag
+            # cannot drift from the rows it describes.
+            #
+            # Counts are what landed (`len(depletion)`), not `pos_count`: a
+            # stockout-capped hour (t_959cd040) writes fewer rows than it planned for.
+            record_stats(conn, len(depletion), tc_count, len(online_depletion),
+                         scenario.scenario_tag, sim_dt, 0, bump_state_clock=False)
 
         if not is_partial:
             # Full day: run all end-of-day events in one pass.
