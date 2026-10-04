@@ -14,6 +14,7 @@ Run:  python -m pytest gas-station/generator/tests/test_build_checks.py -v
 import importlib.util
 import pathlib
 import shutil
+import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
@@ -129,4 +130,25 @@ def test_strip_scripts_keep_only_their_own_industry():
 def test_api_schema_agreement_holds():
     """No route queries a table that no schema.sql creates."""
     check = _load("check_api_schema_agreement")
+    assert check.main() == 0
+
+
+def test_switch_status_sees_every_container_it_creates():
+    """`switch.sh status` must not report 'none' for a container it can start.
+
+    The gas-station branch used to look for `^verisim-gas-station$`, a name no
+    mode creates, so a running dev stack printed "none" (t_a6ecb731).
+    """
+    # A shell script, so run it rather than importing it — same check, no copy.
+    result = subprocess.run(
+        ["bash", str(TOOLS / "check_switch_status.sh"), str(REPO)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_workflows_gate_publish_on_both_test_jobs():
+    """Every workflow's publish job waits for test + integration, and keeps the
+    credential guard ungated (the t_44f5663e regression)."""
+    check = _load("check_workflows")
     assert check.main() == 0
