@@ -402,19 +402,33 @@ The data-lab dbt project expects these 27 source tables from the generator. If y
 
 ## Code Quality Notes
 
-### Oversized Files (need splitting)
-| File | Pure LOC | Problem |
-|------|----------|---------|
-| `base/ui/app.py` | ~2000 | Monolithic Streamlit UI — one file for all 7 tabs |
-| `grocery/generator/main.py` | ~550 | Entry point mixes DB bootstrap, state management, and the generation loop |
-| `grocery/generator/models/pos.py` | ~520 | All POS logic (seeding, transactions, coupons, deals, loyalty) in one file |
+### Oversized Files (split 2026-10-04, t_c2eca5dd)
+The three monoliths self-reported here are now packages. Every one was split
+without changing behaviour, and each split is pinned by a test.
+
+| Was | Now | Largest remaining piece |
+|------|-----|------------------------|
+| `base/ui/app.py` (~2793) | `base/ui/app.py` (110, entry point) + `base/ui/ui_lib/` + `base/ui/tabs/` | `ui_lib/schema.py` (1112 — table docs, mostly data) |
+| `grocery/generator/main.py` (~1077) | `main.py` (229, re-export facade) + `bootstrap.py` / `volume.py` / `seed.py` / `tick.py` / `backfill.py` | `backfill.py` (462) |
+| `grocery/generator/models/pos.py` (~1278) | `pos.py` (99, facade) + `pos_catalog.py` / `pos_txn.py` / `pos_promotions.py` / `pos_loyalty.py` | `pos_txn.py` (459) |
+
+`test_ui_smoke.py` executes the real UI against stubbed Streamlit and asserts
+every tab renders for both industries — no CI job opens port 8501, so nothing
+else would catch a broken tab. The generator's `test_main_split_imports.py` and
+`test_pos_facade.py` pin the re-export facades.
+
+Note `main.py` is BOTH an importable module and the script the container runs
+(`python main.py`), so its sibling imports are conditional on `__package__` — a
+package-relative import raises when the file is `__main__`, and an absolute one
+creates a second copy of every sibling when imported as `grocery.generator.main`.
 
 ### Tooling Gaps
-- **No pyproject.toml** — no type checker, no linter config
-- **No pytest** — no test runner, no conftest, no test files
-- **No pre-commit hooks** — no automated quality gates
-- **No CI/CD** — no GitHub Actions, no automated builds/tests
-- **Unvalidated config** — `config.py` reads YAML without schema validation (pydantic or similar)
+_(stale as of 2026-10-04 — all four are now closed)_
+- ~~**No pyproject.toml**~~ — added; carries the pytest + coverage config and the `fail_under` floor
+- ~~**No pytest**~~ — 27 test files under `grocery/generator/tests/` + `grocery/api/tests/`
+- ~~**No pre-commit hooks**~~ — still absent
+- ~~**No CI/CD**~~ — `.github/workflows/verisim-grocery.yml`, gating `publish` behind `test` + `integration`
+- **Config validation** — added (`config_schema.py`); an unknown `config.yaml` key is now rejected
 
 ## Known Bugs (Fixed — Do Not Revert)
 
@@ -426,7 +440,31 @@ Both confirmed fixed on fresh backfill data:
 
 Source preserved in `gas-station/`. Requires verisim-base running (base/ contains shared postgres + api + ui). Not active development — grocery standalone is primary product.
 
-## Streamlit UI Architecture (`base/ui/app.py`)
+## Streamlit UI Architecture (`base/ui/`)
+
+`base/ui/app.py` was one 2793-line file for all eight tabs. Since t_c2eca5dd it is
+a 110-line entry point over two packages:
+
+```
+base/ui/
+├── app.py           # entry point: builds the Context, renders the tabs
+├── ui_lib/
+│   ├── api.py       # API_BASE_URL, api_get/post/patch/delete, status_badge
+│   ├── context.py   # the Context dataclass each tab receives
+│   ├── loader.py    # _load_table: table name -> API route
+│   ├── scenarios.py # the scenario catalogue per industry
+│   └── schema.py    # per-industry table docs, table lists
+└── tabs/            # one module per tab, each exposing render(ctx)
+    ├── dashboard.py  control.py  scenarios_tab.py  promotions.py
+    └── distributions.py  explorer.py  docs.py  dictionary.py
+```
+
+**Why a Context instead of module globals.** A `@st.fragment` closes over the
+globals of the module that DEFINES it, so a tab moved out of `app.py` resolves
+free names against its own module — not `app.py`'s. Each tab therefore imports
+every name its body reads and receives `industry` / `pfx` / the schema tables
+explicitly through `ctx`. A tab that forgets an import raises `NameError` the
+first time anyone opens it, which is why `test_ui_smoke.py` exists.
 
 **Tab reset bug**: `st.tabs` has no `key` param and resets to tab 0 on every full-app rerun. Fix: wrap every tab's content in `@st.fragment` for isolation.
 

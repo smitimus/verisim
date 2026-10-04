@@ -6,11 +6,22 @@ Python data generator at `grocery/generator/`. Generates realistic POS, timecloc
 
 ```
 generator/
-├── main.py          # Entry point: bootstrap, seeding, backfill, tick loop (620 LOC)
-├── config.py        # YAML config loader + dataclass hierarchy (228 LOC)
+├── main.py          # Entry point + re-export facade (229 LOC)
+├── bootstrap.py     # DB bootstrap, connection, wait_for_db, control state, record_stats
+├── volume.py        # The volume law — POS + online daily/hourly targets
+├── seed.py          # Reference-data seeding
+├── tick.py          # The realtime tick
+├── backfill.py      # Backfill mode + gap detection
+├── config.py        # YAML config loader + dataclass hierarchy
+├── config_schema.py # Config validation (rejects unknown keys)
+├── elasticity.py    # Price-elasticity demand response
 ├── schema.sql       # DB schema (tables, indexes, control schema)
 ├── models/          # Domain-specific DB write modules
-│   ├── pos.py       # POS transactions, coupons, deals, loyalty (660 LOC — largest)
+│   ├── pos.py           # POS facade, re-exports the four below (99 LOC)
+│   ├── pos_catalog.py   # Products, departments, price history (275 LOC)
+│   ├── pos_txn.py       # Transactions, returns, depletion (459 LOC — largest)
+│   ├── pos_promotions.py# Coupons, combo deals, reconcile (394 LOC)
+│   ├── pos_loyalty.py   # Loyalty members, points (201 LOC)
 │   ├── hr.py        # Locations, employees, hire/terminate
 │   ├── timeclock.py # Clock in/out events, daily pairing
 │   ├── ordering.py  # Store replenishment orders
@@ -22,17 +33,23 @@ generator/
 │   └── scheduling.py # Labor scheduling, actuals resolution
 ├── scenarios/
 │   └── scenario_engine.py  # Named event presets (rush_hour, weekend, etc.)
-└── tests/           # pytest tests (4 test files)
+└── tests/           # pytest tests (27 test files)
 ```
+
+The `main.py` split (t_c2eca5dd) made this file a facade: `main.py` is both an
+importable module and the script the container runs, so its sibling imports are
+conditional on `__package__`. Every public name is still reachable from `main`.
+`models/pos.py` is the same shape — `pos.<fn>` keeps working after the four-way
+split.
 
 ## Where to Look
 
 | Task | Location | Notes |
 |------|----------|-------|
 | Change generation volume/timing | `config.py` dataclasses or `config.yaml` | Config reloaded each tick — no restart needed |
-| Add/modify POS logic | `models/pos.py` | Largest model — transactions, coupons, deals, loyalty |
+| Add/modify POS logic | `models/pos_txn.py` / `pos_catalog.py` / `pos_promotions.py` / `pos_loyalty.py` | Split four ways (t_c2eca5dd); `models/pos.py` re-exports all four, so `pos.<fn>` is unchanged |
 | Add new source table | `schema.sql` + relevant `models/*.py` | Must also update `data-lab/airflow/dbt/grocery/models/sources.yml` |
-| Modify backfill behavior | `main.py` auto_backfill_if_fresh() | Gap-aware, idempotent, partial-day handling |
+| Modify backfill behavior | `backfill.py` auto_backfill_if_fresh() | Gap-aware, idempotent, partial-day handling (moved out of `main.py` by t_c2eca5dd) |
 | Add scenario | `scenarios/scenario_engine.py` + `config.yaml` scenarios section | |
 | Run tests | `pytest grocery/generator/tests/` | |
 
