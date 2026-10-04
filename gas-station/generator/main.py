@@ -88,13 +88,32 @@ def bootstrap_database(cfg):
 # ---------------------------------------------------------------------------
 
 def get_connection(cfg):
-    return psycopg2.connect(
+    """Open a connection whose session timezone is THIS process's local zone.
+
+    Every simulated stamp this generator writes is produced by a NAIVE
+    `datetime.now()` and lands in a `TIMESTAMPTZ` column, and Postgres reads a
+    naive timestamp in the SESSION's timezone — so the stored instant depends on
+    the server's `TimeZone` setting rather than on the zone the wall clock that
+    built the value was in. Compose sets `TZ` per service, so the two can differ
+    and every business timestamp then lands shifted by whole hours.
+
+    See `grocery/generator/main.py::get_connection` for the full argument and
+    for why this pins the writer's zone rather than UTC. Gas-station has the
+    identical write path and therefore the identical need; pinned here so the
+    fix is not grocery-shaped.
+    """
+    conn = psycopg2.connect(
         host=cfg.db_host,
         port=cfg.db_port,
         user=cfg.db_user,
         password=cfg.db_password,
         dbname=cfg.db_name,
     )
+    with conn.cursor() as cur:
+        cur.execute("SET SESSION TIME ZONE %s",
+                    (os.environ.get("TZ") or "UTC",))
+    conn.commit()
+    return conn
 
 
 def wait_for_db(cfg, max_retries=30, delay=5):

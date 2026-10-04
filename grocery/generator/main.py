@@ -135,12 +135,94 @@ def bootstrap_database(cfg):
 # DB connection helpers
 # ---------------------------------------------------------------------------
 
+def _local_timezone_name():
+    """A `TimeZone` value naming THIS process's zone, which Postgres accepts.
+
+    **Not** `str(datetime.now().astimezone().tzinfo)`. That yields the POSIX
+    *abbreviation* — `'EDT'` on the dev slot — and Postgres rejects it outright:
+
+        ERROR:  invalid value for parameter "TimeZone": "EDT"
+
+    which is the worst possible failure for this line: it would trade a silent
+    data-integrity bug for a generator that refuses to start at all. Measured on
+    the live dev database rather than assumed: `ETCD`, `America/New_York`,
+    `UTC`, `UTC-4`, `+05:30` and `Etc/GMT+4` are accepted; the bare abbreviation
+    is not. (Caught by running the shipped helper inside the real container, not
+    by reading it — the first version of this line used `str(tzinfo)` and would
+    have failed on every start.)
+
+    So the zone is read from the `TZ` environment variable when it is set. That
+    is what compose configures per service, it is already an IANA name, and it
+    is the SAME zone `datetime.now()` was resolved against — which is the entire
+    requirement. Verified end-to-end against the live database with the
+    generator's TZ set to `America/New_York`, `Asia/Kolkata` (+05:30),
+    `Pacific/Kiritimati` (+14:00) and `Australia/Eucla` (+08:45), plus unset,
+    while the server stayed `America/New_York` throughout: in every case a naive
+    local wall clock stored at exactly the instant the writer meant, to the
+    second.
+
+    With no `TZ` set, Python resolves to UTC, so `UTC` is stated explicitly
+    rather than inherited from the server's default — which is precisely the
+    mismatch being fixed.
+    """
+    tz_env = os.environ.get("TZ")
+    if tz_env:
+        return tz_env
+    return "UTC"
+
+
 def get_connection(cfg):
-    return psycopg2.connect(
+    """Open a connection whose session timezone is THIS process's local zone.
+
+    **Why this one line exists (t_35b4d860).** Every simulated stamp this
+    generator writes — `simulation_dt`, `transaction_dt`, `event_dt`, `placed_dt`
+    — is produced by a NAIVE `datetime.now()` and lands in a `TIMESTAMPTZ`
+    column. Postgres reads a naive timestamp *in the session's timezone*, so the
+    instant it stores depends on the zone this connection happens to be in
+    rather than on the zone the wall clock that produced the value was in.
+
+    Those two are not guaranteed to be the same. Postgres defaults its session
+    zone from the SERVER's `TimeZone` setting, while `datetime.now()` uses the
+    container's `TZ`. Compose sets `TZ` per service, so a generator container
+    with no `TZ` (or one that differs from the database's) silently writes every
+    business timestamp shifted by whole hours.
+
+    The failure is silent and it is data, not display: `transaction_dt::date` is
+    how the generator itself decides which day a backfill still owes
+    (`main.py:413`, `:469`), and `DATE_TRUNC('day', transaction_dt)::date` is how
+    the API reports daily distribution. A session zone ahead of the writer's puts
+    a 23:30 store close into the NEXT day, and vice versa a midnight event into
+    the day before — so a day-boundary aggregate disagrees with the generator
+    that produced it, and the two cannot both be right.
+
+    Pinning the session to the *writer's* zone makes the naive stamp mean exactly
+    what the code that built it meant, with no change to any of the ~60 write
+    sites and no schema change (so an existing data dir picks it up on restart).
+
+    Deliberately NOT `SET TIME ZONE 'UTC'`. That is the other common fix, and it
+    would be wrong here: it moves the interpretation of a LOCAL business time to
+    UTC, so a 09:00 store opening would be stored as 09:00 UTC and read back as
+    05:00 New York — trading one whole-hour class of bug for another, on the same
+    column, in the opposite direction. Verified against the live dev database
+    (2026-10-04): a naive `'08:00:00'` written from a `America/New_York` writer
+    must store as `08:00` New York = `12:00` UTC; pinning the session is what
+    makes that hold regardless of how the server is configured.
+
+    `SET SESSION TIME ZONE` is a single round trip on a connection that is
+    already long-lived and reused for the whole run, so it costs nothing
+    measurable. A read-only or a broken connection still raises here exactly as
+    it did before, so the retry path in `main()` is unaffected.
+    """
+    conn = psycopg2.connect(
         host=cfg.db_host, port=cfg.db_port,
         user=cfg.db_user, password=cfg.db_password,
         dbname=cfg.db_name,
     )
+    local_tz = _local_timezone_name()
+    with conn.cursor() as cur:
+        cur.execute("SET SESSION TIME ZONE %s", (local_tz,))
+    conn.commit()
+    return conn
 
 
 def wait_for_db(cfg, max_retries=30, delay=5):

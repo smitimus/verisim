@@ -492,13 +492,25 @@ def _tick_metrics(window_row: Dict[str, Any], state_row: Dict[str, Any],
     # one that is directly comparable with a dashboard's last refresh.
     #
     # Reported ONLY when it is a real measurement. The generator writes
-    # `simulation_dt` from a NAIVE `datetime.now()`, which Postgres then reads in
-    # the DATABASE's timezone; when the generator container's TZ differs from
-    # Postgres's — the normal case, since compose sets `TZ` per service — the
-    # column lands hours away from the truth. Measured on the dev slot
-    # (2026-10-04): the newest `simulation_dt` was 3.71h in the FUTURE of the
-    # database clock, so a naive `now - newest_sim` reported a staleness of
-    # -13412s.
+    # `simulation_dt` from a NAIVE `datetime.now()`, which Postgres reads in the
+    # SESSION's timezone. `get_connection` now pins that session to the
+    # generator's own zone (t_35b4d860), so the column is correct on every
+    # topology; this suppression stays as the BACKSTOP for rows written before
+    # that fix, and for any connection that has not been through it.
+    #
+    # The reason it is still needed is worth stating plainly, because the shape
+    # of the failure is not what it looks like. A timezone mismatch produces a
+    # CONSTANT offset — whole hours, near-zero standard deviation. The 3.71h
+    # reading that first motivated this block does NOT have that shape on the
+    # dev slot: over all 37,407 ledger rows, `recorded_at - simulation_dt` is
+    # mean 0.200s, stddev 1.21s, max 95.73s, and the newest `simulation_dt`
+    # agrees with the database clock to under a second. A timezone bug has
+    # stddev ~0; this had the shape of TICK COST instead, because
+    # `simulation_dt` is stamped at tick start and `recorded_at` (`DEFAULT
+    # NOW()`) at tick end, so the gap IS the tick's wall clock. The suppression
+    # is therefore correct and cheap, but it should never be read as evidence
+    # that a timezone skew is present — `simulation_clock_skew_seconds` below is
+    # what actually reports one, and on a correctly wired stack it stays absent.
     #
     # A negative staleness is not a measurement, so it is reported as absent plus
     # the skew that caused it, rather than as a number an operator has to notice is
@@ -704,6 +716,18 @@ def metrics(industry: str,
     → 2.4 min behind, 0.5s → 24 min, 5s → 4 hours. Any absolute seconds
     threshold on raw lag therefore fires forever on a healthy box or never on a
     slow one. The factor is dimensionless, so one threshold is right everywhere.
+
+    **How to threshold it, and the number is measured.** The factor's trip rate
+    is not uniform in the window, because a single slow tick stays inside a
+    trailing window for `window` ticks: the dev slot's whole ledger recomputed
+    over every trailing-100 window (t_35b4d860) puts 4.88% of windows below
+    0.95, 2.35% below 0.90 and 1.10% below 0.80, on a generator whose median tick
+    costs 72ms against a 30s cadence. So 0.95 would fire about once every twenty
+    windows of an ordinary day — an alert that has learned to be ignored — while
+    0.80 fires roughly once a hundred and still fires when the ticks in the
+    window are collectively eating a fifth of the interval. If you alert on this,
+    alert below 0.80 and treat a brief dip as the spike passing rather than as an
+    incident; widen `window` first if a single slow tick keeps tripping you.
 
     `?rows=false` skips the per-table row counts, which are exact but not cheap
     (a `count(*)` over a full transaction_items), and are cached for a minute
