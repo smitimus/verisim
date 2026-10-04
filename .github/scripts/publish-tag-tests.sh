@@ -59,9 +59,19 @@ fixture() {
 # same subshell trap that made verify-release-in-both-registries.sh request
 # `.../manifests/` with an always-empty tag (t_ff5a70ec), and the first draft
 # of this harness hit it the same way.
+#
+# EVERY input is pinned here, INCLUDING the ones this harness does not vary.
+# `REGISTRY_IMAGE` is the one that bites: it is exported at the WORKFLOW level
+# in verisim-grocery.yml, so the grocery test job's pytest process inherits it
+# and every child bash does too. Left alone, compute-push-tags.sh would append
+# the second registry's refs and three of these cases would fail on tag COUNTS
+# (6 tags, not 3) — green locally, red in CI, for a reason that has nothing to
+# do with the convention under test. A harness must not read the ambient
+# environment; the case 19 below asserts exactly that.
 run() {
   local dir="$1" ref="$2" ref_name="$3"
   REPO_ROOT="${dir}" IMAGE_NAME=smiti/verisim-grocery \
+    REGISTRY_IMAGE="" REQUIRE_SECOND_REGISTRY=false \
     GITHUB_REF="${ref}" GITHUB_REF_NAME="${ref_name}" GITHUB_SHA="${SHA}" \
     bash "${COMPUTE}" > "${TMP}/out" 2> "${TMP}/err"
   echo $? > "${TMP}/rc"
@@ -195,6 +205,42 @@ else
   bad "the real checkout passes the script end to end" "$(err)"
 fi
 
+# ── 7. The harness is immune to the ambient environment ─────────────────────
+# This case exists because of a real failure, not a hypothetical one. On
+# 2026-10-04 the grocery test job went red on 3 of these cases while the same
+# commit was green on every developer machine: verisim-grocery.yml exports
+# REGISTRY_IMAGE at the WORKFLOW level, so the pytest process inherited it, and
+# compute-push-tags.sh — correctly — appended the second registry's refs to a
+# publish whose fixture asked for a Hub-only one. The tag COUNTS changed from 3
+# to 6 and the count assertions failed.
+#
+# A harness that passes in one environment and fails in another is not testing
+# the convention, it is testing the weather. So: run this same harness with a
+# REGISTRY_IMAGE exported, and require it to give the identical answer.
+#
+# The child gets PUBLISH_TAG_TESTS_CHILD=1 and STOPS at this point. Without that
+# guard this case re-runs the whole harness — which re-enters this case, and so
+# on until the job times out. (It did, the first time: a 60s timeout, no output.)
+if [ -z "${PUBLISH_TAG_TESTS_CHILD:-}" ]; then
+  AMBIENT_OUT="$(mktemp)"
+  PUBLISH_TAG_TESTS_CHILD=1 REGISTRY_IMAGE='gitea.afastbox.com/admin/verisim-grocery' \
+    REQUIRE_SECOND_REGISTRY=true \
+    bash "${0}" "${REPO}" > "${AMBIENT_OUT}" 2>&1
+  ambient_rc=$?
+  ambient_summary="$(grep -E '^publish-tag-tests: ' "${AMBIENT_OUT}" | tail -1)"
+  rm -f "${AMBIENT_OUT}"
+
+  # The child's own count is one lower (it skips this case), so compare the
+  # OUTCOME and the per-case verdict lines, not the summary string verbatim.
+  if [ "${ambient_rc}" -eq 0 ] && ! grep -qE '^  FAIL' "${AMBIENT_OUT}"; then
+    ok "the result is identical under an ambient REGISTRY_IMAGE (${ambient_summary})"
+  else
+    bad "the result is identical under an ambient REGISTRY_IMAGE" \
+        "with REGISTRY_IMAGE exported: rc=${ambient_rc} '${ambient_summary}'. This harness must pin every input, or CI fails for reasons unrelated to the convention."
+  fi
+fi
+
 echo
-echo "publish-tag-tests: ${PASS} passed, ${FAIL} failed"
+SUMMARY="publish-tag-tests: ${PASS} passed, ${FAIL} failed"
+echo "${SUMMARY}"
 [ "${FAIL}" -eq 0 ]
