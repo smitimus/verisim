@@ -168,9 +168,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           missing=""
-          for pair in DOCKER_USERNAME:DOCKER_USERNAME DOCKER_PASSWORD:DOCKER_PASSWORD \
-                      REGISTRY_USERNAME:REGISTRY_USERNAME REGISTRY_PASSWORD:REGISTRY_PASSWORD; do
-            var="${pair%%:*}"
+          for var in DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD; do
             if [ -z "${!var}" ]; then
               missing="${missing:+${missing}, }${var}"
             fi
