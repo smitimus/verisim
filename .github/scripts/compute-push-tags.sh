@@ -21,11 +21,20 @@
 #   GITHUB_SHA       the commit being published
 #
 # Output:
-#   tags=<comma-separated refs for docker/build-push-action>
+#   tags=<comma-separated refs for docker/build-push-action>  every registry
+#   hub_tags=<the Docker Hub subset>
+#   registry_tags=<the second-registry subset, empty for a Hub-only image>
 #   version=<the tracked version, e.g. 1.3.4>
 #   release=true|false  (true when the push was a v* tag push)
 #   dev_tag=dev-<YYYY-MM-DD-HHMM> UTC
-#   version_ref=<image>:<version>
+#   version_ref=<image>:<version>          hub
+#   registry_version_ref=<registry>:<version>   second registry, when it has one
+#   registry_ref=<registry>:<dev_tag>      what the in-CI verifier re-reads
+#   hub_ref=<image>:<sha>                  ditto, on the Hub
+#
+#   REGISTRY_IMAGE=<repo in the second registry>  opt in to that registry. With
+#     REQUIRE_SECOND_REGISTRY=true an unset REGISTRY_IMAGE is a hard failure
+#     rather than a silent single-registry publish (t_e1b1de67).
 # =============================================================================
 set -euo pipefail
 
@@ -89,26 +98,71 @@ if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
 fi
 
 # ── 3. The tags ─────────────────────────────────────────────────────────────
-# Always three things:
+# Two registries, one push, one index digest.
+#
+# Docker Hub always gets three refs:
 #   latest                 moving pointer (what `switch.sh release` pulls)
-#   <version>              THE tracked version — the human-readable tag this card asks for
 #   <sha>                  full traceability back to the commit, and the ref
 #                          t_ff5a70ec's dual-registry verifier keys off
+#   <version>              THE tracked version — the human-readable tag this card asks for
 # A release tag push adds its own git tag name as well, so the historic
 # `v1.3.3` shape keeps working alongside the bare `1.3.3`.
-tags="${IMAGE_NAME}:latest,${IMAGE_NAME}:${VERSION},${IMAGE_NAME}:${GITHUB_SHA}"
-if [ "${RELEASE}" = true ]; then
-  tags="${tags},${IMAGE_NAME}:${GITHUB_REF_NAME}"
-fi
-
-# Named for the moment of the push, in UTC, matching the estate's existing
-# dev-<YYYY-MM-DD>-<HHMM> convention. Never re-pointed: a minute collision
-# overwrites a tag nobody has pinned yet, which is the acceptable case; the
-# version tag above is the one that must stay meaningful.
+#
+# grocery additionally gets a second registry: data-lab pins this image BY DIGEST
+# in our own Gitea namespace, so a release that lands only on the Hub is
+# invisible to every slot — that gap blocked data-dev's t_3f078e61 for hours on
+# 2026-10-04 (t_ff5a70ec). It receives the SAME vocabulary — the commit tag, the
+# tracked version (plus the v* name on a release), and the UTC dev- tag its pin
+# bump reads.
+#
+# Those Gitea refs used to be computed inline in verisim-grocery.yml while this
+# script owned the Hub ones: two owners of a tag name in one workflow, each a
+# valid body, so merging the second of those PRs silently discarded the first
+# (t_e1b1de67). Everything is computed here now, and the workflow has no tag
+# computation of its own left to conflict with.
+#
+# The dev- tag is named for the moment of the push rather than the commit: two
+# releases inside one minute would collide, which is acceptable because a
+# collision overwrites a tag nobody has pinned yet. What is NOT acceptable is
+# re-pointing an EXISTING tag, because rollback is deliberately a re-pin and not
+# a rebuild — so a tag already in the registry must keep naming the index it
+# named before. The in-CI verification step turns that rule into something
+# enforced rather than remembered.
 DEV_TAG="dev-$(date -u +%Y-%m-%d-%H%M)"
 
+hub_ref="${IMAGE_NAME}:${GITHUB_SHA}"
+version_ref="${IMAGE_NAME}:${VERSION}"
+hub_tags="${IMAGE_NAME}:latest,${hub_ref},${version_ref}"
+if [ "${RELEASE}" = true ]; then
+  hub_tags="${hub_tags},${IMAGE_NAME}:${GITHUB_REF_NAME}"
+fi
+tags="${hub_tags}"
+
+# The second registry is opt-in by env: gas-station is Hub-only, grocery is not.
+# An empty REGISTRY_IMAGE on an image that REQUIRES one is a refusal, not a
+# fallback — the four-secret credential gate above checks the credential, not the
+# destination, so a workflow that lost this env var would pass that gate and then
+# publish to the Hub only, which is the precise orphaning failure this exists to
+# prevent, witnessed by a green job.
+if [ -n "${REGISTRY_IMAGE:-}" ]; then
+  registry_version_ref="${REGISTRY_IMAGE}:${VERSION}"
+  if [ "${RELEASE}" = true ]; then
+    registry_version_ref="${registry_version_ref},${REGISTRY_IMAGE}:${GITHUB_REF_NAME}"
+  fi
+  registry_ref="${REGISTRY_IMAGE}:${DEV_TAG}"
+  registry_tags="${REGISTRY_IMAGE}:${GITHUB_SHA},${registry_version_ref},${registry_ref}"
+  tags="${tags},${registry_tags}"
+  echo "registry_tags=${registry_tags}"
+  echo "registry_version_ref=${registry_version_ref}"
+  echo "registry_ref=${registry_ref}"
+elif [ "${REQUIRE_SECOND_REGISTRY:-false}" = "true" ]; then
+  die "REGISTRY_IMAGE is not set, so this push would reach Docker Hub only. This image is pinned by digest in our own registry, so a single-registry release cannot be pulled by a slot. Set REGISTRY_IMAGE (e.g. gitea.afastbox.com/admin/verisim-grocery), or pass REQUIRE_SECOND_REGISTRY=false for an image that is Hub-only."
+fi
+
 echo "tags=${tags}"
+echo "hub_tags=${hub_tags}"
 echo "version=${VERSION}"
 echo "release=${RELEASE}"
 echo "dev_tag=${DEV_TAG}"
-echo "version_ref=${IMAGE_NAME}:${VERSION}"
+echo "version_ref=${version_ref}"
+echo "hub_ref=${hub_ref}"
