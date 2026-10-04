@@ -52,6 +52,8 @@ import grocery.generator.models.pos as pos
 import grocery.generator.elasticity as elasticity
 from grocery.generator.config import Config
 
+from .conftest import patch_all_pos_writes
+
 # A Saturday, mid-morning, so no holiday / rush-hour noise in the scenario tag.
 SIM_DT = datetime(2026, 9, 26, 10, 0, 0)
 
@@ -142,7 +144,7 @@ def _run(products, cfg, count=20000, sim_dt=SIM_DT, seed=7, ad_prices=None):
             conn.items.extend(records)
 
     random.seed(seed)
-    with patch('grocery.generator.models.pos.execute_values', side_effect=_capture):
+    with patch_all_pos_writes(_capture):
         pos.generate_pos_transactions(
             conn, cfg, sim_dt, count, _Scenario(),
             [{'location_id': 'loc1', 'location_type': 'store'}],

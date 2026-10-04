@@ -24,6 +24,8 @@ import random
 import grocery.generator.models.pos as pos
 from grocery.generator.config import Config
 
+from .conftest import patch_all_pos_writes
+
 SIM_DT = datetime(2026, 6, 1, 12, 0, 0)  # inside the windows used below
 
 
@@ -102,7 +104,7 @@ def _generate(sim_dt, coupons, deals):
     conn = _ScriptedConn()
     _captured_items.clear()
     with patch.object(random, "random", lambda: 0.0), \
-         patch("grocery.generator.models.pos.execute_values", side_effect=_capture_items):
+         patch_all_pos_writes(_capture_items):
         pos.generate_pos_transactions(
             conn, cfg, sim_dt, 4, _Scenario(), stores, products,
             employees, [{"member_id": "m1"}], coupons, deals,
@@ -220,7 +222,7 @@ def _seeded_records(func, fetchones, *args):
     def _capture(cur, sql, recs, template=None):
         records.extend(recs)
 
-    with patch("grocery.generator.models.pos.execute_values", side_effect=_capture):
+    with patch_all_pos_writes(_capture):
         func(conn, *args)
     return records
 
