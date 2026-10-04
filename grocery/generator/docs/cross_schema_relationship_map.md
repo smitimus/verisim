@@ -382,21 +382,34 @@ Exit code is non-zero if any assertion returns orphan rows.
 
 ## 6. Open items
 
-- **Pre-existing, NOT introduced by t_2ffb43a0:** the "add a column to an
-  existing data dir" migration this codebase relies on **cannot run on an
-  existing data dir**, because the generator's role does not own the tables
-  `entrypoint.sh` created (see §3a). Measured on CT106 2026-10-03:
-  `elasticity.seed_elasticity_columns` (t_08deeddf) issues an unguarded
-  `ALTER TABLE pos.products ADD COLUMN reference_price` on every boot, and that
-  column is **still absent** from a data dir holding 525,704 transactions — so
-  the price→demand elasticity loop is not actually reading elasticity columns
-  there, and the `mart_product_price_elasticity` regression it exists to make
-  measurable is measuring something else. t_2ffb43a0 guards its own ALTER
-  (probe first, then attempt, then degrade to a no-op with the fix in the log);
-  `elasticity.py` still does not, so it raises on every boot of an old data dir.
-  **Fix:** either apply `schema.sql` as `$POSTGRES_USER` in `entrypoint.sh`, or
-  `ALTER TABLE … OWNER TO $POSTGRES_USER` for every table after applying it.
-  Until then, no card that migrates an existing data dir can rely on that path.
+- **Resolved in source by t_b17da778 (2026-10-04), still not converged on
+  existing data dirs:** the "add a column to an existing data dir" migration
+  this codebase relies on **cannot ALTER an existing data dir**, because the
+  generator's role does not own the tables `entrypoint.sh` created (see §3a).
+  Measured on CT106 2026-10-04 and re-verified on the dev data dir the same
+  day: `ALTER TABLE pos.loyalty_members ADD COLUMN ...` raises
+  `InsufficientPrivilege` **even with `IF NOT EXISTS` and even when the column
+  is already present**, because Postgres checks table ownership before it
+  discovers there is nothing to do. `CREATE TABLE` and `CREATE INDEX IF NOT
+  EXISTS`, by contrast, *do* work: entrypoint.sh grants `verisim=UC/postgres`
+  on each schema, and `CREATE INDEX` needs ownership of the table, not the
+  schema. So the split is: CREATE lands, ALTER does not.
+
+  `t_b17da778` fixed the two halves that were in Verisim's control:
+  `elasticity.seed_elasticity_columns` no longer raises on a refused ALTER
+  (it was crashing `seed_all()` before the main loop — a green container and
+  45+ minutes of zero writes), `customers.ensure_tables` commits its CREATE
+  before attempting its ALTER and verifies the CREATE landed instead of
+  assuming it, and `bootstrap_database` now runs an idempotent reconcile pass
+  over an existing volume (`schema_reconcile.py`) that adds each missing
+  relation, column and index individually, each in its own transaction.
+
+  **What that cannot do:** on a data dir where the ALTER is refused, the
+  *missing columns* still do not land — the pass converges everything the
+  generator's privileges allow and reports the rest. The remaining remedy is
+  still the one named below: apply `schema.sql` as `$POSTGRES_USER` in
+  `entrypoint.sh`, or `ALTER TABLE … OWNER TO $POSTGRES_USER` for every table
+  after applying it. `t_28b047b8` tracks the `inv.*` readiness side.
 - **Data-lab re-ingest (acceptance criterion 3):** after the `load_id` API
   change, data-lab should re-ingest and confirm 0 cross-schema orphans. Tracked
   under data-lab #26–#31; no Verisim generator change is pending for this.

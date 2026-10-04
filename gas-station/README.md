@@ -37,13 +37,31 @@ own postgres + API + UI, exactly like the grocery industry.
 ./switch.sh status                 # show running modes (both industries)
 ```
 
-Release mode (Docker Hub image) becomes available once
-`smiti/verisim-gas-station` is published:
+Release mode (`switch.sh release gas-station`) still needs a deploy stack under
+`/opt/data-lab/verisim-gas-station/compose.yaml`; until one exists the script says so
+rather than pretending. The image itself *is* published — CI pushes
+`smiti/verisim-gas-station` on every main push and on `v*` tags, on the same terms as
+grocery (build + smoke + contract tests first, and a missing Docker credential fails
+the run instead of skipping it).
 
 ```bash
-bash build-and-push.sh gas-station          # builds + smoke-tests the image
+bash build-and-push.sh gas-station          # local build + smoke test, then push
 bash build-and-push.sh gas-station 1.0.0    # versioned tag
 ```
+
+## Tests
+
+```bash
+python -m pytest gas-station/generator/tests/    # unit tests + build/config checkers
+python -m pytest gas-station/api/tests/          # contract tests; needs a live container
+```
+
+The API suite skips when no API is up, so it is safe to run locally; CI starts a
+container first, so there a skip would be a hole rather than a convenience. The
+generator suite also runs the `tools/check_*.py` build checkers, which is what keeps
+the strip scripts, the schema grants and the config from drifting silently — see the
+"Gas Station Status" section of the top-level `AGENTS.md` for what each one catches
+and why.
 
 ## Generator Behavior
 

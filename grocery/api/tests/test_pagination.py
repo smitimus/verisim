@@ -99,6 +99,9 @@ PAGINATED_ROUTES = [
     ("/grocery/online/order-events", "event_id", 1000),
     ("/grocery/hr/schedules", "schedule_id", 1000),
     ("/grocery/online/order-items", "item_id", 1000),
+    # The tick ledger: 37k+ rows and two clocks, so it is the one route where paging
+    # correctness and a window both matter (t_ac80c514).
+    ("/grocery/stats/generation", "stat_id", 1000),
 ]
 
 
@@ -175,6 +178,11 @@ WINDOWED_ROUTES = [
     # row last changed, which created_at cannot express (the status is mutated in
     # place). Together they let a reader bound the window *and* the state it sees.
     ("/grocery/online/orders", "updated_at", "updated_after", "updated_before"),
+    # The tick ledger carries BOTH clocks on one route (t_ac80c514): `simulation_dt` is
+    # business time (the hour the tick simulated) and is backdated by a backfill, while
+    # `recorded_at` is the insert clock and is the only one a delta load can watermark on.
+    ("/grocery/stats/generation", "simulation_dt", "start_dt", "end_dt"),
+    ("/grocery/stats/generation", "recorded_at", "created_after", "created_before"),
 ]
 
 FAR_PAST = "2000-01-01T00:00:00+00:00"

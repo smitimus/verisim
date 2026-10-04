@@ -6,7 +6,18 @@ PG_BIN=/usr/lib/postgresql/18/bin
 PG_CTL="$PG_BIN/pg_ctl"
 PSQL="$PG_BIN/psql"
 INITDB="$PG_BIN/initdb"
-SCHEMAS="hr,pos,timeclock,ordering,fulfillment,transport,inv,control,pricing,online"
+# Every schema the generator writes to. DERIVED FROM schema.sql, not hand-listed.
+#
+# It used to be a literal comma list, and adding a schema to schema.sql without adding
+# it here meant the entrypoint applied schema.sql as `postgres` and never granted the
+# app role on the new schema — so the generator, which connects as that role, died on
+# its first write with `permission denied for schema weather` and crash-looped until
+# supervisord gave up. CI caught it as a container that never left `stopped` (the
+# `weather` covariate, t_2ab1fb0a). Reading the DDL is the whole fix: the list is the
+# schemas that exist by construction, so a new one cannot be forgotten.
+SCHEMAS=$(grep -oE 'CREATE SCHEMA IF NOT EXISTS [a-z_]+' /app/generator/schema.sql \
+          | awk '{print $NF}' | sort -u | paste -sd, -)
+echo "[entrypoint] Schemas to grant: $SCHEMAS"
 
 POSTGRES_USER=${POSTGRES_USER:-verisim}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-verisim}

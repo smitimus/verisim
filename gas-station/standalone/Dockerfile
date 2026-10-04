@@ -66,6 +66,11 @@ COPY base/ui/app.py /app/ui/app.py
 COPY gas-station/generator/ /app/generator/
 
 # ── Default config (overridable by volume mount at /config/config.yaml) ──────
+# The product's config.yaml, copied verbatim. There used to be a second copy at
+# <industry>/standalone/config.yaml, and it drifted: grocery's fell 117 lines
+# behind while the published image kept shipping it (t_a6ecb731). Nothing read
+# the copy during development, so the drift was invisible until it wasn't. One
+# config per industry now, and tools/check_configs.py fails if a second appears.
 COPY gas-station/config.yaml /app/config.yaml
 
 # ── supervisord + entrypoint ──────────────────────────────────────────────────

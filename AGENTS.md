@@ -6,12 +6,14 @@ Multi-industry mock data generation platform. Primary product: `smiti/verisim-gr
 
 | Directory | Purpose |
 |-----------|---------|
-| `/opt/verisim/base/` | Shared platform: postgres + FastAPI + Streamlit UI |
-| `/opt/verisim/grocery/` | Grocery generator — **active, primary product** |
-| `/opt/verisim/gas-station/` | Gas station generator — **paused, source preserved** |
+| `/opt/verisim/base/` | Shared platform source: the API every image is built from, plus the legacy shared stack |
+| `/opt/verisim/grocery/` | Grocery generator — **primary product** |
+| `/opt/verisim/gas-station/` | Gas station generator — self-contained, **active** (t_a6ecb731) |
+| `/opt/verisim/support/` | Customer-support generator — self-contained |
 | `*/standalone/` | All-in-one Docker build (postgres + api + ui + generator via supervisord) |
 | `*/generator/` | Data generation logic + models |
-| `*/api/` | FastAPI endpoints (grocery has its own stripped-down API) |
+| `*/api/` | Per-industry Dockerfile that builds the stripped-down API |
+| `/opt/verisim/tools/` | Build/consistency checkers, run as part of the test suites |
 
 ## switch.sh — Dev Mode Management
 
@@ -75,6 +77,22 @@ If the old data must be preserved (it's mock data — usually not), pull a PG16-
 Base API (`base/api/main.py`) contains routes for all industries. At build time:
 - `grocery/standalone/strip_gas_station.py` removes gas-station routes for the grocery image
 - `gas-station/standalone/strip_grocery.py` removes grocery routes for the gas-station image
+- `support/standalone/strip_support.py` removes the other two for the support image
+
+**This coupling is fragile by construction, and worth knowing before you touch a
+banner comment.** Each script deletes a route *section* by matching the comment header
+above it, so renaming or reordering that header silently changes which routes the
+image serves — while the script still exits 0, the image still builds, and `/docs`
+still loads. Nothing about the failure is loud.
+
+`tools/check_strip_scripts.py` is the guard (run by
+`gas-station/generator/tests/test_build_checks.py`): it runs each script for real,
+asserts the output imports with no dangling references, and asserts the kept routes
+are exactly that industry's plus the shared `/{industry}` and platform ones. If you
+change a banner, that test is the thing that will tell you.
+
+The structural fix is a capability table — one place that declares which routes an
+industry serves, replacing three scripts that each re-guess it from prose.
 
 ## Testing Infrastructure
 
@@ -208,6 +226,49 @@ Whole-table routes accept `start_dt`/`end_dt` so consumers can pull bounded, res
 pieces instead of paging everything: `/grocery/pos/price-history` (`changed_at`),
 `/grocery/pos/return-items` (`return_dt`), `/grocery/online/order-items` (`placed_dt`).
 
+**The tick ledger (`control.generation_stats`) took part in t_ac80c514.** It is the
+relation a consumer asks when a sales dip needs explaining — *was the generator down,
+paused, or running under a scenario regime when these rows were written?* — and it had
+two defects, the second of which made the data wrong rather than merely unreachable:
+
+* `GET /{industry}/stats/generation` took `last_n_ticks` capped at 1000 with no offset
+  and no window, so the newest-1000 slice was all it could serve against a relation
+  holding tens of thousands of rows (`last_n_ticks=2000` → 422). It now takes
+  `limit`/`offset` over a PK-terminated `ORDER BY recorded_at DESC, stat_id DESC` and
+  both windows, and returns `{data, total, limit, offset}`. `last_n_ticks` still works —
+  the UI dashboard and data-lab's readiness sensor both read it — but it means the *page
+  size*, not the ceiling on the relation, and passing it with a different `limit` is a
+  400 rather than a silent preference. Both parameters are `Optional[...] = None` so a
+  bare GET and a `last_n_ticks`-only caller both resolve to the old default of 100.
+* **`run_backfill` never wrote the ledger at all.** Every day produced by a backfill —
+  the 30-day window of a fresh install, and every day a gap-fill repairs — left no
+  telemetry. Measured on dev: the ledger started 2026-09-21 (the first realtime tick)
+  while `pos.transactions` started 2026-08-22, so 94,867 transactions across 30 days had
+  no ledger rows and 2026-09-05..09-09 (the labour-day window) held **zero**. The holiday
+  regime *was* stamped on the transactions, so a consumer joining the ledger to explain a
+  dip found nothing for exactly the days that needed explaining. The backfill now writes
+  one `record_stats` row per simulated hour, inside the hour's own loop, with the counts
+  the hour actually wrote (`len(depletion)`, not the planned `pos_count`) and
+  `scenario.scenario_tag` — the same context object the hour's rows were generated from,
+  so the tag cannot drift from the data.
+
+  Three details that are load-bearing. `record_stats` gained `bump_state_clock`, and the
+  backfill passes `False`: `last_tick_at` is what `/status` and the readiness sensor read
+  as "the generator is alive", and during a backfill the generator is simulating
+  yesterday, so stamping the wall clock there would read as live progress. The ledger
+  delete in `_clear_date_range` now covers `simulation_dt` for the forced-backfill range —
+  otherwise a forced backfill leaves the old ledger rows for a range whose fact tables were
+  just emptied and then appends a second, equally valid set beside them.
+
+**`control.active_scenarios` and `control.scenario_schedules` are manual-only.** Nothing
+seeds them: they get rows only from `POST /{industry}/generator/scenarios` and
+`.../scenario-schedules`, so they are 0 rows on every slot until someone calls them by
+hand. The calendar regimes (labour day, thanksgiving, …) do **not** come from there —
+`scenario_engine._get_holiday_multiplier` is a pure function of the date and touches
+neither table, which is why those tags reach `pos.transactions` while both relations stay
+empty. `idx_scenario_schedules_dates` exists for the read in `get_active_scenario_names`,
+not as evidence of seeding. A consumer must not assume either relation ever has data.
+
 **Two windows, and which one an incremental load needs.** `start_dt`/`end_dt` always
 bound the *business* time — when the event happened. That is the right window for
 analysis and the wrong one for a delta load whenever the business timestamp is
@@ -221,6 +282,7 @@ past:
 | `pos.price_history` | `changed_at` | no — stamped at insert | — | — |
 | `online.orders` / `online.order_items` | `placed_dt` | yes, during backfill | `created_at` | `orders.updated_at` |
 | `online.order_events` | `event_dt` | yes, during backfill | `created_at` | — |
+| `control.generation_stats` | `simulation_dt` | yes, during backfill | `recorded_at` | `generator_state.last_tick_at` (realtime only) |
 
 A consumer that watermarks on a backdated column loses rows: the watermark sits at the
 newest business time already seen, and every row a later batch backdates below it is
@@ -366,11 +428,22 @@ The data-lab dbt project expects these 27 source tables from the generator. If y
 | `grocery/generator/models/pos.py` | ~520 | All POS logic (seeding, transactions, coupons, deals, loyalty) in one file |
 
 ### Tooling Gaps
-- **No pyproject.toml** — no type checker, no linter config
-- **No pytest** — no test runner, no conftest, no test files
-- **No pre-commit hooks** — no automated quality gates
-- **No CI/CD** — no GitHub Actions, no automated builds/tests
-- **Unvalidated config** — `config.py` reads YAML without schema validation (pydantic or similar)
+
+Mostly closed — this list used to describe a repo with no tooling at all, which
+stopped being true some time before it was read. What is actually here:
+
+| Tooling | State |
+|---------|-------|
+| `pyproject.toml` | present: pytest config, coverage floor (`fail_under`), ruff line length |
+| pytest | 350+ generator tests + API contract suites per industry |
+| CI | two workflows (grocery, gas-station), each test + integration gated before publish |
+| config validation | every `config.yaml` is validated against a schema and **rejects unknown keys** (t_6081478a) |
+
+Still open:
+- **No type checker** — ruff is configured but there is no mypy/pyright gate.
+- **No pre-commit hooks** — quality gates live in CI, so a mistake is caught at push rather than at commit.
+- **The strip scripts still match on comment text** (see "Route Stripping at Build Time") — the coupling is
+  commented and tested, not removed; a capability table would remove the class of failure.
 
 ## Known Bugs (Fixed — Do Not Revert)
 
@@ -380,7 +453,49 @@ Both confirmed fixed on fresh backfill data:
 
 ## Gas Station Status
 
-Source preserved in `gas-station/`. Requires verisim-base running (base/ contains shared postgres + api + ui). Not active development — grocery standalone is primary product.
+**Self-contained and active** (revived in t_a6ecb731). `gas-station/` brings its own
+postgres + api + ui, like grocery — it does not require `verisim-base` to be running.
+Grocery remains the primary product; gas-station is the second industry, and its
+standing is the evidence that the multi-industry abstraction holds.
+
+What it ships: a dev stack (`switch.sh dev gas-station`, ports 5500/8011/8502), a
+local standalone image (`switch.sh test gas-station`), an API contract suite, and a
+CI workflow that builds, smoke-tests, contract-tests and publishes
+`smiti/verisim-gas-station` on the same terms as grocery's.
+
+The `verisim-base` stack in `base/compose.yaml` still exists and is still the shared
+API source every image is built from, but no industry depends on it *running*.
+
+### Where its own gaps are
+
+Parity with grocery is about the *stack*, not the feature set. gas-station
+deliberately has no shrinkage, scheduling, or loyalty-ledger models, no seasonal
+holiday calendar in its `scenario_engine`, and fewer tables than grocery — those are
+scope decisions, not defects. The parity it now has is the build and test surface:
+
+| | grocery | gas-station |
+|---|---|---|
+| dev / test / standalone stack | yes | yes |
+| generator unit tests | yes | yes |
+| API contract tests against a live image | yes | yes (t_a6ecb731) |
+| CI builds + smoke-tests the image | yes | yes (t_a6ecb731) |
+| CI publishes to Docker Hub | yes | yes (t_a6ecb731) |
+
+### The silent build-time failures, and what now catches them
+
+Most of what used to break gas-station broke *inside* `docker build`, where a green
+exit and a running image are not evidence of a correct one. The checkers in `tools/`
+each turn one of those into a test failure; they run as part of
+`gas-station/generator/tests/test_build_checks.py`:
+
+| Checker | The failure it exists for |
+|---------|--------------------------|
+| `check_strip_scripts.py` | The strip scripts delete route sections by matching the **banner comment** above them, so a renamed banner silently changes which routes an image serves — while the script still exits 0 and the image still builds. Checks each output imports, and keeps exactly its own routes. |
+| `check_schema_grants.sh` | A schema added to `schema.sql` but not to the entrypoint's granted list means the generator dies on its first write with `permission denied for schema X` (t_ac80c514 killed grocery's image this way). Grocery derives the list from the DDL; the check keeps the other two honest. |
+| `check_configs.py` | Two copies of one config drift, and the copy that drifts is the one nothing reads — grocery's had fallen 117 lines behind while the published image kept shipping it. There is now **one config per industry**, and a second is a hard failure. |
+| `check_api_schema_agreement.py` | A route querying a table no `schema.sql` creates passes the strip check and 500s on a real container. |
+| `check_switch_status.sh` | `switch.sh status` reported `none` for the gas-station dev stack, because it looked for a container name no mode creates. |
+| `check_workflows.py` | Publish must stay gated on test + integration, and the credential guard must stay ungated — a value-gated guard is the t_44f5663e regression (green publish, nothing published). |
 
 ## Streamlit UI Architecture (`base/ui/app.py`)
 

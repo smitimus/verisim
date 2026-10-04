@@ -36,7 +36,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from grocery.generator.config import Config
+from grocery.generator.config import Config, WeatherConfig
 from grocery.generator.models import weather
 from grocery.generator.scenarios import scenario_engine
 from grocery.generator.scenarios.scenario_engine import (
@@ -804,6 +804,33 @@ def test_ddl_matches_schema_sql():
     # the module's copy adds it so the upgrade path is idempotent.
     assert normalise(block).replace('IF NOT EXISTS ', '') == \
         normalise(weather.DDL).replace('IF NOT EXISTS ', '')
+
+
+def test_config_yaml_documents_the_defaults_and_overrides_nothing():
+    """`grocery/config.yaml` now carries a documented `weather:` block. It must
+    DOCUMENT the defaults, not override them: a value there that differs from
+    `WeatherConfig` silently changes the series for anyone who deploys that file
+    while their unit tests (which use `Config()`) keep asserting the other one.
+    That is the "two sources of truth for one knob" defect in a config file.
+    """
+    import yaml
+
+    path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.yaml')
+    with open(path, 'r', encoding='utf-8') as fh:
+        data = yaml.safe_load(fh)
+
+    assert 'weather' in data, 'grocery/config.yaml has no weather section'
+    defaults = WeatherConfig()
+    differing = []
+    for key, value in data['weather'].items():
+        assert hasattr(defaults, key), (
+            f'config.yaml sets weather.{key}, which is not a WeatherConfig '
+            f'field — it would be silently ignored by _apply_yaml')
+        if value != getattr(defaults, key):
+            differing.append((key, value, getattr(defaults, key)))
+    assert not differing, (
+        'config.yaml overrides the documented defaults: '
+        + '; '.join(f'{k}: yaml={y!r} default={d!r}' for k, y, d in differing))
 
 
 def test_every_column_the_generator_writes_is_declared():

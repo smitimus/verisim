@@ -35,6 +35,7 @@ from config import load_config, reload_config
 from models import hr, pos, timeclock, ordering, fulfillment, transport, inventory
 from models import shrinkage, promotions, scheduling, returns, online
 from models import weather, customers, suppliers
+import schema_reconcile as reconcile
 from elasticity import seed_elasticity_columns
 from scenarios.scenario_engine import get_scenario_context, get_active_scenario_names
 
@@ -78,19 +79,83 @@ def bootstrap_database(cfg):
         user=cfg.db_user, password=cfg.db_password,
         dbname=cfg.db_name,
     )
+    fresh = False
     with conn.cursor() as cur:
         cur.execute("""
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema = 'control' AND table_name = 'generator_state'
         """)
         if cur.fetchone()[0] == 0:
+            fresh = True
             log.info("Initializing schema in '%s'...", cfg.db_name)
             with open(SCHEMA_FILE, 'r') as f:
                 sql = f.read()
             cur.execute(sql)
             conn.commit()
             log.info("Schema initialized.")
+
+    if fresh:
+        conn.close()
+        return
+
+    # Step 3: an EXISTING data dir. Applying schema.sql alone would skip it
+    # forever (t_b17da778): a volume only ever receives schema.sql on its first
+    # bootstrap, so every change since is absent. Measured on a CT106 volume
+    # from 2026-09-21: pos.products.{reference_price, price_elasticity},
+    # inv.sku_demand_daily, inv.stockout_events, pos.customers and
+    # pos.loyalty_members.customer_id were all missing from a volume holding
+    # 1.22M transactions. So reconcile it — idempotently, and without a wipe.
+    #
+    # schema.sql cannot simply be re-run: none of its 40 CREATE TABLE / 58
+    # CREATE INDEX statements carry IF NOT EXISTS, so replaying the file aborts
+    # on the first relation that already exists. See schema_reconcile.
+    try:
+        with open(SCHEMA_FILE, 'r') as f:
+            schema_sql = f.read()
+        reconcile.run_reconcile(
+            conn, schema_sql,
+            live_tables=_live_relations(conn),
+            seed_row_present=True,          # the volume reached this branch,
+        )                                   # so control.generator_state is seeded
+    except Exception as exc:                           # noqa: BLE001
+        # Boot must not die over the reconcile. The generator's own seed path
+        # (`seed_all`) carries the per-relation guards, so a volume that still
+        # needs something lands degraded and says so, rather than crashing
+        # before the main loop — which is the failure this card is about.
+        conn.rollback()
+        log.warning("Schema reconcile could not run (%s: %s); continuing. The "
+                    "data dir may predate schema changes, so relations or "
+                    "columns it gained since may be absent. See "
+                    "main.bootstrap_database / schema_reconcile.",
+                    type(exc).__name__, exc)
     conn.close()
+
+
+def _live_relations(conn) -> dict:
+    """Every schema-qualified table in the database and the columns it has.
+
+    One catalog query rather than 40+2 probes, because the reconcile pass needs
+    the whole shape to plan against and a boot is not the place for 40 round
+    trips. Views are excluded: they are not in schema.sql, so a view sharing a
+    name with a table is not something this pass should reason about.
+
+    `array_agg` returns `text[]`, and psycopg2 hands a Postgres array back as a
+    **string** unless told otherwise — `'{a,b,c}'`. Iterating that directly
+    yields single characters, so every column looks absent and the planner
+    proposes re-adding every column of every table (measured: 347 pointless
+    ALTERs against a volume whose 39 tables were otherwise intact). Selecting
+    the plain rows avoids the conversion entirely.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT table_schema || '.' || table_name AS rel, column_name
+            FROM information_schema.columns
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+        """)
+        live: Dict[str, set] = {}
+        for rel, column in cur.fetchall():
+            live.setdefault(rel, set()).add(str(column).lower())
+        return live
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +197,22 @@ def read_state(conn):
         return dict(cur.fetchone())
 
 
-def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms):
+def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms,
+                 bump_state_clock=True):
+    """Write one tick's ledger row.
+
+    `bump_state_clock` moves `control.generator_state.last_tick_at`, which is what the
+    `/status` route and data-lab's readiness sensor read as "the generator is alive". Only
+    a realtime tick means that: during a backfill the generator is simulating *yesterday*
+    over and over, so stamping the wall clock there would make a backfilled hour look
+    like live progress — the sensor would report the generator alive while it was writing
+    history, and `last_tick_at` would stop being comparable with `recorded_at` on the
+    ledger rows themselves. `run_backfill` therefore passes False.
+
+    Counts are the rows actually written, never the planned volume: a stockout-capped
+    tick (t_959cd040) writes strictly fewer rows than it asked for, and the ledger's
+    whole purpose is to say what landed.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO control.generation_stats
@@ -140,11 +220,12 @@ def record_stats(conn, pos_count, timeclock_count, orders_count, scenario_tag, s
                  orders_generated, scenario_tag, simulation_dt, wall_clock_ms)
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (pos_count, timeclock_count, orders_count, scenario_tag, sim_dt, elapsed_ms))
-        cur.execute("""
-            UPDATE control.generator_state
-            SET last_tick_at = NOW(), updated_at = NOW()
-            WHERE state_id = 1
-        """)
+        if bump_state_clock:
+            cur.execute("""
+                UPDATE control.generator_state
+                SET last_tick_at = NOW(), updated_at = NOW()
+                WHERE state_id = 1
+            """)
     conn.commit()
 
 
@@ -922,7 +1003,26 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             # Partial day: generate timeclock events per-hour using the same
             # idempotent realtime logic (checks existing events before inserting).
             if is_partial:
-                timeclock.generate_events(conn, sim_dt, employees, locations)
+                tc_count = timeclock.generate_events(conn, sim_dt, employees, locations)
+            else:
+                # A full day writes its whole shift schedule in one pass after the
+                # hourly loop, so the per-hour timeclock count is only meaningful on a
+                # partial day. Report 0 rather than a planned number it never wrote.
+                tc_count = 0
+
+            # The tick ledger (t_ac80c514). The backfill writes one row per simulated
+            # hour, exactly as the realtime tick loop does, so a consumer asking "was the
+            # generator up, and under what regime, when these sales were written?" has
+            # an answer for every day the backfill produced — including the 30-day
+            # window of a fresh install, which used to exist in the fact tables with no
+            # telemetry at all. The holiday/rush-hour tag is `scenario.scenario_tag`,
+            # the same context this hour's transactions were generated under, so the tag
+            # cannot drift from the rows it describes.
+            #
+            # Counts are what landed (`len(depletion)`), not `pos_count`: a
+            # stockout-capped hour (t_959cd040) writes fewer rows than it planned for.
+            record_stats(conn, len(depletion), tc_count, len(online_depletion),
+                         scenario.scenario_tag, sim_dt, 0, bump_state_clock=False)
 
         if not is_partial:
             # Full day: run all end-of-day events in one pass.

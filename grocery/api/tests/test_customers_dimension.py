@@ -23,6 +23,8 @@ The filters are asserted against the served rows rather than a database, so the
 suite holds wherever it is pointed (the same approach as
 `test_promo_resolvability.py`).
 """
+import pathlib
+
 import httpx
 import pytest
 
@@ -204,20 +206,63 @@ def test_customers_summary_matches_the_detail_route(api_base_url):
 
 @pytest.mark.usefixtures("ensure_api_reachable")
 def test_absent_dimension_degrades_instead_of_500ing(api_base_url):
-    """An old data dir must get an empty result with a flag, never a 500.
+    """A data dir with no dimension must get an empty result with a flag, never a 500.
 
     A rolling deploy leaves at least one slot on an older image. If these routes
     raised, that slot's API would fail every request for the tables it does
     have — turning a missing optional dimension into an outage.
+
+    Only the *absent* case is asserted, and only where the dimension really is absent.
+    A freshly bootstrapped directory has the dimension and thousands of households, and
+    asserting `data == []` there only proved the test could not run on a real install —
+    every other test in this file guards its claim with the same
+    `customers_dimension_present` check. The route's degradation path is therefore
+    asserted from the source contract instead: both routes must carry the flag, so a
+    consumer can always tell "no customers" from "this build has no customers concept".
     """
     payload = _get(api_base_url, CUSTOMERS)
     assert "customers_dimension_present" in payload, (
         "the response must say whether the dimension exists, so a consumer can "
         "tell 'no customers' from 'this build has no customers concept'"
     )
+    summary = _get(api_base_url, SUMMARY)
+    assert "customers_dimension_present" in summary, (
+        "the summary must carry the same flag as the detail route"
+    )
+
+    if payload["customers_dimension_present"]:
+        # The dimension is here, so the honest contract is: rows, not an empty page.
+        assert payload["total"] > 0, (
+            "customers_dimension_present is true but the route served no households"
+        )
+        assert summary["customers_dimension_present"] is True
+        return
+
+    # Absent: empty, zero total, and the flag false on both routes.
     assert payload["data"] == []
     assert payload["total"] == 0
-
-    summary = _get(api_base_url, SUMMARY)
     assert summary["data"] == []
     assert summary["customers_dimension_present"] is False
+
+
+def test_both_customer_routes_degrade_without_raising():
+    """The degradation path must exist in the route source, not just on one data dir.
+
+    CI bootstraps a fresh directory, so the dimension is always present there and the
+    absent branch above can never execute there — an assertion that only runs on one
+    kind of install is an assertion nobody is really checking. Pin the branch in the
+    source instead: both routes must test the table's presence and return the flag.
+    """
+    source = pathlib.Path(__file__).resolve().parents[3] / "base" / "api" / "main.py"
+    body = source.read_text()
+    for route in ('@app.get("/grocery/pos/customers"',
+                  '@app.get("/grocery/pos/customers/summary"'):
+        start = body.index(route)
+        chunk = body[start:start + 4000]
+        assert "_has_customers_table(" in chunk, (
+            f"{route} no longer checks whether the dimension exists, so a data dir "
+            "that predates it would raise instead of degrading"
+        )
+        assert '"customers_dimension_present": False' in chunk, (
+            f"{route} no longer reports the dimension as absent"
+        )

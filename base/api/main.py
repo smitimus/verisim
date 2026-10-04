@@ -634,6 +634,18 @@ def _clear_date_range(industry: str, start: date, end: date) -> None:
                 "WHERE scheduled_date BETWEEN %s AND %s",
                 (start, end))
 
+            # Tick ledger for the window (t_ac80c514). Keyed on `simulation_dt`, like
+            # every other delete above, so it covers the rows this backfill is about to
+            # re-generate. Without it a forced backfill leaves the OLD ledger rows for a
+            # range whose fact tables were just emptied — and now that the backfill
+            # writes a row per simulated hour, it would append a second, equally valid
+            # set beside them: two ledger rows per hour, differing counts, with nothing
+            # to tell a consumer which is the one that describes the data on disk.
+            cur.execute(
+                "DELETE FROM control.generation_stats "
+                "WHERE simulation_dt BETWEEN %s AND %s",
+                (start_ts, end_ts))
+
         conn.commit()
         log.info("Cleared data for %s → %s in industry '%s'", start, end, industry)
     except Exception:
@@ -1080,11 +1092,34 @@ def pos_price_history(
     total = query(f"""
         SELECT COUNT(*) AS n FROM pos.price_history ph WHERE {where}
     """, params, industry)[0]["n"]
+    # `ph.product_id` is the real key of the row and belongs in the payload next to
+    # the label (t_ea399398). The DB has always joined on it — `product_id` is
+    # `NOT NULL REFERENCES pos.products(product_id)` — and then threw it away in
+    # favour of `p.name`, handing the consumer an unenforced natural key instead.
+    # `pos.products.name` carries no uniqueness constraint (only `sku`/`upc` do),
+    # so a consumer that joins the name back to an id re-points a product's whole
+    # price history at whichever product holds that name after a rename, and
+    # merges two products' histories outright if two names ever collide.
+    #
+    # `product_name` stays for one transition cycle: dropping it is a breaking
+    # change for any consumer outside this repo, and nothing here can see them.
+    # data-lab's `stg_pos_price_history` is the one known reader still on the name.
+    #
+    # `LEFT JOIN` is what makes `total` trustworthy rather than merely fast. The
+    # COUNT(*) above counts `pos.price_history` on its own and never joins, so an
+    # inner join here is the only thing that can make the advertised total and the
+    # pages disagree — and it would do so silently, the same way a tie cluster
+    # straddling a page boundary once did (t_d7892e10). The FK currently makes an
+    # orphan unreachable, so this is insurance rather than a live fix; it costs one
+    # word and it keeps `product_name`/`category` as nullable labels rather than
+    # load-bearing ones. `p.category` is a real column on `pos.products`, not a
+    # substituted key, so it stays as a convenience label for the same window.
     rows = query(f"""
-        SELECT ph.price_history_id, p.name AS product_name, p.category,
+        SELECT ph.price_history_id, ph.product_id,
+               p.name AS product_name, p.category,
                ph.old_price, ph.new_price, ph.changed_at
         FROM pos.price_history ph
-        JOIN pos.products p ON p.product_id = ph.product_id
+        LEFT JOIN pos.products p ON p.product_id = ph.product_id
         WHERE {where}
         ORDER BY ph.changed_at DESC, ph.price_history_id DESC LIMIT %s OFFSET %s
     """, params + [limit, offset], industry)
@@ -1215,6 +1250,32 @@ def pos_departments():
 
 @app.get("/grocery/pos/coupons", tags=["Grocery — POS"])
 def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
+    """Coupons. `active_only=false` serves retired-but-referenced coupons too.
+
+    `pos.transaction_items.coupon_id` carries a real FK to this table, so every
+    coupon a line item references is guaranteed to exist here — but
+    `seed_coupons` sets `is_active = FALSE` once `valid_until` passes
+    (models/pos.py) and never deletes the row, precisely because the redemptions
+    it earned are still on disk. An EDW that mirrors only the active set
+    therefore holds items whose `coupon_id` it cannot resolve. Measured on the
+    dev slot 2026-10-04: 8 coupons, 8 active, 308,543 coupon-tagged items, 0
+    orphans — nothing is broken yet only because every window still runs to
+    2027-09-21, so this is the same latent shape combo-deals had before
+    t_27c2dcf7, on the route that mirrors deals.
+
+    A consumer resolving an FK wants the full relation, not the active slice, so
+    it can pass `active_only=false`. `is_active` is in the projection so that
+    consumer can still tell retired from current — without it a full load is
+    indistinguishable from an active one.
+
+    No `offset`, unlike most list routes: `limit` alone caps this response at
+    1000 rows. That is above the relation's size (8 named coupons plus whatever
+    `seed_coupons` tops the active set up to, which retires the expired ones
+    rather than accumulating), so the whole relation fits in one request. It is
+    a ceiling rather than a page — a consumer that ever needed row 1001 would
+    get the first 1000 on every request instead of a `total` to reconcile
+    against. Pinned by grocery/api/tests/test_coupon_resolvability.py.
+    """
     filters, params = ["TRUE"], []
     if active_only:
         filters.append("c.is_active = TRUE AND c.valid_until >= CURRENT_DATE")
@@ -1332,7 +1393,7 @@ def pos_customers(
 
 
 @app.get("/grocery/pos/customers/summary", tags=["Grocery — Customers"])
-def pos_customers_summary(industry: str):
+def pos_customers_summary():
     """The dimension's shape: household count and mix by segment and age band.
 
     The page a data engineer opens first when sizing an RFM or cohort build —
@@ -1341,6 +1402,11 @@ def pos_customers_summary(industry: str):
     age band together because those two are drawn *conditionally* on the
     segment (models/customers.py), so the pair is what the generator actually
     produced; a segment-only marginal would hide that.
+
+    No `industry` parameter: this route is grocery-specific (the literal in the path),
+    and the body already used `"grocery"` explicitly. Declaring it anyway made FastAPI
+    require it as a *query* parameter, so every consumer that called the documented URL
+    got a 422 for a value the route ignored (t_2ffb43a0).
     """
     if not _has_customers_table("grocery"):
         return {"data": [], "total": 0, "customers_dimension_present": False}
@@ -2284,32 +2350,101 @@ def inventory_receipt_items(
 # Shared: Stats
 # ---------------------------------------------------------------------------
 
+# The ledger route's page size when the caller asks for none. The old route's
+# `last_n_ticks` default was 100, and a bare GET must keep returning the same 100 rows
+# rather than silently switching to a different default (t_ac80c514).
+DEFAULT_PAGE_SIZE = 100
+
+
 @app.get("/{industry}/stats/generation", tags=["Stats"])
-def stats_generation(industry: str, last_n_ticks: int = Query(100, le=1000)):
+def stats_generation(
+    industry: str,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
+    limit: Optional[int] = Query(None, le=5000),
+    offset: int = 0,
+    last_n_ticks: Optional[int] = Query(None, le=5000),
+):
+    """The per-tick generation ledger — paged, and windowed on both clocks (t_ac80c514).
+
+    This is the relation a consumer asks when a sales dip needs explaining: *was the
+    generator down, paused, or running under a scenario regime when these rows were
+    written?* It used to answer `last_n_ticks` capped at 1000 with no offset and no
+    window, so the newest-1000 slice was all the route could ever serve against a
+    relation that holds tens of thousands of rows (`last_n_ticks=2000` → 422). A bounded
+    mirror was the only design left to a consumer.
+
+    **Two windows, because the two clocks answer different questions.**
+
+    ``start_dt``/``end_dt`` bound ``simulation_dt`` — *business* time, the hour the tick
+    simulated. A backfill backdates it (a whole day written at one instant), so this is
+    the right window for analysis and the wrong one for a delta load.
+
+    ``created_after``/``created_before`` bound ``recorded_at`` — the *insert* clock,
+    ``DEFAULT NOW()``, written by the same statement as the row and monotone. That makes
+    ``created_after=<MAX(recorded_at) of the last load>`` a complete delta, exactly as on
+    the transactions and returns routes (t_6d2ebc52, t_5d2e2ab0).
+
+    Both windows are optional and independent, and either side of a window may be given
+    on its own.
+
+    **Pagination ends on the primary key.** ``recorded_at`` alone is not a total order —
+    realtime ticks and backfilled rows can share a stamp — and a tie cluster straddling a
+    page boundary is returned twice or never while ``total`` still matches (t_d7892e10).
+
+    ``last_n_ticks`` is kept for existing readers (the UI dashboard and data-lab's
+    readiness sensor both pass it) and now means the page size rather than the ceiling on
+    the relation, so ``limit``/``offset`` can walk past it. Passing it *and* a different
+    ``limit`` is a 400 rather than a silent preference.
+    """
     pool_for(industry)
+    # Both page sizes are optional so that "was limit actually given?" is answerable.
+    # With `limit` defaulted to a number, a caller passing only `last_n_ticks` (the UI
+    # dashboard and data-lab's readiness sensor both do) would trip the conflict check
+    # against a default it never asked for. Resolve to the old default when neither is
+    # given, so a bare GET still returns the newest 100 rows it always did.
+    if last_n_ticks is not None and limit is not None and last_n_ticks != limit:
+        raise HTTPException(
+            400,
+            f"last_n_ticks={last_n_ticks} conflicts with limit={limit}; pass one or the other",
+        )
+    page_size = next(n for n in (limit, last_n_ticks, DEFAULT_PAGE_SIZE) if n is not None)
+
     if industry == "support":
-        return query("""
-            SELECT stat_id, recorded_at, tickets_generated,
-                   calls_generated, chat_sessions_generated, surveys_generated,
-                   scenario_tag, simulation_dt, wall_clock_ms
-            FROM control.generation_stats
-            ORDER BY recorded_at DESC LIMIT %s
-        """, [last_n_ticks], industry)
-    if industry == "grocery":
-        return query("""
-            SELECT stat_id, recorded_at, pos_transactions_generated,
-                   timeclock_events_generated, orders_generated,
-                   scenario_tag, simulation_dt, wall_clock_ms
-            FROM control.generation_stats
-            ORDER BY recorded_at DESC LIMIT %s
-        """, [last_n_ticks], industry)
-    return query("""
-        SELECT stat_id, recorded_at, pos_transactions_generated,
-               fuel_transactions_generated, inventory_receipts_generated,
-               scenario_tag, simulation_dt, wall_clock_ms
-        FROM control.generation_stats
-        ORDER BY recorded_at DESC LIMIT %s
-    """, [last_n_ticks], industry)
+        select = ("stat_id, recorded_at, tickets_generated, calls_generated, "
+                  "chat_sessions_generated, surveys_generated, scenario_tag, "
+                  "simulation_dt, wall_clock_ms")
+    elif industry == "grocery":
+        select = ("stat_id, recorded_at, pos_transactions_generated, "
+                  "timeclock_events_generated, orders_generated, scenario_tag, "
+                  "simulation_dt, wall_clock_ms")
+    else:
+        select = ("stat_id, recorded_at, pos_transactions_generated, "
+                  "fuel_transactions_generated, inventory_receipts_generated, "
+                  "scenario_tag, simulation_dt, wall_clock_ms")
+
+    filters, params = ["TRUE"], []
+    if start_dt:
+        filters.append("simulation_dt >= %s"); params.append(start_dt)
+    if end_dt:
+        filters.append("simulation_dt <= %s"); params.append(end_dt)
+    if created_after:
+        filters.append("recorded_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("recorded_at <= %s"); params.append(created_before)
+    where = " AND ".join(filters)
+
+    total = query(f"SELECT COUNT(*) AS n FROM control.generation_stats WHERE {where}",
+                  params, industry)[0]["n"]
+
+    rows = query(f"""
+        SELECT {select}
+        FROM control.generation_stats WHERE {where}
+        ORDER BY recorded_at DESC, stat_id DESC LIMIT %s OFFSET %s
+    """, params + [page_size, offset], industry)
+    return {"data": rows, "total": total, "limit": page_size, "offset": offset}
 
 
 @app.get("/{industry}/stats/today", tags=["Stats"])

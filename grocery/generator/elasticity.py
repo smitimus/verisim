@@ -50,6 +50,8 @@ import math
 import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import psycopg2
+
 from config import Config
 
 log = logging.getLogger(__name__)
@@ -289,58 +291,167 @@ def seed_elasticity_columns(conn, cfg: Config) -> Dict[str, int]:
     neutral starting point) and `price_elasticity` = the configured default
     with the configured jitter, drawn deterministically per product so a
     restart does not re-roll the catalogue's whole personality.
+
+    NEVER CRASH THE GENERATOR OVER A MIGRATION (t_b17da778)
+    -----------------------------------------------------
+    This function is called from `seed_all`, i.e. *before* the main loop, so an
+    exception here does not cost one tick — it costs every tick, forever. On a
+    data dir whose `schema.sql` was applied by the `postgres` role (which is
+    what the standalone image's `entrypoint.sh` does, via
+    `su -s /bin/bash postgres -c "$PSQL -f /app/generator/schema.sql"`) the
+    generator connects as $POSTGRES_USER with GRANT ALL but no ownership, and
+    the ALTER raises `InsufficientPrivilege: must be owner of table products`.
+    Measured on CT106 2026-10-04: the generator wrote nothing for 45+ minutes
+    while `pg_isready` kept the container green, so every container-level check
+    read healthy and the shortfall surfaced only when a human counted rows.
+
+    So an unavailable ALTER degrades to a no-op with a warning naming role,
+    owner and remedy — the same contract `models/customers.py::ensure_tables`
+    and `models/weather.py::ensure_table` already implement for the same trap.
+    Losing the main loop to protect two columns that are merely missing is a
+    bad trade.
+
+    The probe before each ALTER is load-bearing, not tidiness: on a non-owner
+    role `ADD COLUMN IF NOT EXISTS` STILL raises, because Postgres checks table
+    ownership before it discovers there is nothing to do. So an up-to-date data
+    dir must never reach the ALTER at all, or every healthy boot logs a scary
+    warning and the one real failure is buried in it.
     """
     touched = {'added': 0, 'backfilled': 0}
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COUNT(*) FROM information_schema.columns
-            WHERE table_schema = 'pos' AND table_name = 'products'
-              AND column_name = 'reference_price'
-        """)
-        if not cur.fetchone()[0]:
-            cur.execute("ALTER TABLE pos.products ADD COLUMN reference_price NUMERIC(8,2)")
-            touched['added'] += 1
-        cur.execute("""
-            SELECT COUNT(*) FROM information_schema.columns
-            WHERE table_schema = 'pos' AND table_name = 'products'
-              AND column_name = 'price_elasticity'
-        """)
-        if not cur.fetchone()[0]:
-            cur.execute("ALTER TABLE pos.products ADD COLUMN price_elasticity NUMERIC(4,3)")
-            touched['added'] += 1
+    # Each column is attempted independently: a volume can be half-drifted,
+    # and one refusal must not cost the other.
+    if _ensure_column(conn, 'pos.products', 'reference_price',
+                      'NUMERIC(8,2)'):
+        touched['added'] += 1
+    if _ensure_column(conn, 'pos.products', 'price_elasticity',
+                      'NUMERIC(4,3)'):
+        touched['added'] += 1
 
-        # Existing rows: adopt the live price as the reference (so nothing
-        # invents a price history it did not have) and give every SKU its own
-        # elasticity from the configured default + jitter.
-        jitter = max(0.0, cfg.pricing.elasticity_jitter)
-        cur.execute("""
-            UPDATE pos.products
-               SET reference_price = current_price
-             WHERE reference_price IS NULL
-        """)
-        touched['backfilled'] = cur.rowcount
-        if jitter:
-            cur.execute("SELECT product_id::text, sku FROM pos.products "
-                        "WHERE price_elasticity IS NULL")
-            rows = cur.fetchall()
-            for product_id, sku in rows:
-                # Seeded from (sku, default) so the same catalogue gets the
-                # same elasticities on every boot.
-                rng = random.Random('verisim-elasticity-%s' % (sku or product_id))
-                value = cfg.pricing.default_price_elasticity * (1.0 + rng.uniform(-jitter, jitter))
-                cur.execute(
-                    "UPDATE pos.products SET price_elasticity = %s WHERE product_id = %s::uuid",
-                    (round(value, 3), product_id),
-                )
-        else:
+    # The backfill is plain UPDATE and needs no ownership beyond what the
+    # generator already has, so it runs regardless of how the ALTERs went. It
+    # is what fills the columns the moment an operator adds them out of band.
+    try:
+        with conn.cursor() as cur:
+            # Existing rows: adopt the live price as the reference (so nothing
+            # invents a price history it did not have) and give every SKU its
+            # own elasticity from the configured default + jitter.
+            jitter = max(0.0, cfg.pricing.elasticity_jitter)
             cur.execute("""
                 UPDATE pos.products
-                   SET price_elasticity = %s
-                 WHERE price_elasticity IS NULL
-            """, (cfg.pricing.default_price_elasticity,))
-            touched['backfilled'] += cur.rowcount
-    conn.commit()
+                   SET reference_price = current_price
+                 WHERE reference_price IS NULL
+            """)
+            touched['backfilled'] = cur.rowcount
+            if jitter:
+                cur.execute("SELECT product_id::text, sku FROM pos.products "
+                            "WHERE price_elasticity IS NULL")
+                rows = cur.fetchall()
+                for product_id, sku in rows:
+                    # Seeded from (sku, default) so the same catalogue gets the
+                    # same elasticities on every boot.
+                    rng = random.Random('verisim-elasticity-%s' % (sku or product_id))
+                    value = cfg.pricing.default_price_elasticity * (
+                        1.0 + rng.uniform(-jitter, jitter))
+                    cur.execute(
+                        "UPDATE pos.products SET price_elasticity = %s "
+                        "WHERE product_id = %s::uuid",
+                        (round(value, 3), product_id),
+                    )
+            else:
+                cur.execute("""
+                    UPDATE pos.products
+                       SET price_elasticity = %s
+                     WHERE price_elasticity IS NULL
+                """, (cfg.pricing.default_price_elasticity,))
+                touched['backfilled'] += cur.rowcount
+        conn.commit()
+    except psycopg2.Error as exc:
+        # Same trade as the ALTER: a backfill that cannot run must not stop the
+        # generator. `demand_weight` falls back to the configured default when
+        # `reference_price`/`price_elasticity` are absent, so the demand law
+        # still runs — uniformly, which is the state this volume was in before.
+        conn.rollback()
+        log.warning(
+            "Elasticity backfill skipped: %s. The demand curve falls back to "
+            "pricing.default_price_elasticity for the whole catalogue, so it "
+            "is uniform rather than per-SKU — the mart_product_price_elasticity "
+            "regression will find no signal. See "
+            "elasticity.seed_elasticity_columns.",
+            exc.__class__.__name__,
+        )
+        return touched
+
     if touched['added'] or touched['backfilled']:
         log.info("Elasticity columns: %d added, %d backfilled",
                  touched['added'], touched['backfilled'])
     return touched
+
+
+def _ensure_column(conn, table: str, column: str, coltype: str) -> bool:
+    """Add `table.column` when genuinely absent. True when added.
+
+    Failure-tolerant by design: returns False rather than raising when the
+    role cannot ALTER the table, because the caller is on the boot path.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+              AND column_name = %s
+        """, (table.split('.')[0], table.split('.')[1], column))
+        if cur.fetchone()[0]:
+            return False        # already there — do NOT attempt the ALTER
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        conn.commit()
+        return True
+    except psycopg2.Error as exc:
+        # Roll back so the connection is not left in an aborted transaction —
+        # every later statement would fail with InFailedSqlTransaction.
+        conn.rollback()
+        role, owner = _current_role(conn), _table_owner(conn, table)
+        log.warning(
+            "Cannot add %s.%s: the generator's role (%s) does not own the "
+            "table (owner is %s) — on the standalone image schema.sql is "
+            "applied by the postgres role while the generator connects as %s, "
+            "so this additive migration cannot land. The demand curve will run "
+            "with pricing.default_price_elasticity for the whole catalogue and "
+            "the price/elasticity columns stay absent, so "
+            "mart_product_price_elasticity will find no signal. Run the ALTER "
+            "as the table owner, or re-bootstrap the data dir from a current "
+            "image. See elasticity.seed_elasticity_columns. (%s)",
+            table, column, role, owner, role, exc.__class__.__name__,
+        )
+        return False
+
+
+def _current_role(conn) -> str:
+    """The role the generator is connected as, for the log message."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_user")
+            return str(cur.fetchone()[0])
+    except Exception:                                   # noqa: BLE001
+        return "<unknown>"
+
+
+def _table_owner(conn, table: str) -> str:
+    """Who actually owns `table`, for the log message.
+
+    The same two lookups `models/customers.py` already does — the point of
+    naming both roles is that the operator's next move depends on which of
+    them is which.
+    """
+    schema, name = table.split('.', 1)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT pg_get_userbyid(c.relowner)
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relname = %s
+            """, (schema, name))
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] else "<unknown>"
+    except Exception:                                   # noqa: BLE001
+        return "<unknown>"

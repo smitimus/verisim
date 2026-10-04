@@ -411,6 +411,8 @@ class _StubCursor:
         if self._conn.refuse_alter and "ALTER TABLE" in sql:
             raise psycopg2.errors.InsufficientPrivilege(
                 "must be owner of table loyalty_members")
+        if ' '.join(sql.split()).startswith('CREATE TABLE'):
+            self._conn.create_issued = True
         return self
 
     def fetchone(self):
@@ -436,14 +438,25 @@ class _StubConn:
         self.statements = []
         self.commits = 0
         self.rollbacks = 0
-        self._next_is_table_probe = True
+        self.table_probes = 0
+        # t_b17da778: the module now probes the TABLE a second time, after the
+        # CREATE, so its return value is verified rather than assumed. The
+        # second probe reports the table present iff a CREATE was issued and
+        # not refused — which is the real behaviour, and what lets the test
+        # below catch a CREATE that raises (t_cdc30008's false "Created
+        # pos.customers" on a postgres-owned schema).
+        self.create_issued = False
 
     def cursor(self, *a, **k):
-        # The module probes the TABLE first, then the COLUMN. Returning a
-        # different cursor per probe keeps the two facts independent.
-        if self._next_is_table_probe:
-            self._next_is_table_probe = False
+        # The module probes the TABLE first, then the COLUMN, then the TABLE
+        # again to verify. Returning a different cursor per probe keeps the
+        # facts independent.
+        self.table_probes += 1
+        if self.table_probes == 1:
             return _StubCursor(self, count=1 if self.table_present else 0)
+        if self.table_probes == 3:
+            present = self.table_present or self.create_issued
+            return _StubCursor(self, count=1 if present else 0)
         return _StubCursor(self, row=self.column_present)
 
     def commit(self):

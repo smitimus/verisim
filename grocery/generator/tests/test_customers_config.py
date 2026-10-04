@@ -44,20 +44,53 @@ def test_real_config_yaml_reaches_the_dataclass():
     assert isinstance(cfg.customers.segment_shares, dict)
 
 
-def test_standalone_config_yaml_has_the_same_block():
-    """The standalone image ships its own config.yaml; it must agree.
+def test_the_shipped_config_is_the_one_grocery_config_yaml():
+    """The image ships grocery/config.yaml, so there is nothing left to disagree.
 
-    Two files, two code paths, one behaviour — a key added to only one is a
-    setting that works in dev and silently does nothing in the image.
+    This test used to compare `grocery/standalone/config.yaml` against
+    `grocery/config.yaml` and assert the `customers:` block matched — a guard
+    against exactly the failure it could not prevent. The two files drifted 117
+    lines apart while this test kept passing, because a key added to the
+    authoritative config is not a key added to *this* block: `pricing.*`,
+    `inventory.enforce_stock_availability`, `transport.*` and the whole `weather`
+    section all landed on one side only, and the image shipped the other. The
+    guard was green for every one of those changes.
+
+    The drift is gone because there is one config file (t_a6ecb731): the
+    standalone Dockerfile COPYs grocery/config.yaml, so the image and the dev
+    stack read the same bytes and cannot disagree. What is left to assert is that
+    the Dockerfile still points at that one file — the failure mode being a
+    future re-introduction of a second copy.
     """
+    dockerfile = open(
+        os.path.join(REPO_ROOT, "grocery", "standalone", "Dockerfile"),
+        encoding="utf-8").read()
+    assert "COPY grocery/config.yaml /app/config.yaml" in dockerfile, (
+        "the grocery image must ship grocery/config.yaml; if it points at "
+        "standalone/config.yaml again, a second copy can drift from it again"
+    )
+    assert not os.path.exists(
+        os.path.join(REPO_ROOT, "grocery", "standalone", "config.yaml")
+    ), (
+        "grocery/standalone/config.yaml exists again — a second copy of the "
+        "config is exactly what drifted 117 lines while the image kept "
+        "shipping it (t_a6ecb731); tools/check_configs.py fails on this too"
+    )
+
+
+def test_the_customers_block_is_read_by_the_image_config():
+    """The customers keys must be in the file the image actually ships."""
     main = yaml.safe_load(
         open(os.path.join(REPO_ROOT, "grocery", "config.yaml"), encoding="utf-8"))
-    standalone = yaml.safe_load(
-        open(os.path.join(REPO_ROOT, "grocery", "standalone", "config.yaml"),
-             encoding="utf-8"))
-    assert standalone["customers"] == main["customers"], (
-        "grocery/config.yaml and grocery/standalone/config.yaml disagree on the "
-        f"customers block: {main['customers']} vs {standalone['customers']}"
+    assert "customers" in main, (
+        "grocery/config.yaml has no `customers:` block, so the keys the "
+        "generator reads can never be tuned from config"
+    )
+    cfg = Config()
+    _apply_yaml(cfg, main)
+    assert cfg.customers.household_size_max == main["customers"]["household_size_max"], (
+        "the customers keys did not reach the dataclass from the config the "
+        "image ships"
     )
 
 
