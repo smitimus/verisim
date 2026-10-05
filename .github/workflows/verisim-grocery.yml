@@ -171,6 +171,34 @@ jobs:
       # be loud. Pull requests are the only skip, and that skip is the event's, not the
       # secret's — a release can therefore never be skipped silently again.
       #
+      # THE PUBLISH GATE (t_4b05829c, Chris 2026-10-04) runs FIRST, before any credential
+      # check: a held publish must not fail the run over a secret it will never use, or
+      # every ordinary merge goes red. Everything below is conditional on its decision.
+      #
+      # Docker Hub is a release channel, not a commit feed. Measured before this gate:
+      # 8 publishes in one day and 20 of 29 tags on smiti/verisim-grocery were bare
+      # 40-character SHAs, because the trigger was `push: branches: [main]`.
+      #
+      # The gate publishes only when the push carries a version bump, so N commits in one
+      # push still yield at most ONE image. It exits 1 only when it cannot decide (VERSION
+      # absent) — publishing then would name an image by commit SHA, the exact failure
+      # this prevents.
+      - name: Publish gate — is this a release?
+        id: gate
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/publish-gate.sh \
+            "${{ github.event.before }}" "${{ github.sha }}" \
+            "${GITHUB_REF}" "${GITHUB_EVENT_NAME}"
+
+      # Self-test in CI, including the case that must FAIL. A gate nobody has watched
+      # fail is a gate that does not work.
+      - name: Publish gate self-test
+        if: github.event_name != 'pull_request'
+        run: bash .github/scripts/publish-gate-tests.sh
+
       # BOTH credential pairs are required *when a second registry is configured*, and
       # that is deliberate rather than strict: data-lab pins by digest, so a release
       # that reaches Docker Hub but not the internal registry is unusable to every slot.
@@ -181,7 +209,7 @@ jobs:
       # one day. With no REGISTRY_IMAGE configured there is nothing to half-publish, and
       # the gate below requires no registry credentials at all.
       - name: Require publish credentials
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |
           missing=""
           for var in DOCKER_USERNAME DOCKER_PASSWORD; do
@@ -214,18 +242,18 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
       - name: Log in to our registry
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY_NAME }}
@@ -258,7 +286,7 @@ jobs:
       # registry_ref and version_ref, all as GITHUB_OUTPUT keys.
       - name: Compute tags
         id: meta
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |
           REGISTRY_IMAGE="${REGISTRY_IMAGE}" REQUIRE_SECOND_REGISTRY=true \
             bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"
@@ -286,7 +314,7 @@ jobs:
       # index rather than a bare amd64 manifest. Pushing the child would produce a
       # different digest and silently break the pin.
       - name: Push to both registries
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -300,12 +328,19 @@ jobs:
       # precisely the failure this repo already had once, and it is why this step reads
       # both registries back and compares digests instead of trusting the push log.
       - name: Verify the release is in both registries at one digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |
           bash .github/scripts/verify-release-in-both-registries.sh \
             "${{ steps.meta.outputs.hub_ref }}" \
             "${{ steps.meta.outputs.registry_ref }}" \
             "${GITHUB_SHA}"
+
+      - name: Publishing held — not a release
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish != 'true'
+        run: |
+          echo "::notice title=Docker Hub publishing held::${GATE_REASON}. Gitea is the source of truth and this commit landed there automatically; the public GitHub mirror is published separately by the operator, and Docker Hub follows only a versioned release."
+        env:
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
 
       - name: Publishing skipped — pull request
         if: github.event_name == 'pull_request'
