@@ -36,7 +36,7 @@
 #   verify-release-in-both-registries.sh <hub-ref> <gitea-ref> [<label>]
 #
 #   hub-ref    e.g. smiti/verisim-grocery:416ea83c67757676fee328eb0f74b35660bbd6a2
-#   gitea-ref  e.g. gitea.afastbox.com/admin/verisim-grocery:dev-2026-10-04-1011
+#   registry-ref  e.g. <registry-host>/<owner>/verisim-grocery:dev-2026-10-04-1011
 #
 # exit 0  both registries serve the same, anonymously-resolvable index digest
 # exit 1  the release is NOT safely in both registries (message names which check)
@@ -95,7 +95,7 @@ split_ref() {  # ref -> echoes "host repo" where REPO EXCLUDES the tag; Hub is t
 # The TAG is whatever followed that last colon, or "" when the ref names no tag.
 #
 # `${ref##*:}` is wrong, and it is wrong in a way that looks like a registry outage:
-# on `gitea.afastbox.com/admin/verisim-grocery:dev-2026-10-04-1011` it yields the tag
+# on `<registry-host>/<owner>/verisim-grocery:dev-2026-10-04-1011` it yields the tag
 # (fine), but on `host:5000/repo:tag` it yields `5000/repo:tag`, and on a ref with no
 # tag at all it yields the host. Strip the registry first, then the tag.
 ref_tag() {  # ref -> echoes the tag, or "" when the ref names no tag
@@ -219,7 +219,7 @@ g_tag="$(ref_tag "$GITEA_REF")"
 ANON="$(index_digest "$GITEA_REF")"
 case "$ANON" in
   "$GITEA_DIGEST")
-    echo "  OK: gitea.afastbox.com resolves ${GITEA_DIGEST} ANONYMOUSLY (a fresh slot can pull it)"
+    echo "  OK: ${REGISTRY_NAME} resolves ${GITEA_DIGEST} ANONYMOUSLY (a fresh slot can pull it)"
     ;;
   HTTP-401|HTTP-403)
     die "Gitea ${LABEL} does not resolve anonymously" \

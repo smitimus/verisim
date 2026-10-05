@@ -61,8 +61,12 @@ REG_PASS='registry-token-placeholder'
 run_gate() {
   local v
   export IMAGE_NAME='smiti/verisim-grocery'
-  export REGISTRY_NAME='gitea.afastbox.com'
-  export REGISTRY_IMAGE='gitea.afastbox.com/admin/verisim-grocery'
+  # Fixture registry host. This public repo must not name the internal Git host
+  # (Chris, 2026-10-04), so the tests use a documented placeholder and inherit it
+  # from REGISTRY_NAME/REGISTRY_IMAGE when CI supplies them. The dual-registry logic
+  # under test does not care what the host is called — only that it is set.
+  export REGISTRY_NAME="${REGISTRY_NAME:-registry.example.invalid}"
+  export REGISTRY_IMAGE="${REGISTRY_IMAGE:-registry.example.invalid/example/verisim-grocery}"
   export GITHUB_REF_NAME='main'
   for v in DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD; do
     unset "$v"

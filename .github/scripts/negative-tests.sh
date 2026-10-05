@@ -27,7 +27,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 V="$HERE/verify-release-in-both-registries.sh"
 
 HUB_REPO="smiti/verisim-grocery"
-REG_REPO="gitea.afastbox.com/admin/verisim-grocery"
+# Fixture registry path — placeholder host, see credential-gate-tests.sh. In CI this
+# is overridden by the REGISTRY_IMAGE repository variable so the live check still runs
+# against the real internal registry without naming it here.
+REG_REPO="${REGISTRY_IMAGE:-registry.example.invalid/example/verisim-grocery}"
 
 pass=0; fail=0
 note() { printf '\n=== %s ===\n' "$1"; }

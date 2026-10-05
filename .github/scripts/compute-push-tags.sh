@@ -156,7 +156,7 @@ if [ -n "${REGISTRY_IMAGE:-}" ]; then
   echo "registry_version_ref=${registry_version_ref}"
   echo "registry_ref=${registry_ref}"
 elif [ "${REQUIRE_SECOND_REGISTRY:-false}" = "true" ]; then
-  die "REGISTRY_IMAGE is not set, so this push would reach Docker Hub only. This image is pinned by digest in our own registry, so a single-registry release cannot be pulled by a slot. Set REGISTRY_IMAGE (e.g. gitea.afastbox.com/admin/verisim-grocery), or pass REQUIRE_SECOND_REGISTRY=false for an image that is Hub-only."
+  die "REGISTRY_IMAGE is not set, so this push would reach Docker Hub only. This image is pinned by digest in a second registry, so a single-registry release cannot be pulled by a slot. Set the REGISTRY_IMAGE repository variable (an internal host, deliberately not named in this public repo), or pass REQUIRE_SECOND_REGISTRY=false for an image that is Hub-only."
 fi
 
 echo "tags=${tags}"

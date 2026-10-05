@@ -9,12 +9,26 @@ on:
 
 env:
   IMAGE_NAME: smiti/verisim-grocery
-  # The registry our own image pins name, not just the public one. data-lab pins
-  # verisim-grocery BY DIGEST in this registry (verisim-grocery/compose.yaml +
-  # docs/image-pins.lock), so a release that exists only on Docker Hub is invisible
-  # to every slot. See "Two registries, one build" below.
-  REGISTRY_NAME: gitea.afastbox.com
-  REGISTRY_IMAGE: gitea.afastbox.com/admin/verisim-grocery
+  # The second registry is an INTERNAL host and is deliberately NOT named here. This
+  # repository is a public mirror, and Chris's standing rule (2026-10-04) is that the
+  # internal Git host is never named in a public repo. The value comes from a repository
+  # VARIABLE instead, which lives in repo settings rather than in this tree:
+  #
+  #   Settings -> Secrets and variables -> Actions -> Variables
+  #     REGISTRY_NAME   e.g. <internal-host>
+  #     REGISTRY_IMAGE  e.g. <internal-host>/<owner>/verisim-grocery
+  #
+  # Both are OPTIONAL. Empty means single-registry (Docker Hub only) and the publish
+  # job skips the second push with a notice — so the default is the safe one and this
+  # workflow stays public-safe with no configuration at all. Set them only on a private
+  # fork or a self-hosted runner where the internal host may be named.
+  #
+  # Why the indirection rather than a placeholder string: data-lab pins this image BY
+  # DIGEST, so a wrong or empty registry is a broken pull on every slot, not a cosmetic
+  # default. See docs/image-pins.lock. The digest is identical either way; only the host
+  # that serves it differs.
+  REGISTRY_NAME: ${{ vars.REGISTRY_NAME }}
+  REGISTRY_IMAGE: ${{ vars.REGISTRY_IMAGE }}
 
 jobs:
   test:
@@ -157,27 +171,47 @@ jobs:
       # be loud. Pull requests are the only skip, and that skip is the event's, not the
       # secret's — a release can therefore never be skipped silently again.
       #
-      # BOTH credential pairs are required, and that is deliberate rather than strict:
-      # data-lab pins by digest in OUR registry, so a release that reaches Docker Hub but
-      # not gitea.afastbox.com is unusable to every slot — that exact gap blocked
-      # data-dev's t_3f078e61 for hours on 2026-10-04 and needed a hand-mirror to clear
-      # (t_94476148). Half a publish is the failure mode this step exists to prevent, so
-      # the Gitea pair is mandatory rather than best-effort: warn-and-skip is how the gap
-      # opened in the first place, and it happened twice in one day.
+      # BOTH credential pairs are required *when a second registry is configured*, and
+      # that is deliberate rather than strict: data-lab pins by digest, so a release
+      # that reaches Docker Hub but not the internal registry is unusable to every slot.
+      # That exact gap blocked data-dev's t_3f078e61 for hours on 2026-10-04 and needed
+      # a hand-mirror to clear (t_94476148). Half a publish is the failure mode this step
+      # exists to prevent, so the second pair is mandatory rather than best-effort:
+      # warn-and-skip is how the gap opened in the first place, and it happened twice in
+      # one day. With no REGISTRY_IMAGE configured there is nothing to half-publish, and
+      # the gate below requires no registry credentials at all.
       - name: Require publish credentials
         if: github.event_name != 'pull_request'
         run: |
           missing=""
-          for var in DOCKER_USERNAME DOCKER_PASSWORD REGISTRY_USERNAME REGISTRY_PASSWORD; do
+          for var in DOCKER_USERNAME DOCKER_PASSWORD; do
             if [ -z "${!var}" ]; then
               missing="${missing:+${missing}, }${var}"
             fi
           done
+          # The second registry is OPTIONAL and is not named in this public repo: it is
+          # configured with the REGISTRY_NAME/REGISTRY_IMAGE repository VARIABLES. With
+          # no REGISTRY_IMAGE there is nothing to half-publish, so its credentials are
+          # not required — and demanding them anyway is what made this workflow go red on
+          # a public mirror where the internal host cannot be named at all.
+          if [ -n "${REGISTRY_IMAGE:-}" ]; then
+            for var in REGISTRY_USERNAME REGISTRY_PASSWORD; do
+              if [ -z "${!var}" ]; then
+                missing="${missing:+${missing}, }${var}"
+              fi
+            done
+          else
+            echo "::notice title=Single-registry publish::REGISTRY_IMAGE is not set (repository variable), so this publish targets Docker Hub only."
+          fi
           if [ -n "${missing}" ]; then
-            echo "::error title=Missing publish credential::Cannot publish ${IMAGE_NAME} for ${GITHUB_REF_NAME}: the repository secret(s) ${missing} are not set. Add them under smitimus/verisim -> Settings -> Secrets and variables -> Actions: DOCKER_USERNAME/DOCKER_PASSWORD are the Docker Hub account and a token with read/write on ${IMAGE_NAME}; REGISTRY_USERNAME/REGISTRY_PASSWORD are the ${REGISTRY_NAME} account and a token with write on package ${REGISTRY_IMAGE}. Both registries are required: data-lab pins this image by digest in ${REGISTRY_IMAGE}, so a release published to only one of them cannot be pulled by a slot. Publishing on main and on version tags is required, so this run fails instead of skipping."
+            echo "::error title=Missing publish credential::Cannot publish ${IMAGE_NAME} for ${GITHUB_REF_NAME}: the repository secret(s) ${missing} are not set. Add them under smitimus/verisim -> Settings -> Secrets and variables -> Actions: DOCKER_USERNAME/DOCKER_PASSWORD are the Docker Hub account and a token with read/write on ${IMAGE_NAME}. If a second registry is configured (REGISTRY_IMAGE variable), REGISTRY_USERNAME/REGISTRY_PASSWORD are that registry's account and a token with write on the package. A versioned release is required to publish, so this run fails instead of skipping."
             exit 1
           fi
-          echo "Publish credentials are present (Docker Hub user=${DOCKER_USERNAME}, registry user=${REGISTRY_USERNAME})."
+          if [ -n "${REGISTRY_IMAGE:-}" ]; then
+            echo "Publish credentials are present (Docker Hub user=${DOCKER_USERNAME}, registry user=${REGISTRY_USERNAME})."
+          else
+            echo "Docker Hub credentials are present (DOCKER_USERNAME=${DOCKER_USERNAME})."
+          fi
 
       - name: Set up Docker Buildx
         if: github.event_name != 'pull_request'

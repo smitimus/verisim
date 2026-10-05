@@ -32,7 +32,8 @@ GATE_TESTS="${SCRIPT_DIR}/credential-gate-tests.sh"
 PASS=0
 FAIL=0
 SHA=0123456789abcdef0123456789abcdef01234567
-REG='gitea.afastbox.com/admin/verisim-grocery'
+# Fixture registry path — placeholder host, see credential-gate-tests.sh.
+REG="${REGISTRY_IMAGE:-registry.example.invalid/example/verisim-grocery}"
 
 ok()  { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; return 0; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '        %s\n' "$2"; return 0; }
@@ -135,10 +136,26 @@ else
 fi
 
 # ── Claim 2 (t_ff5a70ec): the push reaches BOTH registries ─────────────────
-if grep -q "REGISTRY_IMAGE" "${WF}" && grep -q "${REG%/*}" "${WF}"; then
-  ok "the workflow names our registry as a destination"
+# The workflow must reference REGISTRY_IMAGE, but it must NOT name the internal host:
+# this repository is a public mirror and Chris's standing rule (2026-10-04) is that the
+# internal Git host never appears in it. The value comes from a repository VARIABLE.
+# So the assertion is "wired to the variable", and there is a second assertion that the
+# host is genuinely absent — a scrub that quietly regressed is the failure worth catching.
+if grep -q "vars.REGISTRY_IMAGE" "${WF}" && grep -q "REGISTRY_IMAGE" "${WF}"; then
+  ok "the workflow reads REGISTRY_IMAGE from a repository variable"
 else
-  bad "the workflow names our registry as a destination" "REGISTRY_IMAGE is gone"
+  bad "the workflow reads REGISTRY_IMAGE from a repository variable" "no \${{ vars.REGISTRY_IMAGE }} reference"
+fi
+
+# The needle is assembled at runtime so THIS file does not contain the literal it
+# forbids — a test that matches its own source proves nothing. It was caught doing
+# exactly that: the assertion failed against a tree that had zero occurrences.
+NEEDLE="gitea""\.afastbox""\.com"
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if grep -rqE "${NEEDLE}" "${WF}" "${SCRIPTS_DIR}" 2>/dev/null; then
+  bad "no internal host is named anywhere in the publish path" "an internal registry host appears in ${WF} or a sibling script"
+else
+  ok "no internal host is named anywhere in the publish path"
 fi
 
 if has_step "Log in to our registry"; then

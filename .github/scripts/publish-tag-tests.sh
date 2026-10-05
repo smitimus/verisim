@@ -223,7 +223,7 @@ fi
 # on until the job times out. (It did, the first time: a 60s timeout, no output.)
 if [ -z "${PUBLISH_TAG_TESTS_CHILD:-}" ]; then
   AMBIENT_OUT="$(mktemp)"
-  PUBLISH_TAG_TESTS_CHILD=1 REGISTRY_IMAGE='gitea.afastbox.com/admin/verisim-grocery' \
+  PUBLISH_TAG_TESTS_CHILD=1 REGISTRY_IMAGE="${REGISTRY_IMAGE:-registry.example.invalid/example/verisim-grocery}" \
     REQUIRE_SECOND_REGISTRY=true \
     bash "${0}" "${REPO}" > "${AMBIENT_OUT}" 2>&1
   ambient_rc=$?
