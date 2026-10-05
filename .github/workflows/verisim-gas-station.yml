@@ -161,8 +161,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Require Docker Hub credentials
+      # THE PUBLISH GATE (t_4b05829c, Chris 2026-10-04) — the SAME gate the grocery
+      # workflow uses, reading the SAME tracked VERSION file. Docker Hub is a release
+      # channel, not a commit feed: gas-station shipped on every main push before this,
+      # under a bare-SHA tag, exactly as grocery did. One VERSION, one gate, both images
+      # tagged from the same release — so the two can never claim different versions.
+      #
+      # It runs FIRST: a held publish must not fail the run over a credential it will
+      # never use, or every ordinary merge would go red.
+      - name: Publish gate — is this a release?
+        id: gate
         if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/publish-gate.sh \
+            "${{ github.event.before }}" "${{ github.sha }}" \
+            "${GITHUB_REF}" "${GITHUB_EVENT_NAME}"
+
+      # Self-test in CI, including the case that must FAIL.
+      - name: Publish gate self-test
+        if: github.event_name != 'pull_request'
+        run: bash .github/scripts/publish-gate-tests.sh
+
+      - name: Require Docker Hub credentials
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |
           missing=""
           if [ -z "${DOCKER_USERNAME}" ]; then missing="DOCKER_USERNAME"; fi
@@ -176,11 +199,11 @@ jobs:
           echo "Docker Hub credentials are present (DOCKER_USERNAME=${DOCKER_USERNAME})."
 
       - name: Set up Docker Buildx
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKER_USERNAME }}
@@ -193,7 +216,7 @@ jobs:
       # (t_4b05829c). Gas-station had the same defect and the same fix.
       - name: Compute tags
         id: meta
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |
           bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"
           {
@@ -203,7 +226,7 @@ jobs:
           }
 
       - name: Push to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -212,6 +235,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
+
+      - name: Publishing held — not a release
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish != 'true'
+        run: |
+          echo "::notice title=Docker Hub publishing held::${GATE_REASON}. Gitea is the source of truth and this commit landed there automatically; the public GitHub mirror is published separately by the operator, and Docker Hub follows only a versioned release."
+        env:
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
 
       - name: Publishing skipped — pull request
         if: github.event_name == 'pull_request'
