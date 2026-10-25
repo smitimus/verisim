@@ -35,6 +35,7 @@ the whole inventory section down for data-lab.
 """
 import pathlib
 import re
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -429,3 +430,270 @@ def test_paging_a_vendor_route_loses_no_rows(quiesced_generator):
             f"a total of {min(total, cap)}")
         assert len(page["data"]) == len(seen), (
             f"{path}: the page returned a duplicate {primary_key}")
+
+
+# ---------------------------------------------------------------------------
+# 5. The ingest-clock window on the three vendor inventory feeds (t_70051ceb)
+# ---------------------------------------------------------------------------
+# data-lab watermarks these three tables on `created_at` — the insert clock,
+# exact — but could only ask for a *business* window: `delivery_date` on the two
+# DSD routes, `event_dt` on the short-ship feed. A backfill writes 30 business
+# days at one wall-clock instant, so after a backfill every row sits ABOVE its
+# own business date (measured on CT107, 2026-10-25: 52/52 drops, 207/207 lines,
+# 2022/2022 shorts, max lag 30/30/27 days). The window a `created_at` watermark
+# implies is therefore not narrow — it is empty: asking today's date returned 0
+# drops and 0 lines while the table held 52 and 207, and the short feed's own
+# day returned 88 of 2022. A row inserted late for an earlier business day was
+# unreachable through EVERY business window, so data-lab bought correctness
+# with a 365-day re-read on every run (its 547e523/e074e60). These parameters
+# retire that reach.
+#
+# The pair binds the row's OWN insert clock: `d.created_at` on the drop,
+# `i.created_at` on the line (not the parent's — the line is the row data-lab
+# watermarks), `se.created_at` on the short. The business window keeps its
+# column and the two compose as independent AND filters, exactly as on the POS
+# routes since 373cbe3/4ec85ec.
+CREATED_WINDOW_ROUTES = [
+    {
+        "request": "/grocery/inventory/dsd-deliveries",
+        "source": "/{industry}/inventory/dsd-deliveries",
+        "alias": "d",
+        "pk": "dsd_delivery_id",
+        "business": "d.delivery_date",
+        "business_key": "delivery_date",
+        "business_window": lambda day: {"start_date": day.isoformat(),
+                                        "end_date": day.isoformat()},
+    },
+    {
+        "request": "/grocery/inventory/dsd-delivery-items",
+        "source": "/{industry}/inventory/dsd-delivery-items",
+        "alias": "i",
+        "pk": "dsd_item_id",
+        "business": "d.delivery_date",
+        "business_key": "delivery_date",
+        "business_window": lambda day: {"start_date": day.isoformat(),
+                                        "end_date": day.isoformat()},
+    },
+    {
+        "request": "/grocery/inventory/short-ship-events",
+        "source": "/{industry}/inventory/short-ship-events",
+        "alias": "se",
+        "pk": "short_ship_id",
+        "business": "se.event_dt",
+        "business_key": "event_dt",
+        "business_window": lambda day: {
+            "start_dt": _day_start(day).isoformat(),
+            "end_dt": _day_end(day).isoformat()},
+    },
+]
+
+CREATED_WINDOW_PATHS = [route["request"] for route in CREATED_WINDOW_ROUTES]
+
+FAR_PAST = "2000-01-01T00:00:00+00:00"
+FAR_FUTURE = "2999-01-01T00:00:00+00:00"
+
+
+def _day_start(day) -> datetime:
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+
+def _day_end(day) -> datetime:
+    return _day_start(day) + timedelta(days=1) - timedelta(microseconds=1)
+
+
+def _as_datetime(value) -> datetime:
+    """Parse an API timestamp (``Z`` or ``+00:00``; naive means UTC) as aware UTC."""
+    stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _business_date(route, row):
+    """The row's business date, whichever column this route's business window reads."""
+    raw = row[route["business_key"]]
+    if route["business_key"] == "event_dt":
+        return _as_datetime(raw).date()
+    return datetime.fromisoformat(str(raw)[:10]).date()
+
+
+@pytest.mark.parametrize("route", CREATED_WINDOW_ROUTES,
+                         ids=lambda r: r["request"])
+def test_route_declares_the_created_window(route):
+    """The pair must be DECLARED (so ``/openapi.json`` advertises it, which is how
+    data-lab's ingest verifies a configured window before trusting it) and applied
+    to the row's own ``created_at`` in the count query and the page query alike —
+    a filter on one and not the other makes ``total`` disagree with the pages,
+    which is what the ingest reconciles landed rows against."""
+    body = _route_source(route["source"])
+    alias = route["alias"]
+
+    for param in ("created_after", "created_before"):
+        assert re.search(rf"^\s+{param}: Optional\[datetime\] = None,$", body, re.M), \
+            f"{route['request']}: does not declare {param}"
+
+    assert f'filters.append("{alias}.created_at >= %s"); params.append(created_after)' in body, \
+        f"{route['request']}: created_after is not applied to {alias}.created_at"
+    assert f'filters.append("{alias}.created_at <= %s"); params.append(created_before)' in body, \
+        f"{route['request']}: created_before is not applied to {alias}.created_at"
+
+
+@pytest.mark.parametrize("route", CREATED_WINDOW_ROUTES,
+                         ids=lambda r: r["request"])
+def test_created_window_leaves_the_business_window_alone(route):
+    """``start_date``/``end_date`` (``start_dt``/``end_dt`` on shorts) keep filtering
+    the business column. Adding the insert clock must not move the window every
+    other consumer already uses — ``grocery_ingest_api.py`` names both pairs."""
+    body = _route_source(route["source"])
+    lo, hi = (route["business"] + " >= %s", route["business"] + " <= %s")
+    for applied in (lo, hi):
+        assert f'filters.append("{applied}")' in body, (
+            f"{route['request']}: the business window no longer filters "
+            f"{route['business']} ({applied})")
+
+
+def test_dsd_delivery_items_windows_on_the_item_clock_not_the_parents():
+    """The line has its own ``created_at``, and that is the clock its consumer
+    watermarks: a line inserted late for an earlier delivery day is reachable
+    through ``i.created_at`` even when its parent drop was written in an earlier
+    batch. Binding the parent's clock instead would silently reinstate the defect
+    for exactly those rows (t_70051ceb)."""
+    body = _route_source("/{industry}/inventory/dsd-delivery-items")
+    assert 'filters.append("i.created_at >= %s")' in body
+    assert 'filters.append("i.created_at <= %s")' in body
+    assert 'd.created_at' not in body, (
+        "the item route filters its parent's created_at — the line's own clock is "
+        "the one data-lab watermarks")
+
+
+@pytest.mark.parametrize("route", CREATED_WINDOW_ROUTES,
+                         ids=lambda r: r["request"])
+def test_created_window_payload_carries_created_at(route):
+    """The raw landzone is built FROM this payload, so the column the ingest
+    watermarks on has to be in it — the same rule `373cbe3` established for the
+    return lines."""
+    select_list = _page_query(_route_source(route["source"]))
+    assert f"{route['alias']}.created_at" in select_list, (
+        f"{route['request']} does not return {route['alias']}.created_at in its "
+        f"payload:\n{select_list}")
+
+
+@pytest.mark.usefixtures("ensure_api_reachable")
+@pytest.mark.parametrize("path", CREATED_WINDOW_PATHS)
+def test_openapi_advertises_the_created_window(api_base_url, path):
+    """FastAPI ignores unknown query parameters, so a configured window the route
+    does not declare looks like a bounded fetch that returns the whole table."""
+    with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
+        assert {"created_after", "created_before"} <= _route_query_params(client, path), \
+            f"{path}: OpenAPI does not advertise created_after/created_before"
+
+
+def _route_query_params(client: httpx.Client, path: str) -> set:
+    """Query parameters the route declares, read the way the ingest reads them."""
+    spec = client.get("/openapi.json", timeout=10.0).json()
+    names: set = set()
+    for spec_path, methods in spec.get("paths", {}).items():
+        if spec_path.strip("/").split("/")[-2:] != path.strip("/").split("/")[-2:]:
+            continue
+        for method in methods.values():
+            if isinstance(method, dict):
+                names |= {p.get("name") for p in method.get("parameters", [])
+                          if p.get("in") == "query"}
+    return names
+
+
+def _rows(client, path: str, params: dict, cap: int):
+    """Every row of a bounded window, walked a page at a time."""
+    rows, offset = [], 0
+    while True:
+        body = client.get(path, params=dict(params, limit=cap, offset=offset)).json()
+        rows.extend(body["data"])
+        offset += cap
+        if len(body["data"]) < cap or offset >= body["total"]:
+            return rows, body["total"]
+
+
+@pytest.mark.usefixtures("ensure_api_reachable")
+@pytest.mark.parametrize("route", CREATED_WINDOW_ROUTES,
+                         ids=lambda r: r["request"])
+def test_created_window_reaches_a_row_the_business_date_cannot(quiesced_generator, route):
+    """THE property this card exists for: one calendar day, read on two clocks.
+
+    A backfill stamps a row written today with ``created_at = now`` and a business
+    date up to a month earlier, so a row exists whose two clocks sit on different
+    sides of midnight. Asking for that day as an *insert* day must return it;
+    asking for the same day as a *business* day must not; and the two filters
+    must compose (AND), not replace one another.
+
+    A test that only checked the parameter is accepted would pass on a route that
+    ignores it — this one fails there, because the row is reachable only through
+    the clock the watermark is taken on.
+    """
+    client = quiesced_generator
+    path, cap, pk = route["request"], _max_limit(route["request"]), route["pk"]
+
+    rows, _total = _rows(client, path,
+                         {"created_after": FAR_PAST, "created_before": FAR_FUTURE}, cap)
+    if not rows:
+        pytest.skip(f"{path}: no rows to straddle midnight with")
+
+    straddling = [row for row in rows
+                  if _as_datetime(row["created_at"]).date() > _business_date(route, row)]
+    if not straddling:
+        pytest.skip(f"{path}: no row whose created_at date is later than its "
+                    f"{route['business_key']} — nothing straddles midnight here")
+
+    row = straddling[0]
+    created_at = _as_datetime(row["created_at"])
+    day = created_at.date()
+    created_window = {"created_after": _day_start(day).isoformat(),
+                      "created_before": _day_end(day).isoformat()}
+
+    # 1. The insert-clock day returns the row whose created_at lands in it.
+    by_created = client.get(path, params=dict(created_window, limit=cap)).json()
+    assert by_created["total"] >= 1, (
+        f"{path}: the insert-clock window for {day} returned nothing, though a row "
+        f"is stamped {created_at}")
+    assert row[pk] in {r[pk] for r in by_created["data"]}, (
+        f"{path}: the row stamped created_at={created_at} is not in the created "
+        f"window that contains that instant — the parameter is not filtering the "
+        f"insert clock")
+    for returned in by_created["data"]:
+        assert _as_datetime(returned["created_at"]).date() == day, (
+            f"{path}: insert-clock window for {day} returned created_at="
+            f"{returned['created_at']}")
+    if by_created["total"] <= cap:
+        assert by_created["total"] == len(by_created["data"]), (
+            f"{path}: `total` says {by_created['total']} but the page carries "
+            f"{len(by_created['data'])} rows — the count and the page disagree")
+
+    # 1b. It is a FILTER, not decoration. A created day nothing was ever written on
+    #     must return nothing; a route that accepts the pair and ignores it returns
+    #     the whole table here (and would still pass step 1 on a single-day seed,
+    #     where every row shares the newest created_at date).
+    never = datetime(1999, 1, 1).date()
+    empty = client.get(path, params={"created_after": _day_start(never).isoformat(),
+                                     "created_before": _day_end(never).isoformat(),
+                                     "limit": cap}).json()
+    assert empty["total"] == 0, (
+        f"{path}: an insert-clock window over {never}, a day nothing was written on, "
+        f"returned {empty['total']} rows — created_after/created_before is ignored")
+
+    # 2. The same calendar day read as the BUSINESS day does not reach it.
+    business_window = route["business_window"](day)
+    by_business = client.get(path, params=dict(business_window, limit=cap)).json()
+    assert row[pk] not in {r[pk] for r in by_business["data"]}, (
+        f"{path}: the business window for {day} returned a row whose "
+        f"{route['business_key']} is {row[route['business_key']]} — the two clocks "
+        f"are being confused")
+
+    # 3. The pair composes: both filters AND, so the intersection cannot contain
+    #    a row that only one of them admits.
+    both = client.get(path, params=dict(business_window, **created_window,
+                                        limit=cap)).json()
+    assert row[pk] not in {r[pk] for r in both["data"]}, (
+        f"{path}: created_after/created_before did not compose with the business "
+        f"window — the row was admitted although its business date is outside")
+    assert {r[pk] for r in both["data"]} <= {r[pk] for r in by_created["data"]}, (
+        f"{path}: adding a business window widened the created window, so one of "
+        f"the two is not being applied")

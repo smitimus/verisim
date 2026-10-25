@@ -370,6 +370,9 @@ past:
 | `online.orders` / `online.order_items` | `placed_dt` | yes, during backfill | `created_at` | `orders.updated_at` |
 | `online.order_events` | `event_dt` | yes, during backfill | `created_at` | — |
 | `control.generation_stats` | `simulation_dt` | yes, during backfill | `recorded_at` | `generator_state.last_tick_at` (realtime only) |
+| `inv.short_ship_events` | `event_dt` | yes, during backfill | `created_at` | — |
+| `inv.dsd_deliveries` | `delivery_date` | yes, during backfill | `created_at` | — |
+| `inv.dsd_delivery_items` | parent's `delivery_date` | yes, during backfill | `created_at` (the ITEM's) | — |
 
 A consumer that watermarks on a backdated column loses rows: the watermark sits at the
 newest business time already seen, and every row a later batch backdates below it is
@@ -409,6 +412,20 @@ route is incremental too. **No DDL was needed for any of this**: `online.order_e
 has had `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()` since the channel was introduced
 (0cfd0ed, t_24fae529) — the column was simply never surfaced by the API, which is why the
 raw mirror data-lab built from the payload had no column to watermark on.
+
+The three vendor inventory feeds followed (t_70051ceb), and there the *business* window was
+the wrong one in the same way: `/{industry}/inventory/dsd-deliveries` and
+`.../dsd-delivery-items` filter `delivery_date`, `.../short-ship-events` filters `event_dt`,
+while data-lab watermarks all three on `created_at`. After a 30-day backfill the watermark
+(2026-10-25T16:29:43-04:00) sits above every business date in the table — measured on CT107,
+52/52 drops, 207/207 lines and 2022/2022 shorts carried a `created_at` date LATER than their
+own business date (max lag 30/30/27 days), so the watermark's own day returned 0 drops, 0
+lines and 88 of 2022 shorts. A row inserted late for an earlier delivery day was therefore
+unreachable through every business window, which is why the ingest bought correctness with a
+365-day re-read on each run. All three now take `created_after`/`created_before`; the line
+feed binds the ITEM's `i.created_at` (not the parent drop's), because the line is the row
+data-lab mirrors. `start_date`/`end_date` (and `start_dt`/`end_dt` on shorts) keep their
+business meaning and compose with the new pair as independent AND filters.
 
 **The third window: state.** `online.orders.status` is mutated *in place* by
 `grocery/generator/models/online.py::advance_online_lifecycle` (it also bumps

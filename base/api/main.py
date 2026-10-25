@@ -1897,6 +1897,8 @@ def inventory_short_ship_events(
     is_creditable: Optional[bool] = None,
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: int = Query(500, le=5000),
     offset: int = 0,
 ):
@@ -1913,6 +1915,19 @@ def inventory_short_ship_events(
     fulfillment line the event came from (asserted by harness check SEMA-15),
     and `short_value` is that shortfall priced at the same unit cost the
     receipt used for the goods that DID arrive.
+
+    **Two independent time windows.** ``start_dt``/``end_dt`` bound the
+    *business* time (``event_dt``) — when the short happened. ``created_after``/
+    ``created_before`` bound the *ingest* time (``se.created_at``) — when the
+    row was written, stamped by the same statement and never moved backwards.
+    A backfill writes whole business days at one wall-clock instant, so a row
+    inserted late for an earlier day sits below a watermark taken on
+    ``event_dt`` and is unreachable through *every* business window. Measured
+    on CT107 (2026-10-25): 2022 of 2022 rows carried a ``created_at`` date later
+    than their ``event_dt`` date, max lag 27 days, and the watermark's own day
+    returned 88 rows while the table held 2022 — which is why data-lab had to
+    re-read 365 days per run to stay correct. ``created_after=<MAX(created_at)
+    of the last load>`` is a complete delta (kanban t_70051ceb).
     """
     pool_for(industry)
     if not _has_vendor_tables(industry):
@@ -1940,6 +1955,10 @@ def inventory_short_ship_events(
     if end_dt:
         filters.append("se.event_dt <= %s")
         params.append(end_dt)
+    if created_after:
+        filters.append("se.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("se.created_at <= %s"); params.append(created_before)
     where = " AND ".join(filters)
     total = query(f"SELECT COUNT(*) AS n FROM inv.short_ship_events se "
                   f"WHERE {where}", params, industry)[0]["n"]
@@ -2038,6 +2057,8 @@ def inventory_dsd_deliveries(
     location_id: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: int = Query(500, le=5000),
     offset: int = 0,
 ):
@@ -2060,6 +2081,17 @@ def inventory_dsd_deliveries(
     landzone is built FROM this payload, so the column is then absent from
     `raw_inv.dsd_deliveries` and "did the truck arrive inside its window" is
     unanswerable at every layer above (kanban t_120b25b0).
+
+    **Two independent time windows.** ``start_date``/``end_date`` bound the
+    *business* date (``delivery_date``) — the day the drop belongs to in the
+    schedule. ``created_after``/``created_before`` bound the *ingest* time
+    (``d.created_at``) — when the row was written, which for a backfill is one
+    wall-clock instant covering many business days. data-lab watermarks on the
+    latter, so without this pair a row inserted late for an earlier delivery
+    day sat below the watermark and could not be fetched again by any
+    ``start_date``/``end_date`` window (measured on CT107, 2026-10-25: 52 of 52
+    drops, max lag 30 days). ``created_after=<MAX(created_at) of the last
+    load>`` is a complete delta (kanban t_70051ceb).
     """
     pool_for(industry)
     if not _has_vendor_tables(industry):
@@ -2078,6 +2110,10 @@ def inventory_dsd_deliveries(
     if end_date:
         filters.append("d.delivery_date <= %s")
         params.append(end_date)
+    if created_after:
+        filters.append("d.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("d.created_at <= %s"); params.append(created_before)
     where = " AND ".join(filters)
     total = query(f"SELECT COUNT(*) AS n FROM inv.dsd_deliveries d "
                   f"WHERE {where}", params, industry)[0]["n"]
@@ -2106,6 +2142,8 @@ def inventory_dsd_delivery_items(
     location_id: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    created_after: Optional[datetime] = None,
+    created_before: Optional[datetime] = None,
     limit: int = Query(500, le=5000),
     offset: int = 0,
 ):
@@ -2113,6 +2151,16 @@ def inventory_dsd_delivery_items(
     DSD line items. `quantity_delivered = 0` is a MISSED drop, not a missing row:
     it is the record that makes the shortfall visible, which is why the column
     is CHECK (>= 0) rather than (> 0).
+
+    **Two independent time windows**, and here the ingest window binds the
+    ITEM's own clock: ``created_after``/``created_before`` filter
+    ``i.created_at``, not the parent drop's. The line is the row data-lab
+    watermarks, and it has its own ``created_at`` (``DEFAULT NOW()``, written by
+    the same statement), so a line inserted late for an earlier delivery day is
+    reachable even when its parent was written in an earlier batch.
+    ``start_date``/``end_date`` keep their business meaning — the parent's
+    ``delivery_date`` — and the two windows compose as independent filters
+    (kanban t_70051ceb).
     """
     pool_for(industry)
     if not _has_vendor_tables(industry):
@@ -2137,6 +2185,10 @@ def inventory_dsd_delivery_items(
     if end_date:
         filters.append("d.delivery_date <= %s")
         params.append(end_date)
+    if created_after:
+        filters.append("i.created_at >= %s"); params.append(created_after)
+    if created_before:
+        filters.append("i.created_at <= %s"); params.append(created_before)
     where = " AND ".join(filters)
     total = query(f"""
         SELECT COUNT(*) AS n
