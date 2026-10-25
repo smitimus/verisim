@@ -37,7 +37,7 @@ the VALUES row — the shape `returns.restock_returns` already uses.
 """
 import logging
 import random
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import psycopg2.extras
 import pytest
@@ -52,6 +52,9 @@ STORE = 'cccccccc-0000-0000-0000-000000000003'
 OTHER_STORE = 'cccccccc-0000-0000-0000-000000000004'
 SUPPLIER = '11111111-0000-0000-0000-000000000001'
 SCHEDULE = '22222222-0000-0000-0000-000000000002'
+# The window the schedule promises, i.e. `inv.supplier_delivery_schedules.
+# delivery_window_start`. The drop must carry it (kanban t_120b25b0).
+WINDOW_START = time(6, 0)
 
 CATALOGUE = [
     ('aaaaaaaa-0000-0000-0000-00000000000%d' % i, SUPPLIER, 'EA', 1.25 + i)
@@ -138,7 +141,8 @@ class _FakeDB:
     def answer(self, flat):
         lowered = flat.lower()
         if 'from inv.supplier_delivery_schedules' in lowered:
-            return [(SCHEDULE, SUPPLIER, STORE, 'dsd', 'FreshFields Produce')]
+            return [(SCHEDULE, SUPPLIER, STORE, 'dsd', 'FreshFields Produce',
+                     WINDOW_START)]
         if 'from inv.products ip' in lowered:
             return list(CATALOGUE)
         if 'from inv.dsd_deliveries d' in lowered:
@@ -235,13 +239,56 @@ def test_a_dsd_drop_writes_the_delivery_and_its_lines(recording_execute_values):
     assert params[2] == SUPPLIER
     assert params[3] == STORE
     assert params[4] == SIM_DAY
-    assert params[8] == counts['lines'] > 0
+    assert params[9] == counts['lines'] > 0
 
     items = db.batch_for('INSERT INTO inv.dsd_delivery_items')
     assert items is not None, 'the drop wrote no delivery lines'
     _sql, item_rows, _template = items
     assert len(item_rows) == counts['lines']
     assert all(row[2] > 0 for row in item_rows), 'a DSD drop delivered nothing'
+
+
+def _delivery_params(db):
+    """The one delivery INSERT's parameter tuple, in column order."""
+    header = db.statements_containing('INSERT INTO inv.dsd_deliveries')[0]
+    return db.writes[[sql for sql, _ in db.writes].index(header)][1]
+
+
+def test_a_dsd_drop_records_the_window_its_schedule_promised(
+        recording_execute_values):
+    """`inv.dsd_deliveries.scheduled_window` must arrive with the drop.
+
+    The column existed in `schema.sql` and no writer ever set it, so all 12
+    rows on CT107 read NULL — and "did the truck arrive inside the window it
+    promised", the one question a drop and a schedule together exist to answer,
+    could not be computed at all (kanban t_120b25b0). The window is not
+    something the drop has to invent: it already references `schedule_id`, and
+    that schedule carries `delivery_window_start`.
+    """
+    db = _FakeDB()
+    _run(db)
+
+    params = _delivery_params(db)
+    assert params[6] == WINDOW_START, (
+        "the drop did not carry its schedule's window: %r" % (params[6],))
+    assert params[6] is not None, (
+        'a NULL window is the defect this card exists to fix')
+
+
+def test_the_drop_reads_its_window_from_the_schedule_it_references(
+        recording_execute_values):
+    """The value comes from the schedule row the drop selects, not from a
+    constant and not from the arrival time — so it stays the promise the
+    delivery is measured against even if the arrival band changes."""
+    db = _FakeDB()
+    _run(db)
+
+    statements = db.statements_containing(
+        'FROM inv.supplier_delivery_schedules')
+    assert statements, 'the drop pass never read a schedule'
+    assert 'delivery_window_start' in statements[0], (
+        'the drop query does not read the schedule\'s window:\n%s'
+        % statements[0])
 
 
 def test_a_second_pass_over_the_same_day_writes_nothing(recording_execute_values):
@@ -431,6 +478,6 @@ def test_a_fully_missed_line_writes_no_delivery_item(recording_execute_values):
 
     header = db.statements_containing('INSERT INTO inv.dsd_deliveries')[0]
     params = db.writes[[sql for sql, _ in db.writes].index(header)][1]
-    assert params[6] == pytest.approx(sum(row[2] for row in item_rows)), (
+    assert params[7] == pytest.approx(sum(row[2] for row in item_rows)), (
         'total_units must be the sum of the units that actually arrived')
-    assert params[8] == len(item_rows)
+    assert params[9] == len(item_rows)

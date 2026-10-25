@@ -122,7 +122,7 @@ SHORT_SHIP_ROW_TEMPLATE = (
 # the next lifecycle step to it. An execute_values template would be a constant
 # nothing reads.
 DSD_DELIVERY_ROW_TEMPLATE = (
-    "(%s::uuid,%s::uuid,%s::uuid,%s::uuid,%s,%s,%s,%s,%s)"
+    "(%s::uuid,%s::uuid,%s::uuid,%s::uuid,%s,%s,%s::time,%s,%s,%s)"
 )
 DSD_ITEM_ROW_TEMPLATE = "(%s::uuid,%s::uuid,%s,%s,%s)"
 
@@ -136,10 +136,10 @@ DSD_ITEM_ROW_TEMPLATE = "(%s::uuid,%s::uuid,%s,%s,%s)"
 # so a mismatch here would have stayed dark for weeks.
 #
 # Each count matches the INSERT it feeds:
-#   short_ship_events  16 columns   dsd_deliveries  9 columns
+#   short_ship_events  16 columns   dsd_deliveries  10 columns
 #   dsd_delivery_items  5 columns
 SHORT_SHIP_COLUMN_COUNT = 16
-DSD_DELIVERY_COLUMN_COUNT = 9
+DSD_DELIVERY_COLUMN_COUNT = 10
 DSD_ITEM_COLUMN_COUNT = 5
 
 # A short-ship cannot fill more than the whole line, and a line below this is
@@ -957,6 +957,16 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
     against the vendor's terms on the spot, and restocked only for what
     actually arrived.
 
+    Each drop records `scheduled_window`, copied from the `delivery_window_start`
+    of the schedule it references. That is what makes a drop and its schedule
+    comparable at all: "did the truck arrive inside the window it promised" is
+    the only question the pair exists to answer, and while this column was never
+    written every row read NULL and the comparison was not computable
+    (t_120b25b0). The ARRIVAL is drawn from the morning delivery band and is
+    deliberately not pinned inside the window — a truck that always landed
+    inside its own window would make the on-time rate a constant, which is a
+    measurement of nothing.
+
     Idempotent per (schedule, delivery_date) — the UNIQUE is not on the delivery
     table, so idempotence is enforced by a NOT EXISTS on the schedule's weekday,
     which is what a re-run of the same day re-derives.
@@ -972,7 +982,8 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
     with conn.cursor() as cur:
         cur.execute("""
             SELECT ds.schedule_id::text, ds.supplier_id::text,
-                   ds.location_id::text, s.fulfillment_model, s.supplier_name
+                   ds.location_id::text, s.fulfillment_model, s.supplier_name,
+                   ds.delivery_window_start
             FROM inv.supplier_delivery_schedules ds
             JOIN inv.suppliers s ON s.supplier_id = ds.supplier_id
             WHERE ds.delivery_weekday = %s AND ds.is_active AND s.is_active
@@ -1007,7 +1018,8 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
         """, (today,))
         already = {row[0] for row in cur.fetchall()}
 
-    for schedule_id, supplier_id, location_id, model, supplier_name in drops:
+    for (schedule_id, supplier_id, location_id, model, supplier_name,
+         window_start) in drops:
         if schedule_id in already:
             continue
         vendor = vendor_by_id.get(str(supplier_id))
@@ -1077,13 +1089,13 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
             cur.execute("""
                 INSERT INTO inv.dsd_deliveries
                     (dsd_delivery_id, schedule_id, supplier_id, location_id,
-                     delivery_date, delivered_at, total_units, total_value,
-                     line_count)
+                     delivery_date, delivered_at, scheduled_window, total_units,
+                     total_value, line_count)
                 VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date,
-                        %s, %s, %s, %s)
+                        %s, %s::time, %s, %s, %s)
             """, (delivery_id, schedule_id, supplier_id, location_id, today,
-                  delivered_at, round(total_units, 3), round(total_value, 2),
-                  len(delivery_items)))
+                  delivered_at, window_start, round(total_units, 3),
+                  round(total_value, 2), len(delivery_items)))
 
             if delivery_items:
                 execute_values(cur, """

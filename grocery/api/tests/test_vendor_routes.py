@@ -246,7 +246,8 @@ def test_route_declares_the_page_ceiling_a_consumer_can_read(path):
       "resolved_dt"]),
     ("/grocery/inventory/dsd-deliveries",
      ["dsd_delivery_id", "supplier_id", "supplier_name", "location_id",
-      "delivery_date", "total_units", "total_value", "line_count"]),
+      "delivery_date", "delivered_at", "scheduled_window", "total_units",
+      "total_value", "line_count"]),
     ("/grocery/inventory/dsd-delivery-items",
      ["dsd_item_id", "dsd_delivery_id", "product_id", "quantity_delivered",
       "unit_cost", "line_total"]),
@@ -265,6 +266,23 @@ def test_payload_carries_the_columns_a_mart_needs(path, required):
     missing = [c for c in required if c not in select_list]
     assert not missing, (
         f"{path} does not return {missing} in its payload:\n{select_list}")
+
+
+def test_the_dsd_delivery_route_serves_the_window_it_is_measured_against():
+    """
+    `scheduled_window` is the half of the on-time question the schedule cannot
+    answer on its own: the schedule says when the vendor PROMISED to arrive,
+    the drop says when it did. data-lab's `stg_inv_dsd_deliveries` declares the
+    column (kanban t_120b25b0) and probes for it at compile time, so a route
+    that omits it leaves the raw landzone without it and the model emits
+    `null::time` for ever — the on-time mart would have no window to compare
+    the arrival against.
+    """
+    _request, source, _pk = _params("/grocery/inventory/dsd-deliveries")
+    select_list = _page_query(_route_source(source))
+    assert "d.scheduled_window" in select_list, (
+        "the DSD drop route does not project scheduled_window:\n"
+        f"{select_list}")
 
 
 def test_short_ship_route_returns_the_receipt_comparable_columns():

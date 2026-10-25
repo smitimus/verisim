@@ -950,6 +950,21 @@ ASSERTIONS: List[AssertionSpec] = [
                         OR se.fulfillment_id IS NOT NULL))
         """,
     ),
+    AssertionSpec(
+        id="SEMA-29",
+        dimension="semantic_type",
+        title="a DSD delivery's recorded window must be the one its schedule promised",
+        sql="""
+            SELECT d.dsd_delivery_id, d.scheduled_window,
+                   ds.delivery_window_start AS promised_window
+            FROM inv.dsd_deliveries d
+            JOIN inv.supplier_delivery_schedules ds
+              ON ds.schedule_id = d.schedule_id
+            WHERE d.scheduled_window IS NOT NULL
+              AND d.scheduled_window IS DISTINCT FROM ds.delivery_window_start
+              AND d.delivery_date < CURRENT_DATE
+        """,
+    ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
     # The promo key resolves, but the promotion's validity window does not
     # cover the transaction date it was applied to. Fixed at the source by

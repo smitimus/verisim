@@ -93,7 +93,13 @@ enforce.
   `SEMA-28`, and `HARD-32` (the item FK anti-join) skips the NULL rows — a
   consumer joining either column must expect NULLs on the DSD half.
 - **`inv.dsd_deliveries`** referenced by: `inv.dsd_delivery_items`
-  (`dsd_delivery_id`).
+  (`dsd_delivery_id`). Its `scheduled_window` is the **promise the drop is
+  measured against**, copied from its schedule's `delivery_window_start` at
+  write time (t_120b25b0) — a delivery and a schedule together are what answer
+  "did the truck arrive inside the window it promised". The column is nullable
+  and NULL means "no window recorded", not "arrived outside every window";
+  `SEMA-29` asserts that a window which IS recorded is the one the schedule
+  names.
 
 ---
 
@@ -252,6 +258,7 @@ stockouts.
 | `SEMA-25` | a DSD delivery's supplier matches its schedule's supplier |
 | `SEMA-26` | a DSD delivery lands on a weekday its schedule actually visits |
 | `SEMA-27` | `inv.products.supplier_name` agrees with `inv.suppliers.supplier_name` — the denormalised display copy can never disagree with the row it came from |
+| `SEMA-29` | a DSD delivery's recorded `scheduled_window` is the window its schedule promised (a recorded window cannot contradict the schedule; NULL reads as "no window recorded") |
 
 `HARD-29`..`HARD-39` cover the new foreign keys themselves, plus the one that is
 also a type check: a DSD delivery's supplier must actually be

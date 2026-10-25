@@ -2050,6 +2050,16 @@ def inventory_dsd_deliveries(
     a receipt would double-count the goods (once on our truck, once on the
     vendor's). This route is the inbound channel for the perishable half of the
     catalogue, which otherwise arrived by a mechanism no table described.
+
+    `scheduled_window` is served because the drop alone cannot answer the
+    question the pair exists for. The vendor's promise lives on
+    `inv.supplier_delivery_schedules.delivery_window_start` (this route's
+    sibling serves it as `window_start`); the drop carries the window it was
+    measured against, so a consumer can compute the arrival against it. Leaving
+    the column out of this projection is not a display omission: the raw
+    landzone is built FROM this payload, so the column is then absent from
+    `raw_inv.dsd_deliveries` and "did the truck arrive inside its window" is
+    unanswerable at every layer above (kanban t_120b25b0).
     """
     pool_for(industry)
     if not _has_vendor_tables(industry):
@@ -2074,7 +2084,8 @@ def inventory_dsd_deliveries(
     rows = query(f"""
         SELECT d.dsd_delivery_id, d.schedule_id, d.supplier_id,
                s.supplier_name, d.location_id, l.name AS location_name,
-               d.delivery_date, d.delivered_at, d.total_units, d.total_value,
+               d.delivery_date, d.delivered_at, d.scheduled_window,
+               d.total_units, d.total_value,
                d.line_count, d.created_at
         FROM inv.dsd_deliveries d
         JOIN inv.suppliers s ON s.supplier_id = d.supplier_id

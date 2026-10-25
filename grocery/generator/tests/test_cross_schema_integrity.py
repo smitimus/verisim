@@ -199,6 +199,9 @@ TABLE_OR_COLUMN_OPTIONAL = {
     "SEMA-27": ("inv", "suppliers", None),
     # SEMA-28 reads inv.short_ship_events (parents vs detected_source).
     "SEMA-28": ("inv", "short_ship_events", None),
+    # SEMA-29 reads inv.dsd_deliveries for the window it records against
+    # inv.supplier_delivery_schedules' promised window.
+    "SEMA-29": ("inv", "dsd_deliveries", None),
 }
 
 _OPTIONAL_ASSERTION_IDS = frozenset(TABLE_OR_COLUMN_OPTIONAL)

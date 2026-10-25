@@ -562,6 +562,21 @@ SELECT se.short_ship_id, se.detected_source,
                    AND (se.fulfillment_item_id IS NOT NULL
                         OR se.fulfillment_id IS NOT NULL));
 
+-- [SEMA-29] a DSD delivery's recorded window must be the one its schedule promised
+-- The drop writes the schedule's `delivery_window_start` so "did the truck arrive
+-- inside the window it promised" can be computed at all (t_120b25b0). NULL is
+-- allowed on purpose: the column is nullable and a row generated before that card
+-- has no window recorded, which is not a contradiction of the promise. A window
+-- that IS recorded, however, must be the one the schedule names.
+SELECT d.dsd_delivery_id, d.scheduled_window,
+                   ds.delivery_window_start AS promised_window
+            FROM inv.dsd_deliveries d
+            JOIN inv.supplier_delivery_schedules ds
+              ON ds.schedule_id = d.schedule_id
+            WHERE d.scheduled_window IS NOT NULL
+              AND d.scheduled_window IS DISTINCT FROM ds.delivery_window_start
+              AND d.delivery_date < CURRENT_DATE;
+
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
 -- --------------------------------------------------------------------------
