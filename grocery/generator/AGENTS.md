@@ -80,6 +80,11 @@ inline INSERT per simulated hour in their own `run_backfill`. Grocery was the od
 - Gap detection: checks max transaction timestamp per day, fills missing days
 - Partial day: today gets hours 0 → current_hour, final tick uses `datetime.now()` for seamless realtime handoff
 - Idempotent: existing days skipped, partial days resume from last hour
+- A *past* day with partial POS rows is replayed (a generator that died mid-day), and
+  that replay is where `timeclock.generate_day_events()` used to write every punch
+  twice: it is now read-back-and-complete, one row per (employee, type, instant)
+  regardless of what realtime already wrote (t_251755f7,
+  `tests/test_timeclock_day_write_once.py`)
 
 ### Config Hierarchy
 `config.yaml` (mounted read-only) → `config.py` dataclasses → env var overrides for DB connection only.

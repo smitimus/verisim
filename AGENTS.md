@@ -235,7 +235,10 @@ Config is read at each tick — no restart needed for changes. Mounted into the 
 
 - On fresh (empty) DB: auto-backfills last 30 days, then switches to realtime
 - If `backfill_end_date = today`: backfills current day hour-by-hour up to current hour
-- Re-running backfill over same range is safe — existing days skipped
+- Re-running backfill over same range is safe — existing days skipped. A day with
+  *partial* POS rows is replayed from the hour after its last transaction, which is what
+  a generator that died mid-day leaves behind; `timeclock.generate_day_events()` reads
+  the day back and completes it, so the replay cannot write a punch twice (t_251755f7)
 - Force re-generate: `POST /grocery/generator/start` with `{"mode":"backfill","force":true}`
 
 ## REST API Endpoints (FastAPI, port 8010)
@@ -498,7 +501,7 @@ Still open:
 ## Known Bugs (Fixed — Do Not Revert)
 
 Both confirmed fixed on fresh backfill data:
-- **Timeclock pairing**: `generate_events()` queries existing events before inserting; `generate_day_events()` clamps clock_out to 23:30 same day. Since t_a24cfbc6 a break is also written as a **closed pair in one tick** (`break_start` + `break_end` `BREAK_LENGTH_MINUTES` apart) on the realtime path, not `break_start` now and `break_end` in the next break hour — hour 18 has no hour 19 behind it, so that shape left every 18:xx break open and failed data-lab's hard `assert_timeclock_pairs` on every run. `test_timeclock_breaks.py` pins it.
+- **Timeclock pairing**: `generate_events()` queries the day's existing events before inserting, and so does `generate_day_events()` — a day that already holds punches is **completed, never rewritten**, one row per `(employee_id, event_type, event_dt)` (t_251755f7). Without that, a backfill replay of a day realtime had partly written (the generator died at 11:09 on 2026-10-07, the restart's gap-fill replayed the day on 10-11) wrote a second full shift for every employee whose shift had started: 105 doubled rows with fresh `event_id`s, 55 employee-days with `ins = 2, outs = 1`, and `assert_labor_net_hours_agree` red on 22 of them. `test_timeclock_day_write_once.py` pins it. `clock_out` is still clamped to 23:30 same day. Since t_ca6642e0 the realtime path writes the day from a pure `(date, employee)` shift plan, one instant at a time, and the two halves of a break are written by the ticks that reach them — t_a24cfbc6's "closed pair in one tick" was replaced because writing the pair at once back-dates `break_start` below data-lab's `event_dt` ingest watermark. `test_timeclock_breaks.py` and `test_timeclock_realtime.py` pin that.
 - **Loyalty points balance**: `_record_loyalty_points()` uses `FOR UPDATE` row lock; dbt test orders by `(transaction_dt, points_balance_after)` for same-tick tiebreaks
 
 ## Gas Station Status

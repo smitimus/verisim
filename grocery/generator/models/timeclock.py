@@ -16,6 +16,11 @@ a pure function — no shared RNG stream, no stored state, the same answer on an
 tick, in any order, after any restart:
 
 * `generate_day_events()` — the backfill writes a whole past day in one pass.
+  It reads the day back first too (t_251755f7): a day realtime had already
+  partly written — the generator died at 11:09 on 2026-10-07 and the restart's
+  gap-fill replayed the day on 10-11 — used to get a *second* full shift for
+  every employee whose shift had started, with a fresh `event_id` each time.
+  Now an employee the day already holds rows for is completed, not rewritten.
 * `generate_events()`     — realtime (and the backfill's partial day) writes
   each instant as the clock reaches it, one tick at a time. Idempotency comes
   from the dedup SELECT below: an event is inserted only once, and only once
@@ -396,17 +401,57 @@ def generate_events(conn, simulation_dt: datetime, employees: List[Dict],
 def generate_day_events(conn, sim_date, employees: List[Dict]) -> int:
     """
     Write every event of one simulated day in one pass.
-    Each working employee gets one shift's worth of events.
+
+    Each working employee gets one shift's worth of events — and only the ones
+    the day does not already hold. `run_backfill` calls this for any past day
+    whose POS rows look incomplete, which is exactly what a generator that died
+    mid-day leaves behind: realtime had already written the punches of the hours
+    it lived through, so a blind INSERT here wrote a *second*
+    `clock_in`/`break_start`/`break_end` for everyone whose shift had started
+    (t_251755f7 — measured in the source on 2026-10-07, when `created_at` shows
+    105 realtime rows on 10-07 and one 328-row day pass on 10-11: 55
+    employee-days with `ins = 2, outs = 1`, and skill-testing labour nets).
+
+    So the day is read back first, and an employee the day already holds rows
+    for is *completed* by the same rules realtime uses — `_due_records`, which
+    derives the shift from the `clock_in` actually on the clock and writes only
+    the halves that are missing. Two consequences worth naming:
+
+    * A shift realtime floored later than its plan (t_fa8cad04) is completed
+      from where it was written; no punch can land before that `clock_in`.
+    * `day_max` is `None` here on purpose. The flooring it enables exists to
+      keep a write above the ingest cursor of the day *being written*, and this
+      day is already behind the cursor — flooring a close-out above a newer
+      day's newest row would invent a punch at an hour nobody worked.
     """
     store_employees = [e for e in employees
                        if e['location_type'] == 'store' and e['status'] == 'active']
     if not store_employees:
         return 0
 
+    written = _events_on(conn, sim_date)
+
     records: List[tuple] = []
+    roster = set()
     for emp in store_employees:
-        shift = plan_shift(sim_date, emp['employee_id'])
+        employee_id = str(emp['employee_id'])
+        roster.add(employee_id)
+        seen = written.get(employee_id)
+        if seen:
+            records.extend(_due_records(employee_id, emp['location_id'], sim_date,
+                                        seen, None, _day_end(sim_date)))
+            continue
+        shift = plan_shift(sim_date, employee_id)
         if shift is None:
             continue
         records.extend(_shift_records(emp, shift))
+
+    # The day can also hold punches for someone the active roster no longer
+    # carries: `hr.maybe_terminate_employee()` fires mid-shift, and half a shift
+    # is an unpaired punch — the one thing data-lab's check treats as fatal.
+    off_roster = sorted(set(written) - roster)
+    for employee_id, location_id in _locations_for(conn, off_roster):
+        records.extend(_due_records(employee_id, location_id, sim_date,
+                                    written[employee_id], None, _day_end(sim_date)))
+
     return _insert(conn, records)
