@@ -2355,10 +2355,17 @@ def inventory_receipts(
 def inventory_products(industry: str, limit: int = Query(500, le=2000), offset: int = 0):
     pool_for(industry)
     total = query("SELECT COUNT(*) AS n FROM inv.products ip", [], industry)[0]["n"]
+    # `supplier_id` is the product's real vendor key (FK to inv.suppliers, written by
+    # the generator in the same statement as the denormalised `supplier_name`). It is
+    # projected because this payload IS the raw landzone's schema: data-lab's
+    # `_ensure_table` builds `raw_inv.products` from these keys, so a column missing
+    # here does not exist downstream however clearly `schema.sql` declares it — and
+    # `mart_vendor_performance.product_count` is keyed on it (kanban t_ed802fa6).
     rows = query("""
         SELECT ip.inv_product_id, ip.product_id, p.name AS product_name,
                p.category, p.sku, ip.reorder_point, ip.reorder_qty,
-               ip.unit_of_measure, ip.supplier_name, ip.lead_time_days
+               ip.unit_of_measure, ip.supplier_id, ip.supplier_name,
+               ip.lead_time_days
         FROM inv.products ip
         JOIN pos.products p ON p.product_id = ip.product_id
         ORDER BY p.category, p.name, ip.inv_product_id LIMIT %s OFFSET %s
