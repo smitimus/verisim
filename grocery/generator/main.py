@@ -636,7 +636,7 @@ def _run_vendor_phase(conn, cfg, sim_dt, locations, products, scenario):
     try:
         vendors = suppliers.fetch_suppliers(conn)
         if vendors:
-            suppliers.generate_dsd_deliveries(
+            deliveries = suppliers.generate_dsd_deliveries(
                 conn, cfg, sim_dt, vendors, locations['stores'], products,
                 scenario)
         else:
@@ -644,7 +644,11 @@ def _run_vendor_phase(conn, cfg, sim_dt, locations, products, scenario):
                      "(pre-t_57b1a1ab data dir?)")
             return empty, empty_memos
         memos = suppliers.advance_credit_memos(conn, cfg, sim_dt, scenario)
-        return empty, memos
+        # The DSD counts, not `empty`: the caller logs them, and returning a
+        # zero dict for a pass that just wrote forty drops is the kind of
+        # "green and silent" that hid the placeholder defect for as long as it
+        # did (t_5a16106b).
+        return deliveries, memos
     except Exception:
         # A tick must not die because of the vendor paperwork. The receiving
         # path above it has already committed the goods.

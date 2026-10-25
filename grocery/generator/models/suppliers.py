@@ -886,6 +886,14 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
             # What the vendor PROMISED on this run, against what it did. A zero
             # delivery is the whole drop missed, which is the extreme case of the
             # same arithmetic rather than a separate branch.
+            #
+            # NOTE (t_d74d67a3): `short` is 0 on BOTH branches — `picked` equals
+            # `requested` unless the drop was missed, and a missed drop requested
+            # 0 — so this path writes no DSD short-ship today. Do not "fix" the
+            # arithmetic on its own: the INSERT below puts fabricated uuids in
+            # `fulfillment_item_id` / `fulfillment_id`, which are NOT NULL FKs to
+            # fulfillment.items/orders, so it needs the schema decision that card
+            # carries (and the data-lab ticket that goes with it).
             promised = draw_lead_time_days(vendor)
             short = short_quantity(quantity, quantity if not missed else 0.0)
             if short >= MIN_SHORT_UNITS:
@@ -919,17 +927,25 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
 
             # Stock the shelf for what actually arrived. A DSD line has no
             # load_id and no receipt, so this is where a DSD restock happens.
+            #
+            # The location travels INSIDE the row, not as a second `%s` in the
+            # statement: `execute_values` substitutes the `(VALUES %s)` slot
+            # itself, and psycopg2's `_split_sql` refuses any statement that
+            # carries another placeholder (t_5a16106b — the daily vendor phase
+            # raised on every simulated day and was swallowed by its caller, so
+            # inv.dsd_deliveries was empty on every seed). Same shape as
+            # `returns.restock_returns`.
             if total_units > 0:
                 execute_values(cur, """
                     UPDATE inv.stock_levels sl
                     SET quantity_on_hand = sl.quantity_on_hand + v.qty,
                         last_updated = NOW()
-                    FROM (VALUES %s) AS v(product_id, qty)
+                    FROM (VALUES %s) AS v(product_id, qty, location_id)
                     WHERE sl.product_id = v.product_id::uuid
-                      AND sl.location_id = %s::uuid
-                """, [(item[1], item[2]) for item in delivery_items
+                      AND sl.location_id = v.location_id::uuid
+                """, [(item[1], item[2], location_id) for item in delivery_items
                       if item[2] > 0],
-                    template="(%s::uuid,%s::numeric)")
+                    template="(%s::uuid,%s::numeric,%s::uuid)")
 
         counts['deliveries'] += 1
         counts['lines'] += len(delivery_items)

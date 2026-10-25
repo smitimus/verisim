@@ -46,6 +46,39 @@ Each `models/*.py` module owns one domain and exposes:
 
 All models use raw `psycopg2` with `execute_values` for bulk inserts. No ORM.
 
+### `execute_values` owns its one placeholder
+
+`execute_values(cur, sql, args, template=...)` substitutes the single `(VALUES %s)`
+slot itself, and psycopg2's `_split_sql` **refuses** a statement that carries any other
+`%s`: `ValueError: the query contains more than one '%s' placeholder`. So the statement
+carries exactly one placeholder, and every value that varies per row — a store location,
+a parent id — travels INSIDE the row tuple, with a matching `template`:
+
+```python
+FROM (VALUES %s) AS v(product_id, qty, location_id)      -- 1 placeholder, 3 fields
+WHERE sl.product_id = v.product_id::uuid
+  AND sl.location_id = v.location_id::uuid
+-- template="(%s::uuid,%s::numeric,%s::uuid)"
+```
+
+`models/returns.restock_returns` and the DSD shelf restock in `models/suppliers.py` are
+the shapes to copy.
+
+This is a repeat offender, in two forms. A row template whose slot count does not match
+its INSERT stays dark until the first row that uses it (`inventory`'s stockout template
+shipped 11 slots for 12 columns, t_959cd040). And the parameterised form above killed the
+whole daily vendor phase on every seed — `_run_vendor_phase` swallowed the ValueError, so
+`inv.dsd_deliveries`, its items and the DSD shelf restock were empty on every seed until
+someone counted rows (t_5a16106b). `tests/test_vendor_phase_dsd.py` pins the statement
+against the REAL `psycopg2.extras.execute_values`, because a stub that only records the
+rows cannot see this defect.
+
+**A swallowed phase exception is a data outage.** `_run_vendor_phase`'s `except` is
+deliberate (a tick must not die over the vendor paperwork) and must stay — but the
+counts it returns are what the caller logs, so returning the empty dict after a pass
+that wrote nothing is what made the outage invisible. Keep the log line; never
+replace the real counts with the fallback.
+
 ### Tick Lifecycle
 ```
 1. reload_config() — hot-reload config.yaml
