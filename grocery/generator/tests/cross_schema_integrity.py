@@ -965,6 +965,31 @@ ASSERTIONS: List[AssertionSpec] = [
               AND d.delivery_date < CURRENT_DATE
         """,
     ),
+    # ---- ONE REPLENISHMENT CHANNEL PER SKU (t_d59b551f) -------------------
+    # SEMA-16 asks whether a short-ship's `detected_source` matches the vendor's
+    # own `fulfillment_model` — an EVENT check, and it only goes red once the
+    # wrong-channel order has already reached a dock. This asks the upstream
+    # question, which is the one that prevents it: a store order may not exist
+    # for a SKU a DSD vendor delivers direct, because a vendor that both
+    # delivers direct AND has its SKUs supplied by our warehouse means the
+    # fill-rate and on-time marts attribute one vendor's failures to two
+    # channels, one of which it does not use.
+    AssertionSpec(
+        id="SEMA-30",
+        dimension="semantic_type",
+        title="a store order must never carry a SKU a DSD vendor delivers direct",
+        sql="""
+            SELECT soi.order_id, soi.product_id, s.fulfillment_model,
+                   so.order_dt::date AS order_date
+            FROM ordering.store_order_items soi
+            JOIN ordering.store_orders so ON so.order_id = soi.order_id
+            JOIN inv.products ip ON ip.product_id = soi.product_id
+            JOIN inv.suppliers s ON s.supplier_id = ip.supplier_id
+            WHERE s.fulfillment_model = 'dsd'
+              AND s.is_active
+              AND so.order_dt::date < CURRENT_DATE
+        """,
+    ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
     # The promo key resolves, but the promotion's validity window does not
     # cover the transaction date it was applied to. Fixed at the source by

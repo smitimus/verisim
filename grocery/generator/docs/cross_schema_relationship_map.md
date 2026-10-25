@@ -259,6 +259,32 @@ stockouts.
 | `SEMA-26` | a DSD delivery lands on a weekday its schedule actually visits |
 | `SEMA-27` | `inv.products.supplier_name` agrees with `inv.suppliers.supplier_name` — the denormalised display copy can never disagree with the row it came from |
 | `SEMA-29` | a DSD delivery's recorded `scheduled_window` is the window its schedule promised (a recorded window cannot contradict the schedule; NULL reads as "no window recorded") |
+| `SEMA-30` | a store order never carries a SKU a DSD vendor delivers direct — the upstream half of `SEMA-16`, checked before the goods reach a dock |
+
+**One shelf, ONE replenishment channel (t_d59b551f).** A SKU's shelf is restocked by
+exactly one channel, decided by its vendor's `fulfillment_model`: a `warehouse` vendor
+(and an unassigned SKU) through `ordering` → `fulfillment` → `transport` →
+`inv.receipts`, a `dsd` vendor through `suppliers.generate_dsd_deliveries`. So
+`ordering.check_and_create_orders` skips a DSD vendor's SKUs, and the vendor's own drop
+is their only replenishment — which is why the drop restocks the store's lines that are
+below their reorder point (`dsd_visit_quantity` sizes each line for the gap until the
+next visit, `7 / visits_per_week` days of measured demand) instead of a random 2–6 line
+slice of the catalogue.
+
+Before the split both channels fed the same shelf: a DSD vendor's perishables were
+ordered from our warehouse, rode one of our trucks, and a pick short at the dock was
+recorded `detected_source = 'receiving'` against a vendor whose own row says
+direct-store-delivery only. That is `SEMA-16` red on every fresh seed (20–37 rows), and
+a fill-rate/on-time mart attributing one vendor's failures to two channels, one of which
+it does not use. `SEMA-30` is the assertion that keeps the split honest, and
+`ordering.check_and_create_orders` is the only place it can be enforced because that is
+the only place a warehouse order is raised.
+
+Two data-lab consequences, both intentional: `ordering.store_order_items` no longer
+carries a DSD vendor's SKUs at all, and a DSD drop that finds nothing below its reorder
+point writes **no** `inv.dsd_deliveries` row (an empty delivery is what data-lab's
+`assert_dsd_delivery_reconciles_with_items` reports as an `empty_delivery` anomaly, so a
+visit with a full shelf is not a delivery).
 
 `HARD-29`..`HARD-39` cover the new foreign keys themselves, plus the one that is
 also a type check: a DSD delivery's supplier must actually be

@@ -66,6 +66,7 @@ from uuid import uuid4
 from psycopg2.extras import execute_values
 
 from config import Config
+from models import ordering
 
 log = logging.getLogger(__name__)
 
@@ -939,6 +940,35 @@ def open_pending_credit_memos(conn, cfg: Config, sim_dt: datetime,
 # Direct Store Delivery
 # ---------------------------------------------------------------------------
 
+def dsd_visit_quantity(reorder_qty: int, demand_per_day: Optional[float],
+                       visits_per_week: int, safety_pct: float,
+                       max_multiple: float) -> int:
+    """
+    How many units a DSD vendor brings for ONE shelf line on ONE visit.
+
+    Pure, so the sizing rule is testable without a database.
+
+    A DSD visit is the only replenishment its SKUs get (t_d59b551f), so the line
+    has to cover the shelf until the NEXT visit — `7 / visits_per_week` days of
+    measured demand — plus the configured safety fraction. Sizing it off one
+    day's demand, which is what the warehouse's daily order does, starves every
+    DSD shelf between visits: 4 visits a week means a 1.75-day gap, so a trader
+    bringing one day's worth runs the shelf dry the day after the drop.
+
+    The demand figure goes through `ordering.reorder_quantity`, so the clamp to
+    `max_multiple` × the seeded `reorder_qty` and the "no measured demand yet"
+    fallback to `reorder_qty` are the same rules the warehouse channel uses —
+    one sizing contract, two cadences.
+    """
+    visits = max(1, int(visits_per_week or 1))
+    # `reorder_qty` can arrive as a Decimal from a NUMERIC/INTEGER column.
+    seeded = int(reorder_qty or 0)
+    per_visit_demand = (float(demand_per_day) * (7.0 / visits)
+                        if demand_per_day else None)
+    return int(ordering.reorder_quantity(
+        seeded, per_visit_demand, safety_pct, max_multiple))
+
+
 def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
                             vendors: List[Dict], store_locations: List[Dict],
                             products: List[Dict], scenario=None
@@ -951,6 +981,16 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
     pallet on one of our `transport.loads`, no receiving dock, and deliberately
     no `inv.receipts` row. Modelling it as a receipt would double-count the
     goods once on our truck and once on the vendor's.
+
+    WHICH LINES (t_d59b551f). The drop covers THIS STORE'S shelf lines for this
+    vendor that are below their reorder point — the same trigger the warehouse
+    uses — because this is now the only channel that replenishes them
+    (`ordering.check_and_create_orders` skips a DSD vendor's SKUs). It used to
+    be a random 2-6 line slice of the vendor's whole catalogue, which was
+    survivable only while the warehouse was covering the same shelves every
+    night. A visit whose shelf is entirely above its reorder points carries
+    nothing, and writes no delivery row: an empty delivery is an anomaly to
+    data-lab (`assert_dsd_delivery_reconciles_with_items`), not a normal visit.
 
     It also runs the DSD half of the short-ship path: a line the vendor did not
     bring is found on the shelf (detected_source = 'dsd_delivery'), credited
@@ -975,6 +1015,7 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
     weekday = today.weekday()
     tag = getattr(scenario, 'scenario_tag', None) if scenario else None
     counts = {'deliveries': 0, 'lines': 0, 'short_lines': 0}
+    skipped = 0
 
     if not vendors or not store_locations or not products:
         return counts
@@ -993,20 +1034,63 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
     if not drops:
         return counts
 
-    # The SKUs each vendor owns. One read for the whole pass.
+    # WHAT THIS DROP IS FOR (t_d59b551f). `ordering.check_and_create_orders` no
+    # longer raises a store order for a DSD vendor's SKUs, so this pass is the
+    # ONLY replenishment those shelves get. It therefore has to restock what the
+    # shelf actually needs, not a random 2-6 line slice of the vendor's whole
+    # catalogue.
+    #
+    # Random slicing looked harmless while the warehouse was quietly covering
+    # the same SKUs every night: 90 DSD SKUs per store against 4 visits a week
+    # of ~4 lines each meant each shelf line was visited by its own vendor once
+    # every five weeks. That is not a replenishment channel, and once the
+    # warehouse stops covering for it, it is a permanent stockout. The trigger
+    # is the SAME one the warehouse uses (`quantity_on_hand < reorder_point`);
+    # only the cadence differs — a vendor visits `dsd_deliveries_per_week`
+    # times, a truck was ordered every night — which is why the line size is
+    # scaled by the gap between visits in `dsd_visit_quantity`.
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT ip.product_id::text, ip.supplier_id::text, ip.unit_of_measure,
-                   p.cost
-            FROM inv.products ip
-            JOIN pos.products p ON p.product_id = ip.product_id
-            WHERE ip.supplier_id IS NOT NULL
+            SELECT sl.location_id::text, ip.product_id::text,
+                   ip.supplier_id::text, ip.reorder_qty, p.cost
+            FROM inv.stock_levels sl
+            JOIN inv.products ip ON ip.product_id = sl.product_id
+            JOIN pos.products p ON p.product_id = sl.product_id
+            JOIN inv.suppliers s ON s.supplier_id = ip.supplier_id
+            WHERE s.fulfillment_model = 'dsd'
+              AND sl.quantity_on_hand < ip.reorder_point
         """)
-        catalogue = cur.fetchall()
-    by_supplier: Dict[str, List[Tuple[str, str, float]]] = {}
-    for product_id, supplier_id, _uom, cost in catalogue:
-        by_supplier.setdefault(str(supplier_id), []).append(
-            (str(product_id), str(supplier_id), float(cost)))
+        shelf = cur.fetchall()
+
+    # One read for the whole pass, keyed by the shelf the drop serves.
+    by_shelf: Dict[Tuple[str, str], List[Tuple[str, str, int, float]]] = {}
+    for location_id, product_id, supplier_id, reorder_qty, cost in shelf:
+        by_shelf.setdefault((str(location_id), str(supplier_id)), []).append(
+            (str(product_id), str(supplier_id), int(reorder_qty), float(cost)))
+
+    # How often each (vendor, store) is actually visited, from the schedules
+    # themselves rather than the config: the cadence the drop is sized for must
+    # be the cadence the schedule keeps, or a config change silently restocks
+    # too little for the gap it just widened.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT supplier_id::text, location_id::text, COUNT(*)::int
+            FROM inv.supplier_delivery_schedules
+            WHERE is_active
+            GROUP BY 1, 2
+        """)
+        visits = {(supplier_id, location_id): int(per_week)
+                  for supplier_id, location_id, per_week in cur.fetchall()}
+
+    # Demand is measured the same way the warehouse sizes its orders
+    # (`ordering.expected_daily_demand`), from COMPLETED days only.
+    inventory_cfg = getattr(cfg, 'inventory', None)
+    window_days = int(getattr(inventory_cfg, 'reorder_demand_window_days', 1) or 1)
+    safety_pct = float(getattr(inventory_cfg, 'restock_threshold_pct', 0.25) or 0.0)
+    max_multiple = float(
+        getattr(inventory_cfg, 'reorder_qty_max_multiple', 4.0) or 4.0)
+    demand = ordering.expected_daily_demand(
+        conn, window_days, today - timedelta(days=1))
 
     vendor_by_id = {str(v['supplier_id']): v for v in vendors}
     already = set()
@@ -1025,15 +1109,20 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
         vendor = vendor_by_id.get(str(supplier_id))
         if not vendor:
             continue
-        catalogue_lines = by_supplier.get(str(supplier_id))
-        if not catalogue_lines:
+        shelf_lines = by_shelf.get((str(location_id), str(supplier_id)))
+        if not shelf_lines:
+            # Nothing on this vendor's shelf is below its reorder point: the
+            # truck has nothing to bring, and a delivery with no lines is not a
+            # delivery. `inv.dsd_deliveries` is read by data-lab's
+            # `assert_dsd_delivery_reconciles_with_items`, which fails an
+            # 'empty_delivery' as the anomaly it is — so a visit that carried
+            # nothing is not recorded at all. In steady state this only happens
+            # at the start of a fresh seed, where every shelf begins at
+            # `initial_stock_per_product`.
+            skipped += 1
             continue
 
-        # A drop is a top-up, not a full catalogue: a handful of lines the
-        # vendor actually brings on this run.
-        wanted = min(len(catalogue_lines),
-                     random.randint(2, 6))
-        chosen = random.sample(catalogue_lines, wanted)
+        per_week = visits.get((str(supplier_id), str(location_id)), 1)
 
         delivery_id = str(uuid4())
         delivered_hour = random.choice([5, 6, 7, 8, 9])
@@ -1053,13 +1142,15 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
         short_rows = []
         total_units = 0.0
         total_value = 0.0
-        for product_id, supplier_id_ref, cost in chosen:
+        for product_id, supplier_id_ref, reorder_qty, cost in shelf_lines:
             unit_cost = round(cost, 4)
             # What the vendor's drop sheet SAYS it is bringing, then what it
             # actually brought. A short line arrives with anything from nothing
             # to all-but-one unit, so a missed line (picked = 0) and a partial
             # one are the same arithmetic rather than two branches.
-            promised_qty = float(random.randint(6, 48))
+            promised_qty = float(dsd_visit_quantity(
+                reorder_qty, demand.get((str(location_id), str(product_id))),
+                per_week, safety_pct, max_multiple))
             if random.random() < short_rate:
                 picked_qty = float(random.randint(0, int(promised_qty) - 1))
             else:
@@ -1086,18 +1177,22 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
                 })
 
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO inv.dsd_deliveries
-                    (dsd_delivery_id, schedule_id, supplier_id, location_id,
-                     delivery_date, delivered_at, scheduled_window, total_units,
-                     total_value, line_count)
-                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date,
-                        %s, %s::time, %s, %s, %s)
-            """, (delivery_id, schedule_id, supplier_id, location_id, today,
-                  delivered_at, window_start, round(total_units, 3),
-                  round(total_value, 2), len(delivery_items)))
-
+            # A drop whose every line was missed arrives with nothing, and an
+            # empty delivery row is a data-lab test failure ('empty_delivery'),
+            # not a record of a visit. The miss still lands below, as short-ship
+            # events, which is where a vendor's missed drop belongs.
             if delivery_items:
+                cur.execute("""
+                    INSERT INTO inv.dsd_deliveries
+                        (dsd_delivery_id, schedule_id, supplier_id, location_id,
+                         delivery_date, delivered_at, scheduled_window, total_units,
+                         total_value, line_count)
+                    VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::date,
+                            %s, %s::time, %s, %s, %s)
+                """, (delivery_id, schedule_id, supplier_id, location_id, today,
+                      delivered_at, window_start, round(total_units, 3),
+                      round(total_value, 2), len(delivery_items)))
+
                 execute_values(cur, """
                     INSERT INTO inv.dsd_delivery_items
                         (dsd_delivery_id, product_id, quantity_delivered,
@@ -1105,30 +1200,30 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
                     VALUES %s
                 """, delivery_items, template=DSD_ITEM_ROW_TEMPLATE)
 
-            # Stock the shelf for what actually arrived. A DSD line has no
-            # load_id and no receipt, so this is where a DSD restock happens.
-            #
-            # The location travels INSIDE the row, not as a second `%s` in the
-            # statement: `execute_values` substitutes the `(VALUES %s)` slot
-            # itself, and psycopg2's `_split_sql` refuses any statement that
-            # carries another placeholder (t_5a16106b — the daily vendor phase
-            # raised on every simulated day and was swallowed by its caller, so
-            # inv.dsd_deliveries was empty on every seed). Same shape as
-            # `returns.restock_returns`.
-            if total_units > 0:
-                execute_values(cur, """
-                    UPDATE inv.stock_levels sl
-                    SET quantity_on_hand = sl.quantity_on_hand + v.qty,
-                        last_updated = NOW()
-                    FROM (VALUES %s) AS v(product_id, qty, location_id)
-                    WHERE sl.product_id = v.product_id::uuid
-                      AND sl.location_id = v.location_id::uuid
-                """, [(item[1], item[2], location_id) for item in delivery_items
-                      if item[2] > 0],
-                    template="(%s::uuid,%s::numeric,%s::uuid)")
+                # Stock the shelf for what actually arrived. A DSD line has no
+                # load_id and no receipt, so this is where a DSD restock happens.
+                #
+                # The location travels INSIDE the row, not as a second `%s` in the
+                # statement: `execute_values` substitutes the `(VALUES %s)` slot
+                # itself, and psycopg2's `_split_sql` refuses any statement that
+                # carries another placeholder (t_5a16106b — the daily vendor phase
+                # raised on every simulated day and was swallowed by its caller, so
+                # inv.dsd_deliveries was empty on every seed). Same shape as
+                # `returns.restock_returns`.
+                if total_units > 0:
+                    execute_values(cur, """
+                        UPDATE inv.stock_levels sl
+                        SET quantity_on_hand = sl.quantity_on_hand + v.qty,
+                            last_updated = NOW()
+                        FROM (VALUES %s) AS v(product_id, qty, location_id)
+                        WHERE sl.product_id = v.product_id::uuid
+                          AND sl.location_id = v.location_id::uuid
+                    """, [(item[1], item[2], location_id) for item in delivery_items
+                          if item[2] > 0],
+                        template="(%s::uuid,%s::numeric,%s::uuid)")
 
-        counts['deliveries'] += 1
-        counts['lines'] += len(delivery_items)
+                counts['deliveries'] += 1
+                counts['lines'] += len(delivery_items)
 
         # 2) The DSD short-ship path.
         #
@@ -1174,6 +1269,9 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
     if counts['deliveries']:
         log.info("DSD: %d drop(s), %d line(s), %d short line(s) recorded",
                  counts['deliveries'], counts['lines'], counts['short_lines'])
+    if skipped:
+        log.info("DSD: %d scheduled visit(s) had nothing below its reorder "
+                 "point — no delivery recorded", skipped)
     return counts
 
 

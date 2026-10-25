@@ -202,6 +202,9 @@ TABLE_OR_COLUMN_OPTIONAL = {
     # SEMA-29 reads inv.dsd_deliveries for the window it records against
     # inv.supplier_delivery_schedules' promised window.
     "SEMA-29": ("inv", "dsd_deliveries", None),
+    # SEMA-30 reads inv.suppliers to decide which channel owns a SKU — a data
+    # dir predating the vendor layer has no vendor rows to check against.
+    "SEMA-30": ("inv", "suppliers", None),
 }
 
 _OPTIONAL_ASSERTION_IDS = frozenset(TABLE_OR_COLUMN_OPTIONAL)

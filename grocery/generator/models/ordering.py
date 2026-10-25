@@ -5,6 +5,10 @@ when inventory falls below reorder thresholds.
 Flow:
   1. check_and_create_orders() — called once per simulated day:
      - Finds store/product combos below reorder_point in inv.stock_levels
+     - SKIPS the SKUs of a DSD vendor: those shelves are restocked by the
+       vendor's own truck (suppliers.generate_dsd_deliveries), so ordering them
+       from our warehouse would give one shelf two channels and record a DSD
+       vendor's shortfall as a receiving one (t_d59b551f, SEMA-16/SEMA-30)
      - Sizes the order off MEASURED demand (inv.sku_demand_daily) rather than
        the seeded reorder_qty alone
      - Creates ordering.store_orders + store_order_items
@@ -130,14 +134,31 @@ def check_and_create_orders(
     as_of = sim_dt.date() - timedelta(days=1)
 
     with conn.cursor() as cur:
+        # ONE CHANNEL PER SKU (t_d59b551f). A DSD vendor restocks the shelf with
+        # its own truck (`suppliers.generate_dsd_deliveries`), so its SKUs must
+        # not ALSO be ordered from our warehouse: two channels feeding one
+        # shelf meant a DSD vendor's perishables rode one of our trucks and a
+        # pick short at our dock was recorded `detected_source = 'receiving'`
+        # against a vendor whose own row says direct-store-delivery only. That
+        # is 20-37 rows on a fresh seed, and it is the reason SEMA-16 was red
+        # the first time it ever ran against populated vendor tables.
+        #
+        # A channel that owns the shelf owns the shortfall on it, so the split
+        # is decided once, here, from the vendor's own `fulfillment_model`.
+        # LEFT JOIN, not JOIN: a product with no vendor is still ours to order,
+        # and `is_active` is the one exception — a deactivated DSD vendor's
+        # shelves fall back to the warehouse rather than starving.
         cur.execute("""
             SELECT sl.location_id, sl.product_id, sl.quantity_on_hand,
                    ip.reorder_point, ip.reorder_qty
             FROM inv.stock_levels sl
             JOIN inv.products ip ON ip.product_id = sl.product_id
             JOIN hr.locations l ON l.location_id = sl.location_id
+            LEFT JOIN inv.suppliers sup ON sup.supplier_id = ip.supplier_id
             WHERE l.location_type = 'store'
               AND sl.quantity_on_hand < ip.reorder_point
+              AND NOT (COALESCE(sup.fulfillment_model, 'warehouse') = 'dsd'
+                       AND sup.is_active)
         """)
         low_stock = cur.fetchall()
 

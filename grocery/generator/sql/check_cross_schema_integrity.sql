@@ -577,6 +577,28 @@ SELECT d.dsd_delivery_id, d.scheduled_window,
               AND d.scheduled_window IS DISTINCT FROM ds.delivery_window_start
               AND d.delivery_date < CURRENT_DATE;
 
+-- [SEMA-30] a store order must never carry a SKU a DSD vendor delivers direct
+-- One shelf, ONE replenishment channel (t_d59b551f). A DSD vendor restocks the
+-- shelf with its own truck, so `ordering.check_and_create_orders` no longer
+-- raises a store order for its SKUs. Before the split, a DSD vendor's
+-- perishables were ordered from our warehouse, rode one of our trucks, and a
+-- pick short at the dock was recorded `detected_source = 'receiving'` against a
+-- vendor that delivers direct — which is SEMA-16 red on a fresh seed (20-37
+-- rows), and a vendor-performance mart attributing one vendor's failures to two
+-- channels, one of which it does not use.
+--
+-- SEMA-16 asks whether the EVENT's source matches the vendor's model; this asks
+-- the upstream question, so the defect is caught before anything reaches a dock.
+SELECT soi.order_id, soi.product_id, s.fulfillment_model,
+                   so.order_dt::date AS order_date
+            FROM ordering.store_order_items soi
+            JOIN ordering.store_orders so ON so.order_id = soi.order_id
+            JOIN inv.products ip ON ip.product_id = soi.product_id
+            JOIN inv.suppliers s ON s.supplier_id = ip.supplier_id
+            WHERE s.fulfillment_model = 'dsd'
+              AND s.is_active
+              AND so.order_dt::date < CURRENT_DATE;
+
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
 -- --------------------------------------------------------------------------

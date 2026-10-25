@@ -56,6 +56,11 @@ SCHEDULE = '22222222-0000-0000-0000-000000000002'
 # delivery_window_start`. The drop must carry it (kanban t_120b25b0).
 WINDOW_START = time(6, 0)
 
+# Distinguishes "the caller did not pass this" from "the caller passed an empty
+# list/dict", which is the difference between the default shelf and a vendor
+# whose shelf has nothing below its reorder point.
+_UNSET = object()
+
 CATALOGUE = [
     ('aaaaaaaa-0000-0000-0000-00000000000%d' % i, SUPPLIER, 'EA', 1.25 + i)
     for i in range(1, 5)
@@ -121,13 +126,27 @@ class _RecordingCursor:
 
 
 class _FakeDB:
-    """A grocery DB holding nothing but the DSD vendor's own rows."""
+    """A grocery DB holding nothing but the DSD vendor's own rows.
 
-    def __init__(self, already=()):
+    `shelf` is what the drop pass reads from `inv.stock_levels`: the store's
+    lines for that vendor that are BELOW their reorder point (the query does the
+    filtering; these are its results). Defaults to all four catalogue SKUs on the
+    test store, so a test that does not care about coverage still ships lines.
+    """
+
+    def __init__(self, already=(), shelf=_UNSET, demand=None, visits=_UNSET):
         self.writes = []          # (statement, params) as `execute` saw them
         self.batches = []         # (sql, rows, template) as execute_values saw them
         self.already = set(already)
         self.commits = 0
+        if shelf is _UNSET:
+            shelf = [(STORE, product[0], SUPPLIER, 120, product[3])
+                     for product in CATALOGUE]
+        self.shelf = list(shelf)
+        # {(location_id, product_id): units_per_day}
+        self.demand = dict(demand or {})
+        # {(supplier_id, location_id): visits_per_week}
+        self.visits = ({(SUPPLIER, STORE): 4} if visits is _UNSET else dict(visits))
 
     def cursor(self, *args, **kwargs):
         return _RecordingCursor(self)
@@ -141,12 +160,21 @@ class _FakeDB:
     def answer(self, flat):
         lowered = flat.lower()
         if 'from inv.supplier_delivery_schedules' in lowered:
-            return [(SCHEDULE, SUPPLIER, STORE, 'dsd', 'FreshFields Produce',
-                     WINDOW_START)]
-        if 'from inv.products ip' in lowered:
-            return list(CATALOGUE)
+            if 'delivery_weekday' in lowered:
+                return [(SCHEDULE, SUPPLIER, STORE, 'dsd', 'FreshFields Produce',
+                         WINDOW_START)]
+            # The visits-per-week read (GROUP BY supplier, location).
+            return [(supplier, location, per_week)
+                    for (supplier, location), per_week in self.visits.items()]
+        if 'from inv.stock_levels sl' in lowered:
+            return list(self.shelf)
+        if 'from inv.sku_demand_daily' in lowered:
+            return [(location, product, units)
+                    for (location, product), units in self.demand.items()]
         if 'from inv.dsd_deliveries d' in lowered:
             return [(schedule_id,) for schedule_id in self.already]
+        if 'from inv.products ip' in lowered:
+            return list(CATALOGUE)
         return []
 
     # -- helpers ---------------------------------------------------------
@@ -175,11 +203,19 @@ def recording_execute_values(monkeypatch):
     return _spy
 
 
-def _run(db, sim_dt=SIM_DT, cfg=None):
+def _run(db, sim_dt=SIM_DT, cfg=None, vendor=None):
     random.seed(20261019)
     return suppliers.generate_dsd_deliveries(
-        db, cfg or Config(), sim_dt, [_vendor()], [{'location_id': STORE}],
+        db, cfg or Config(), sim_dt, [vendor or _vendor()], [{'location_id': STORE}],
         [{'product_id': product[0]} for product in CATALOGUE])
+
+
+def _vendor_without_shorts():
+    """A vendor that always brings the whole line — so a test about WHAT was
+    shipped is not also a coin flip on what `short_probability_for` drew."""
+    vendor = _vendor()
+    vendor['short_ship_rate'] = 0.0
+    return vendor
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +517,105 @@ def test_a_fully_missed_line_writes_no_delivery_item(recording_execute_values):
     assert params[7] == pytest.approx(sum(row[2] for row in item_rows)), (
         'total_units must be the sum of the units that actually arrived')
     assert params[9] == len(item_rows)
+
+
+# ---------------------------------------------------------------------------
+# The drop is a REPLENISHMENT, not a random slice — t_d59b551f
+#
+# `ordering.check_and_create_orders` no longer raises a store order for a DSD
+# vendor's SKUs, so the vendor's own truck is the only channel that restocks
+# them. The pass used to ship `random.sample(catalogue, randint(2, 6))` lines:
+# 90 DSD SKUs per store against 4 visits a week of ~4 lines each, i.e. each
+# shelf line was visited by its own vendor roughly once every five weeks. That
+# was survivable only because the warehouse was covering the same shelves every
+# night, and it is a permanent stockout the moment it stops.
+# ---------------------------------------------------------------------------
+def test_a_drop_ships_the_shelf_lines_that_are_actually_low(
+        recording_execute_values):
+    """The lines come from `inv.stock_levels` for THIS store and vendor, and
+    the trigger is the warehouse's own (`quantity_on_hand < reorder_point`)."""
+    below = CATALOGUE[0][0]
+    other_store_product = CATALOGUE[1][0]
+    other_vendor_product = CATALOGUE[2][0]
+    db = _FakeDB(shelf=[
+        (STORE, below, SUPPLIER, 120, 2.5),
+        (OTHER_STORE, other_store_product, SUPPLIER, 120, 3.5),
+        (STORE, other_vendor_product,
+         '11111111-0000-0000-0000-000000000009', 120, 4.5),
+    ])
+    _run(db, vendor=_vendor_without_shorts())
+
+    items = db.batch_for('INSERT INTO inv.dsd_delivery_items')
+    assert items is not None
+    shipped = {row[1] for row in items[1]}
+    assert shipped == {below}, (
+        'a drop must ship exactly the low shelf lines it owns; got %r'
+        % (shipped,))
+
+    shelf_query = db.statements_containing('FROM inv.stock_levels sl')
+    assert shelf_query, 'the drop pass never read the shelf'
+    sql = shelf_query[0]
+    assert 'quantity_on_hand < ip.reorder_point' in sql, (
+        'the drop must restock what is BELOW the reorder point, the same '
+        'trigger the warehouse uses:\n%s' % sql)
+    assert "fulfillment_model = 'dsd'" in sql, (
+        'only a DSD vendor restocks at the shelf:\n%s' % sql)
+
+
+def test_a_visit_with_nothing_low_writes_no_delivery(
+        recording_execute_values):
+    """A full shelf means the truck brings nothing — and nothing is recorded.
+
+    An empty `inv.dsd_deliveries` row is what data-lab's
+    `assert_dsd_delivery_reconciles_with_items` reports as an 'empty_delivery'
+    anomaly, so a visit that carried no goods must not write one. This is the
+    first days of a fresh seed: every shelf starts at
+    `initial_stock_per_product`, above every reorder point.
+    """
+    db = _FakeDB(shelf=[])
+    counts = _run(db)
+
+    assert counts == {'deliveries': 0, 'lines': 0, 'short_lines': 0}
+    assert db.statements_containing('INSERT INTO inv.dsd_deliveries') == []
+    assert db.batch_for('INSERT INTO inv.dsd_delivery_items') is None
+    assert db.batch_for('UPDATE inv.stock_levels') is None
+    assert _short_inserts(db) == []
+
+
+def test_a_visit_line_covers_the_days_until_the_next_visit(
+        recording_execute_values):
+    """The line is sized for the GAP between visits, from measured demand.
+
+    A daily-order quantity on a 4-visits-a-week schedule runs the shelf dry the
+    day after the drop — the same starvation the warehouse was hiding.
+    """
+    product = CATALOGUE[0][0]
+    demand_per_day = 40.0
+    db = _FakeDB(shelf=[(STORE, product, SUPPLIER, 120, 2.5)],
+                 demand={(STORE, product): demand_per_day},
+                 visits={(SUPPLIER, STORE): 4})
+    _run(db, vendor=_vendor_without_shorts())
+
+    items = db.batch_for('INSERT INTO inv.dsd_delivery_items')
+    promised = items[1][0][2]
+    # 7/4 days of cover at 40/day, plus the default 25% safety fraction
+    # (rounded, exactly as `ordering.reorder_quantity` rounds every line).
+    expected = round(demand_per_day * (7.0 / 4) * (1 + 0.25))
+    assert promised == expected, (
+        'a 4-visits-a-week vendor must bring 1.75 days of demand, not one; '
+        'brought %r, expected %r' % (promised, expected))
+
+
+def test_dsd_visit_quantity_is_pure_and_clamped():
+    """The sizing rule, without a database — one contract with the warehouse."""
+    # No measured demand yet (first day of a backfill): the seeded quantity.
+    assert suppliers.dsd_visit_quantity(150, None, 4, 0.25, 4.0) == 150
+    # 1.75 days of 100/day, no safety.
+    assert suppliers.dsd_visit_quantity(150, 100.0, 4, 0.0, 100.0) == 175
+    # A daily visit is the warehouse's own cadence: one day of cover.
+    assert suppliers.dsd_visit_quantity(150, 100.0, 7, 0.0, 100.0) == 100
+    # Clamped to max_multiple x the seeded quantity, like every other line.
+    assert suppliers.dsd_visit_quantity(150, 10_000.0, 4, 0.25, 4.0) == 600
+    # A defensive floor on the visit count: 0 must not divide by zero (it is
+    # read as one visit a week, the longest gap the sizing rule covers).
+    assert suppliers.dsd_visit_quantity(150, 100.0, 0, 0.0, 100.0) == 700
