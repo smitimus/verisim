@@ -559,12 +559,40 @@ def test_a_claim_the_vendor_always_pays_carries_no_rejection_text():
 
 def test_every_disputable_reason_carries_why():
     """A rejected claim with a NULL reason is useless to the analyst deciding
-    whether to escalate — the text is the only explanation they get."""
-    for reason, (_pay, rejection) in suppliers.REASON_PAY_PROFILE.items():
-        if rejection is None:
-            continue
-        assert rejection.strip(), \
-            f"{reason} can be disputed but carries no rejection reason"
+    whether to escalate — the text is the only explanation they get.
+
+    The invariant is stated over the DISPUTE probability, not over "someone
+    happened to type a string": `pay_rate` is the share of claims the vendor
+    pays, so every profile below 1.0 can reject and must carry the text. The
+    guard used to `continue` on `rejection is None`, which skipped exactly the
+    three profiles that were rejecting with NULL — half of every rejection on a
+    30-day seed (t_ec78f608).
+    """
+    for reason, (pay_rate, rejection) in suppliers.REASON_PAY_PROFILE.items():
+        if pay_rate >= 1.0:
+            continue  # never disputed; nothing to explain
+        assert rejection and rejection.strip(), (
+            f"{reason} rejects {100 * (1 - pay_rate):.0f}% of its claims but "
+            f"carries no rejection reason ({rejection!r}) — the row would be "
+            f"rejected with a NULL `rejection_reason`")
+
+
+def test_the_reason_pay_profile_guard_has_teeth():
+    """The import-time guard is what stops a NULL reason reaching a row; a guard
+    nobody has watched fail is a guard that does not work. Both directions: a
+    disputable profile with no text, and an always-paid one carrying text."""
+    broken = {
+        'warehouse_shortage': (0.92, None),
+        'quality_reject': (0.30, 'Goods rejected at our dock — claim denied'),
+    }
+    with pytest.raises(ValueError, match='warehouse_shortage'):
+        suppliers._validate_reason_pay_profile(broken)
+
+    contradiction = {
+        'always_paid': (1.0, 'Delivery window missed — claim disputed'),
+    }
+    with pytest.raises(ValueError, match='always_paid'):
+        suppliers._validate_reason_pay_profile(contradiction)
 
 
 # ---------------------------------------------------------------------------

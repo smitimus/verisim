@@ -260,6 +260,27 @@ stockouts.
 | `SEMA-27` | `inv.products.supplier_name` agrees with `inv.suppliers.supplier_name` — the denormalised display copy can never disagree with the row it came from |
 | `SEMA-29` | a DSD delivery's recorded `scheduled_window` is the window its schedule promised (a recorded window cannot contradict the schedule; NULL reads as "no window recorded") |
 | `SEMA-30` | a store order never carries a SKU a DSD vendor delivers direct — the upstream half of `SEMA-16`, checked before the goods reach a dock |
+| `SEMA-31` | a rejected claim carries the text explaining why the vendor disputed it — `rejection_reason` is the only explanation the analyst deciding whether to escalate ever gets |
+
+**A rejection must say why (t_ec78f608).** `REASON_PAY_PROFILE` pairs each
+`short_reason` with `(pay_probability, rejection_text)`, and
+`advance_credit_memos` writes that second element straight into
+`rejection_reason` on the reject branch. Three of the five profiles carried
+`None` — `warehouse_shortage`, `out_of_stock`, `weather_carrier_delay` — so 8%,
+12% and 30% of those claims rejected with a NULL explanation: 60 of 119
+rejections on the CT107 reseed, and data-lab's
+`assert_credit_memo_timeline_is_coherent` counted every one. The pairing is now
+enforced at three levels, because each catches what the others cannot:
+`suppliers._validate_reason_pay_profile` at import (a disputable profile with no
+text stops the generator from starting, rather than writing NULL at midnight),
+`credit_rejected_requires_reason` in `schema.sql` on the row (blank text is as
+useless as NULL), and `SEMA-31` across a seed. The reverse pairing is a rule
+too: an always-paid profile must NOT carry the text, or the row reads as both
+paid and disputed next to `memo_status` in an aging mart.
+`grocery/standalone/migrations/002_credit_memo_rejection_reason.sql` repairs the
+rows already written that way — derived from each row's own `short_reason`, a
+closed set — before it adds the CHECK, so an existing data dir converges on one
+boot instead of crash-looping on a constraint it cannot satisfy.
 
 **One shelf, ONE replenishment channel (t_d59b551f).** A SKU's shelf is restocked by
 exactly one channel, decided by its vendor's `fulfillment_model`: a `warehouse` vendor

@@ -492,3 +492,37 @@ def test_the_vendor_phase_resolves_what_it_opens_once_the_clock_advances():
     counts = suppliers.advance_credit_memos(
         later, Config(), datetime(2026, 11, 3, 23, 30))
     assert counts['paid'] + counts['rejected'] == 1
+
+
+@pytest.mark.parametrize('reason', sorted(suppliers.REASON_PAY_PROFILE))
+def test_a_rejection_always_writes_the_profiles_reason_text(reason):
+    """The reject branch has exactly one writer, and what it writes is
+    `REASON_PAY_PROFILE[reason][1]`.
+
+    The dispute is a coin toss, so the profile has to be sampled until the
+    vendor actually says no — and only the three profiles that were
+    `(pay_rate, None)` ever produced a NULL `rejection_reason`, on 8%, 12% and
+    30% of their claims, which is why 60 of 119 rejections on a 30-day seed had
+    nothing to explain them (t_ec78f608). Parametrised over the whole profile so
+    a new reason cannot be added without text.
+    """
+    text = suppliers.REASON_PAY_PROFILE[reason][1]
+    aware_submitted = datetime(2026, 10, 18, 23, 30, tzinfo=timezone.utc)
+
+    for _ in range(600):
+        db = _MemoDB(submitted=[('memo-1', reason, aware_submitted, 0, 0)])
+        counts = suppliers.advance_credit_memos(
+            db, Config(), datetime(2026, 10, 25, 23, 30))
+        if not counts['rejected']:
+            continue
+        writes = [params for sql, params in db.statements
+                  if "memo_status = 'rejected'" in sql]
+        assert len(writes) == 1, writes
+        # (sim_dt, resolved_by, rejection_reason, memo_id)
+        assert writes[0][2] == text, (
+            f'{reason} was rejected with {writes[0][2]!r}, not the profile text')
+        assert text and text.strip()
+        return
+
+    pytest.fail(f'{reason} never disputed in 600 draws — the sample cannot show '
+                f'what its reject branch writes')

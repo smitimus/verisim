@@ -96,14 +96,50 @@ SHORT_REASONS = [
 
 # How a vendor answers a claim. Keyed to the reason: our own quality rejection
 # is rarely credited, the vendor's own stock-out usually is.
+#
+# The second element is the text the vendor gives when it DISPUTES the claim,
+# and it is not decoration: `rejection_reason` is the only explanation the
+# analyst deciding whether to escalate ever gets. So the pairing is a rule, not
+# a habit — a profile that can reject (pay_rate < 1.0) must carry the text, and
+# one that is always paid must not (a paid row carrying a rejection reason reads
+# as both paid and disputed). Three of these five used to reject with NULL,
+# which was half of every rejection on a 30-day seed (t_ec78f608).
+#
+# Enforced in three places on purpose: `_validate_reason_pay_profile` at import
+# (the generator will not start with a broken profile), `schema.sql`'s
+# `credit_rejected_requires_reason` at the row, and SEMA-31 across a seed.
 # (reason -> (pay probability, rejection reason or None))
 REASON_PAY_PROFILE = {
-    'warehouse_shortage': (0.92, None),
-    'out_of_stock': (0.88, None),
-    'weather_carrier_delay': (0.70, None),
-    'delivery_missed': (0.55, 'Delivery window missed — claim disputed'),
-    'quality_reject': (0.30, 'Goods rejected at our dock — claim denied'),
+    'warehouse_shortage':    (0.92, "Vendor's own warehouse shortage — claim disputed"),
+    'out_of_stock':          (0.88, 'Vendor could not restock — claim disputed'),
+    'weather_carrier_delay': (0.70, 'Weather / carrier delay — claim disputed'),
+    'delivery_missed':       (0.55, 'Delivery window missed — claim disputed'),
+    'quality_reject':        (0.30, 'Goods rejected at our dock — claim denied'),
 }
+
+
+def _validate_reason_pay_profile(profile=None):
+    """A profile that can reject must say why; one that is always paid must not.
+
+    Run at import because the alternative is a NULL `rejection_reason` on the
+    first dispute after a bad edit — by then the generator is up, the tick has
+    written the row, and the only thing that notices is a mart nobody is
+    reading yet (t_ec78f608). A profile whose pay rate is 1.0 has nothing to
+    explain, so carrying text there is the opposite mistake and equally caught:
+    `rejection_reason` sits next to `memo_status` in an aging mart.
+    """
+    for reason, (pay_rate, rejection) in (profile or REASON_PAY_PROFILE).items():
+        if pay_rate < 1.0 and not (rejection or '').strip():
+            raise ValueError(
+                f'{reason} rejects {100 * (1 - pay_rate):.0f}% of its claims '
+                f'but carries no rejection reason ({rejection!r})')
+        if pay_rate >= 1.0 and rejection is not None:
+            raise ValueError(
+                f'{reason} is always paid but carries the rejection text '
+                f'{rejection!r}')
+
+
+_validate_reason_pay_profile()
 
 # Resolved by whom, for the paid / rejected pair.
 RESOLVER_VENDOR = 'vendor'

@@ -652,6 +652,13 @@ def _open_memo(sandbox, seeded, **overrides):
         'deadline': overrides.get('deadline', 'CURRENT_DATE + 14'),
         'submitted': overrides.get('submitted', 'NULL'),
         'resolved': overrides.get('resolved', 'NULL'),
+        # An inlined SQL expression like the timestamps above (this file writes
+        # its own literals). A `rejected` row must carry one — the CHECK says so
+        # — so the default follows the status rather than leaving every
+        # rejection test failing for the wrong reason.
+        'rejection': overrides.get(
+            'rejection',
+            "'Claim disputed'" if overrides.get('status') == 'rejected' else 'NULL'),
     }
 
 
@@ -659,22 +666,23 @@ def _memo_sql(sandbox, p, with_resolved=True):
     """
     The memo INSERT.
 
-    `claim_deadline`, `submitted_dt` and `resolved_dt` are inlined SQL
-    expressions rather than bound parameters, because the tests need to say
-    "NOW() - INTERVAL '30 days'" and a parameter would be cast as a literal
-    string (`'CURRENT_DATE + 14'::date` is not a date). Every value here is
-    test-written, never user input.
+    `claim_deadline`, `submitted_dt`, `resolved_dt` and `rejection_reason` are
+    inlined SQL expressions rather than bound parameters, because the tests need
+    to say "NOW() - INTERVAL '30 days'" and a parameter would be cast as a
+    literal string (`'CURRENT_DATE + 14'::date` is not a date). Every value here
+    is test-written, never user input.
     """
     cols = ['credit_memo_number', 'short_ship_id', 'supplier_id', 'product_id',
             'location_id', 'credit_quantity', 'unit_cost', 'credit_amount',
-            'short_reason', 'memo_status', 'claim_deadline', 'submitted_dt']
+            'short_reason', 'memo_status', 'claim_deadline', 'submitted_dt',
+            'rejection_reason']
     if with_resolved:
         cols.append('resolved_dt')
     return (f"INSERT INTO inv.supplier_credit_memos "
             f"({', '.join(cols)}) VALUES (%(memo)s, %(ship)s::uuid, "
             f"%(supplier)s::uuid, %(product)s::uuid, %(store)s::uuid, "
             f"%(quantity)s, 4.0, 80.00, %(reason)s::varchar, %(status)s, "
-            f"{p['deadline']}, {p['submitted']}"
+            f"{p['deadline']}, {p['submitted']}, {p['rejection']}"
             + (f", {p['resolved']}" if with_resolved else "")
             + ")")
 
@@ -733,6 +741,45 @@ def test_a_paid_claim_with_both_timestamps_is_accepted(sandbox, seeded):
                    resolved='NOW()', deadline='CURRENT_DATE + 14')
     ok, detail = accepts(conn, _memo_sql(sandbox, p), p)
     assert ok, detail
+
+
+def test_a_rejected_claim_without_a_reason_is_refused(sandbox, seeded):
+    """A rejected claim is the ONLY place `rejection_reason` gets written, and
+    the text is the only explanation the analyst deciding whether to escalate
+    ever gets. Half of every rejection on a 30-day seed carried NULL until the
+    CHECK existed (t_ec78f608)."""
+    conn = sandbox_conn(sandbox)
+    p = _open_memo(sandbox, seeded, status='rejected',
+                   submitted='NOW() - INTERVAL \'5 days\'',
+                   resolved='NOW()', rejection='NULL')
+    refused, detail = rejects(conn, _memo_sql(sandbox, p), p)
+    assert refused, ('a rejected claim with no rejection_reason was accepted — '
+                     'the mart carries a dispute it cannot explain')
+    assert 'check constraint' in detail, detail
+
+
+def test_a_rejected_claim_that_says_why_is_accepted(sandbox, seeded):
+    """The positive half: the constraint must not make a well-formed rejection
+    impossible to write, which is how a CHECK silently stops a phase."""
+    conn = sandbox_conn(sandbox)
+    p = _open_memo(sandbox, seeded, status='rejected',
+                   submitted='NOW() - INTERVAL \'5 days\'',
+                   resolved='NOW()',
+                   rejection="'Delivery window missed — claim disputed'")
+    ok, detail = accepts(conn, _memo_sql(sandbox, p), p)
+    assert ok, detail
+
+
+def test_a_blank_rejection_reason_is_refused(sandbox, seeded):
+    """Blank text is as useless as NULL to the analyst, and `IS NOT NULL` alone
+    would let a generator write `''` and pass."""
+    conn = sandbox_conn(sandbox)
+    p = _open_memo(sandbox, seeded, status='rejected',
+                   submitted='NOW() - INTERVAL \'5 days\'',
+                   resolved='NOW()', rejection="'   '")
+    refused, detail = rejects(conn, _memo_sql(sandbox, p), p)
+    assert refused, 'a rejected claim with a blank rejection_reason was accepted'
+    assert 'check constraint' in detail, detail
 
 
 def test_a_claim_submitted_after_its_deadline_is_rejected(sandbox, seeded):
@@ -1202,3 +1249,164 @@ def test_the_migration_matches_what_schema_sql_declares(sandbox):
     assert 'ADD CONSTRAINT short_ship_requires_its_parents CHECK' in migration
 
 
+# ---------------------------------------------------------------------------
+# 10. The rejection-reason migration reaches an EXISTING data dir — t_ec78f608
+# ---------------------------------------------------------------------------
+# Same shape as section 9, and for the same reason: `rejection_reason` is written
+# by the generator's reject UPDATE, so the CHECK that forces the text has to
+# exist on CT107's data dir as well — where 60 rejected memos already carry
+# NULL. A CHECK alone would fail the boot there, so the migration repairs those
+# rows FIRST (from each row's own `short_reason`, a closed set) and then adds the
+# constraint.
+MEMO_MIGRATION_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "standalone", "migrations",
+    "002_credit_memo_rejection_reason.sql")
+
+LEGACY_MEMO_TABLE = "supplier_credit_memos_legacy"
+MEMO_CHECK = "credit_rejected_requires_reason"
+
+
+def _memo_migration_sql(sandbox, table):
+    """The migration file, pointed at the table this test is about."""
+    sql = open(MEMO_MIGRATION_PATH, encoding="utf-8").read()
+    return sql.replace("inv.supplier_credit_memos",
+                       f"{sandbox}inv.{table}")
+
+
+def _legacy_memo_clone(conn, sandbox):
+    """A memo table in the shape every pre-card data dir has: no reason CHECK."""
+    table = f"{sandbox}inv.{LEGACY_MEMO_TABLE}"
+    accepts(conn, f"DROP TABLE IF EXISTS {table}")
+    ok, detail = accepts(
+        conn, f"CREATE TABLE {table} (LIKE {sandbox}inv.supplier_credit_memos "
+              f"INCLUDING ALL)")
+    assert ok, detail
+    ok, detail = accepts(conn, f"ALTER TABLE {table} DROP CONSTRAINT {MEMO_CHECK}")
+    assert ok, detail
+    return table
+
+
+def _legacy_rejection(conn, sandbox, seeded, reason):
+    """A rejected claim the way the OLD profile wrote it: no reason, no CHECK.
+
+    `_open_memo` only files the short-ship and hands back the INSERT parameters;
+    the claim itself is written here, `open`, into the REAL table, and then
+    copied into the legacy clone and rejected there — the clone has no reason
+    CHECK, which is the whole point of the fixture.
+    """
+    p = _open_memo(sandbox, seeded, reason=reason,
+                   memo=f"CM-{reason}-{seeded['tag']}")
+    ok, detail = accepts(conn, _memo_sql(sandbox, p), p)
+    assert ok, detail
+    table = f"{sandbox}inv.{LEGACY_MEMO_TABLE}"
+    ok, detail = accepts(conn, f"""
+        INSERT INTO {table}
+            (credit_memo_number, short_ship_id, supplier_id, product_id,
+             location_id, credit_quantity, unit_cost, credit_amount,
+             short_reason, memo_status, claim_deadline, submitted_dt,
+             resolved_dt, resolved_by)
+        SELECT credit_memo_number, short_ship_id, supplier_id, product_id,
+               location_id, credit_quantity, unit_cost, credit_amount,
+               %(reason)s, 'rejected', claim_deadline,
+               NOW() - INTERVAL '5 days', NOW(), 'vendor'
+        FROM {sandbox}inv.supplier_credit_memos
+        WHERE credit_memo_number = %(memo)s
+    """, {'reason': reason, 'memo': p['memo']})
+    assert ok, detail
+    return p['memo']
+
+
+def _legacy_reason(conn, sandbox, memo):
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT rejection_reason FROM {sandbox}inv."
+                    f"{LEGACY_MEMO_TABLE} WHERE credit_memo_number = %s",
+                    (memo,))
+        row = cur.fetchone()
+    assert row is not None, f'memo {memo} vanished from the legacy table'
+    return row[0]
+
+
+def test_the_reason_migration_repairs_a_legacy_data_dir(sandbox, seeded):
+    """The measured path: rows already rejected with NULL, one boot, and the
+    mart's `rejected and reason is null` count goes to zero without a reseed."""
+    from grocery.generator.models import suppliers
+
+    conn = sandbox_conn(sandbox)
+    try:
+        _legacy_memo_clone(conn, sandbox)
+        assert MEMO_CHECK not in _constraints(conn, sandbox, LEGACY_MEMO_TABLE), (
+            'the fixture is meant to be the OLD shape, with no reason CHECK — '
+            'otherwise this test proves nothing')
+        memos = {
+            reason: _legacy_rejection(conn, sandbox, seeded, reason)
+            for reason in ('warehouse_shortage', 'weather_carrier_delay')
+        }
+        assert _legacy_reason(conn, sandbox, memos['warehouse_shortage']) is None, (
+            'the fixture must start from the NULL the card measured')
+
+        ok, detail = accepts(conn, _memo_migration_sql(sandbox, LEGACY_MEMO_TABLE))
+        assert ok, f'the migration failed on a legacy data dir: {detail}'
+
+        for reason, memo in memos.items():
+            assert _legacy_reason(conn, sandbox, memo) == \
+                suppliers.REASON_PAY_PROFILE[reason][1], (
+                    f'{reason} was not repaired to the profile text')
+        constraints = _constraints(conn, sandbox, LEGACY_MEMO_TABLE)
+        assert constraints.get(MEMO_CHECK) is True, (
+            'the migration must leave a VALIDATED constraint: %r' % (constraints,))
+
+        # And the row the old profile could write is now refused.
+        refused, detail = rejects(
+            conn,
+            f"UPDATE {sandbox}inv.{LEGACY_MEMO_TABLE} "
+            "SET rejection_reason = NULL")
+        assert refused, 'a NULL reason was still writable after the migration'
+        assert 'check constraint' in detail, detail
+    finally:
+        accepts(conn, f"DROP TABLE IF EXISTS {sandbox}inv.{LEGACY_MEMO_TABLE}")
+        conn.close()
+
+
+def test_the_reason_migration_is_idempotent(sandbox, seeded):
+    """Every boot re-applies it. A second run must change nothing and raise
+    nothing — a duplicate constraint here crash-loops the container."""
+    conn = sandbox_conn(sandbox)
+    try:
+        _legacy_memo_clone(conn, sandbox)
+        memo = _legacy_rejection(conn, sandbox, seeded, 'out_of_stock')
+        ok, detail = accepts(conn, _memo_migration_sql(sandbox, LEGACY_MEMO_TABLE))
+        assert ok, detail
+        first = _constraints(conn, sandbox, LEGACY_MEMO_TABLE)
+        repaired = _legacy_reason(conn, sandbox, memo)
+        ok, detail = accepts(conn, _memo_migration_sql(sandbox, LEGACY_MEMO_TABLE))
+        assert ok, f'the second application raised: {detail}'
+        assert _constraints(conn, sandbox, LEGACY_MEMO_TABLE) == first
+        assert _legacy_reason(conn, sandbox, memo) == repaired
+    finally:
+        accepts(conn, f"DROP TABLE IF EXISTS {sandbox}inv.{LEGACY_MEMO_TABLE}")
+        conn.close()
+
+
+def test_the_reason_migration_matches_what_schema_sql_declares():
+    """Two copies of one change drift, and the copy that drifts is the one
+    nothing runs. Pins the CHECK and the five texts the migration derives."""
+    from grocery.generator.models import suppliers
+
+    source = open(SCHEMA_PATH, encoding="utf-8").read()
+    table = re.search(
+        r"CREATE TABLE inv\.supplier_credit_memos \((.*?)\n\);", source, re.S)
+    assert table, 'supplier_credit_memos not found in schema.sql'
+    assert f'CONSTRAINT {MEMO_CHECK} CHECK' in table.group(1), table.group(1)
+    assert 'rejection_reason' in table.group(1)
+
+    migration = open(MEMO_MIGRATION_PATH, encoding="utf-8").read()
+    assert f'ADD CONSTRAINT {MEMO_CHECK} CHECK' in migration
+    for reason, (_pay, rejection) in suppliers.REASON_PAY_PROFILE.items():
+        if rejection is None:
+            # Not a skip for convenience: None means the profile is never
+            # disputed, so there is no text for the migration to carry.
+            continue
+        # The migration writes apostrophes doubled inside a SQL literal.
+        assert rejection.replace("'", "''") in migration, (
+            f'the migration does not carry the {reason} text the generator '
+            f'writes ({rejection!r}) — the two copies have drifted')

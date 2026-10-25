@@ -1062,6 +1062,15 @@ CREATE TABLE inv.supplier_credit_memos (
     CONSTRAINT credit_terminal_has_no_vendor_resolution CHECK (
         memo_status NOT IN ('expired', 'written_off')
         OR (submitted_dt IS NULL AND resolved_dt IS NULL)
+    ),
+    -- A rejected claim must say WHY. `rejection_reason` is the only explanation
+    -- the analyst deciding whether to escalate ever gets, and the generator used
+    -- to reject `warehouse_shortage` / `out_of_stock` / `weather_carrier_delay`
+    -- claims with a NULL one — half of every rejection on a 30-day seed
+    -- (t_ec78f608). Blank text is as useless as NULL, so both are refused.
+    CONSTRAINT credit_rejected_requires_reason CHECK (
+        memo_status <> 'rejected'
+        OR (rejection_reason IS NOT NULL AND btrim(rejection_reason) <> '')
     )
 );
 

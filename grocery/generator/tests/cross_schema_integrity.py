@@ -990,6 +990,28 @@ ASSERTIONS: List[AssertionSpec] = [
               AND so.order_dt::date < CURRENT_DATE
         """,
     ),
+    # t_ec78f608: a rejected claim said nothing about why. `REASON_PAY_PROFILE`
+    # carried the vendor's rejection text for two of its five short reasons;
+    # `warehouse_shortage`, `out_of_stock` and `weather_carrier_delay` were
+    # `(pay_rate, None)` and `advance_credit_memos` writes that straight into the
+    # reject UPDATE — 60 of 119 rejected memos on the CT107 reseed, all three of
+    # the broken reasons, and `rejection_reason` is the only explanation the
+    # analyst deciding whether to escalate ever gets. The source has a CHECK for
+    # this now (credit_rejected_requires_reason); this restates it for a slot
+    # whose data dir has not had the boot migration yet, and for the rows the
+    # old profile already wrote there.
+    AssertionSpec(
+        id="SEMA-31",
+        dimension="semantic_type",
+        title="a rejected claim must say why the vendor disputed it",
+        sql="""
+            SELECT m.credit_memo_id, m.short_reason, m.rejection_reason
+            FROM inv.supplier_credit_memos m
+            WHERE m.memo_status = 'rejected'
+              AND (m.rejection_reason IS NULL
+                   OR btrim(m.rejection_reason) = '')
+        """,
+    ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
     # The promo key resolves, but the promotion's validity window does not
     # cover the transaction date it was applied to. Fixed at the source by
