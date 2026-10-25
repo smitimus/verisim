@@ -122,6 +122,40 @@ After this, ALWAYS re-run the data-lab ingest + dbt (they hold the old raw copy)
 
 If the old data must be preserved (it's mock data — usually not), pull a PG16-era image tag (`smiti/verisim-grocery:1.2.2`, 2026-07-03) and dump/restore — pg_upgrade is not set up for the standalone layout.
 
+## Schema changes reach an EXISTING data dir through `/app/migrations`
+
+`schema.sql` is applied by `entrypoint.sh` **only on a first run** (the block is
+gated on `$PG_DATA/PG_VERSION` being absent). `bootstrap_database` is gated on
+`control.generator_state`. `schema_reconcile` — the generator's boot pass — only
+ever ADDS columns/indexes/tables, and on the standalone image even those are
+refused for most relations because `entrypoint.sh` created them as `postgres`
+while the generator connects as `$POSTGRES_USER` (t_b17da778, t_66647bbd).
+
+So there was no path at all for the other kind of schema change — dropping a
+`NOT NULL`, tightening a CHECK, changing a default. On a fresh data dir the new
+image was correct; on every existing one (CT107 included) it booted green and
+then failed on its first write, which is exactly the failure shape t_66647bbd
+was filed for.
+
+**The path now is `grocery/standalone/migrations/*.sql`.** `entrypoint.sh` starts
+postgres briefly on EVERY boot, applies every file in name order as `postgres`
+(the owner) with `ON_ERROR_STOP=1`, re-runs the schema grants, and stops it
+again. Rules for a new file:
+
+- **idempotent** — it runs on every boot of every volume, including one this
+  image just bootstrapped where the change is already present. `DROP NOT NULL`
+  is naturally idempotent; guard an `ADD CONSTRAINT` on `pg_constraint`.
+- **the same statement the `schema.sql` declares** — the two are one change in
+  two places, and `test_supplier_schema.py` pins the pair it can
+  (`001_short_ship_dsd_parents.sql` vs `schema.sql`'s
+  `short_ship_requires_its_parents`).
+- **a failure fails the boot.** A container that cannot write its own tables
+  reported `healthy` for forty minutes once already; a crash-loop with the psql
+  error in the log is the honest signal.
+- **it does not replace the data-lab ticket.** Any schema change still needs the
+  data-lab ticket in the same breath (staging `not_null`/`relationships` tests
+  read these columns).
+
 ## Route Stripping at Build Time
 
 Base API (`base/api/main.py`) contains routes for all industries. At build time:
@@ -503,6 +537,7 @@ Still open:
 Both confirmed fixed on fresh backfill data:
 - **Timeclock pairing**: `generate_events()` queries the day's existing events before inserting, and so does `generate_day_events()` — a day that already holds punches is **completed, never rewritten**, one row per `(employee_id, event_type, event_dt)` (t_251755f7). Without that, a backfill replay of a day realtime had partly written (the generator died at 11:09 on 2026-10-07, the restart's gap-fill replayed the day on 10-11) wrote a second full shift for every employee whose shift had started: 105 doubled rows with fresh `event_id`s, 55 employee-days with `ins = 2, outs = 1`, and `assert_labor_net_hours_agree` red on 22 of them. `test_timeclock_day_write_once.py` pins it. `clock_out` is still clamped to 23:30 same day. Since t_ca6642e0 the realtime path writes the day from a pure `(date, employee)` shift plan, one instant at a time, and the two halves of a break are written by the ticks that reach them — t_a24cfbc6's "closed pair in one tick" was replaced because writing the pair at once back-dates `break_start` below data-lab's `event_dt` ingest watermark. `test_timeclock_breaks.py` and `test_timeclock_realtime.py` pin that.
 - **Loyalty points balance**: `_record_loyalty_points()` uses `FOR UPDATE` row lock; dbt test orders by `(transaction_dt, points_balance_after)` for same-tick tiebreaks
+- **The credit-memo book was empty on every seed** (t_d74d67a3): 147 `inv.short_ship_events` over an 8-day backfill and **0** `inv.supplier_credit_memos`, with the vendor phase green. Two independent causes, both now closed. *First*, `open_credit_memo` had one caller (`generate_dsd_deliveries`), so a WAREHOUSE vendor's shortfall — the receiving path — was recorded and never claimed; `suppliers.open_pending_credit_memos()` now runs once per simulated day in `_run_vendor_phase` and files a memo for every creditable, unclaimed event inside the vendor book's longest claim window, taking `claim_deadline` from the EVENT's date so a gap-fill pass cannot re-date an old shortfall. *Second*, the DSD short-ship path computed `short_quantity(quantity, quantity)` (identically 0) and, had that been fixed alone, would have died on `fulfillment_item_id`/`fulfillment_id`, which were NOT NULL FKs it fed fabricated uuids — because a DSD drop has no fulfillment. Those two columns are now nullable with `short_ship_requires_its_parents` tying them to `detected_source`. **Do not** "simplify" the DSD INSERT back to non-NULL parents, and do not remove the boot migration. `test_credit_memo_pass.py`, `test_vendor_phase_dsd.py` and `test_supplier_schema.py` pin all of it.
 
 ## Gas Station Status
 

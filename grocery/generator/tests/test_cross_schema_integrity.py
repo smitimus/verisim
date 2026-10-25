@@ -197,6 +197,8 @@ TABLE_OR_COLUMN_OPTIONAL = {
     # SEMA-27 reads inv.suppliers for the denormalised supplier_name on
     # inv.products — the vendor is what it compares against.
     "SEMA-27": ("inv", "suppliers", None),
+    # SEMA-28 reads inv.short_ship_events (parents vs detected_source).
+    "SEMA-28": ("inv", "short_ship_events", None),
 }
 
 _OPTIONAL_ASSERTION_IDS = frozenset(TABLE_OR_COLUMN_OPTIONAL)

@@ -56,6 +56,7 @@ but "how long did it take to be paid, and did it get paid at all". Those need a
 lifecycle with its own timestamps and a terminal state, and a memo that never
 resolves is a real finding rather than a missing value.
 """
+import hashlib
 import logging
 import random
 from datetime import datetime, timedelta
@@ -237,6 +238,69 @@ def short_quantity(requested: float, picked: float,
     Python so the caller can skip a line rather than fail an INSERT.
     """
     return max(0.0, round(float(requested) - float(picked), 3))
+
+
+def as_naive(dt):
+    """
+    A timestamp with its tzinfo dropped, for comparing a SIMULATED clock with a
+    timestamp that came back from Postgres.
+
+    Every simulated time in this generator is a naive local `datetime`; a
+    `TIMESTAMPTZ` column comes back tz-aware (`+00:00`), and Python refuses to
+    order the two — `TypeError: can't compare offset-naive and offset-aware
+    datetimes`. That is not hypothetical: `advance_credit_memos` compares
+    `sim_dt` with `submitted_dt + settlement`, and it raised on the first memo
+    that reached the paid stage (measured on a fresh 8-day backfill,
+    t_d74d67a3). The book had always been empty, so the comparison never ran —
+    one more defect the empty memo book was hiding.
+
+    Dropping tzinfo is right HERE because both sides were written in the same
+    session's timezone (the generator writes `submitted_dt` as a naive local
+    value and reads it back in that timezone); converting instead would need a
+    tz argument this module does not have.
+    """
+    return dt.replace(tzinfo=None) if getattr(dt, 'tzinfo', None) else dt
+
+
+def claim_is_filed(short_ship_id: str, claim_rate: float) -> bool:
+    """
+    Does THIS shortfall get a claim filed, at `claim_rate` over the book?
+
+    The decision is a pure function of the short-ship id, not a coin toss,
+    because the same simulated day gets replayed: a backfill re-runs a day whose
+    rows exist (a generator that died mid-day), and `random.random()` made the
+    claim book depend on how many times a day had been generated — the same
+    event claimed on the second pass and not the first. A per-event draw keeps
+    `credit_claim_rate` meaning "share of creditable shorts we claim" on every
+    seed and every replay.
+
+    Bounded to [0, 1] for the same reason `short_probability_for` clamps: a
+    config with `credit_claim_rate: 3.0` must not mean "claim everything"
+    without the typo being visible.
+    """
+    rate = min(1.0, max(0.0, float(claim_rate)))
+    if rate >= 1.0:
+        return True
+    if rate <= 0.0:
+        return False
+    digest = hashlib.sha256(str(short_ship_id).encode('utf-8')).digest()
+    return int.from_bytes(digest[:4], 'big') / float(1 << 32) < rate
+
+
+def claim_window_days(vendors: Optional[List[Dict]]) -> int:
+    """
+    How far back a claim can still be filed, in days: the LONGEST claim window
+    on the vendor book.
+
+    This is the bounded window the daily claim pass scans. It is derived rather
+    than configured because a shortfall older than its own vendor's window can
+    no longer be submitted — it would be born expired — so there is nothing
+    beyond the longest term to look for, and a separate dial could only ever be
+    set wrong (too small silently drops claims, too large re-scans rows that
+    cannot produce one).
+    """
+    windows = [claim_deadline_days(v) for v in (vendors or []) if v]
+    return max(windows) if windows else 14
 
 
 def dsd_delivery_weekdays(per_week: int, rng: Optional[RNG] = None
@@ -607,16 +671,27 @@ def open_credit_memo(conn, cfg: Config, short_ship_id: str,
     One memo per short-ship, enforced by the UNIQUE on `short_ship_id`, so this
     is safe to call again for the same event (the second call finds no row and
     returns None rather than double-crediting).
+
+    CLAIM DEADLINE COMES FROM THE EVENT, NOT FROM `sim_dt` (t_d74d67a3). The
+    pass that files claims also repairs days it missed, so `sim_dt` can be weeks
+    after the shortfall: dating the deadline from the pass would move a
+    three-week-old claim's window into the future and make a vendor look
+    responsive that never was. `sim_dt` is only the clock the claim is filed
+    against — an event whose own window has already closed is not claimed at all
+    (a memo born expired is noise, not a finding: `advance_credit_memos` would
+    expire it on its first pass).
     """
     if not vendor.get('credit_eligible'):
         return None
-    if random.random() >= float(getattr(cfg.vendors, 'credit_claim_rate', 0.7)):
+    if not claim_is_filed(short_ship_id,
+                          float(getattr(cfg.vendors, 'credit_claim_rate', 0.7))):
         return None
 
     with conn.cursor() as cur:
         cur.execute("""
             SELECT se.short_ship_id::text, se.product_id::text, se.location_id::text,
-                   se.quantity_short, se.unit_cost, se.short_value
+                   se.quantity_short, se.unit_cost, se.short_value,
+                   se.event_dt::date
             FROM inv.short_ship_events se
             WHERE se.short_ship_id = %s::uuid
               AND se.is_creditable
@@ -629,13 +704,22 @@ def open_credit_memo(conn, cfg: Config, short_ship_id: str,
     if not row:
         return None
 
-    short_ship_id, product_id, location_id, quantity, unit_cost, short_value = row
+    (short_ship_id, product_id, location_id, quantity, unit_cost, short_value,
+     event_date) = row
     if float(quantity) <= 0:
         return None
 
+    deadline = event_date + timedelta(days=claim_deadline_days(vendor))
+    today = sim_dt.date() if hasattr(sim_dt, 'date') else sim_dt
+    if deadline <= today:
+        # The vendor's window on THIS shortfall has closed. Filing it now would
+        # write a memo that cannot be submitted, so it is left unclaimed — the
+        # honest record is the short-ship event itself.
+        log.info("No claim on short-ship %s: the vendor's %d-day window closed "
+                 "on %s", short_ship_id, claim_deadline_days(vendor), deadline)
+        return None
+
     reason = draw_short_reason(rng)
-    deadline = (sim_dt.date() if hasattr(sim_dt, 'date') else sim_dt) \
-        + timedelta(days=claim_deadline_days(vendor))
     memo_number = 'CM-%s' % uuid4().hex[:10].upper()
 
     with conn.cursor() as cur:
@@ -725,6 +809,12 @@ def advance_credit_memos(conn, cfg: Config, sim_dt: datetime,
 
     # 2) submitted -> paid | rejected. Only claims past the chase delay are
     #    resolved, so a vendor who answers in two days looks responsive.
+    #
+    #    The resolution runs on its OWN cursor: the read above closes with its
+    #    `with` block, and resolving on that one raises
+    #    `psycopg2.InterfaceError: cursor already closed` on the first claim that
+    #    actually reaches this stage (t_d74d67a3 — never fired while the memo
+    #    book was empty, which is the only reason it was never seen).
     with conn.cursor() as cur:
         cur.execute("""
             SELECT m.credit_memo_id::text, m.short_reason, m.submitted_dt,
@@ -737,31 +827,34 @@ def advance_credit_memos(conn, cfg: Config, sim_dt: datetime,
         """, (sim_dt - timedelta(days=chase_after),))
         pending = cur.fetchall()
 
-    for memo_id, reason, submitted_dt, mean, stddev in pending:
-        vendor = {'credit_settle_mean_days': mean,
-                  'credit_settle_stddev_days': stddev}
-        settle_at = submitted_dt + timedelta(days=settlement_days(vendor))
-        if sim_dt < settle_at:
-            continue  # still inside the vendor's payment terms
+        for memo_id, reason, submitted_dt, mean, stddev in pending:
+            vendor = {'credit_settle_mean_days': mean,
+                      'credit_settle_stddev_days': stddev}
+            settle_at = submitted_dt + timedelta(days=settlement_days(vendor))
+            # `submitted_dt` came back from a TIMESTAMPTZ column and `sim_dt` is
+            # a naive simulated clock: compare them as naive local time or
+            # Python raises on the first claim that reaches this stage.
+            if as_naive(sim_dt) < as_naive(settle_at):
+                continue  # still inside the vendor's payment terms
 
-        pay_rate, rejection_reason = REASON_PAY_PROFILE.get(
-            reason, REASON_PAY_PROFILE['warehouse_shortage'])
-        if random.random() < pay_rate:
-            cur.execute("""
-                UPDATE inv.supplier_credit_memos
-                SET memo_status = 'paid', resolved_dt = %s,
-                    resolved_by = %s, updated_at = NOW()
-                WHERE credit_memo_id = %s::uuid AND memo_status = 'submitted'
-            """, (sim_dt, RESOLVER_VENDOR, memo_id))
-            counts['paid'] += cur.rowcount
-        else:
-            cur.execute("""
-                UPDATE inv.supplier_credit_memos
-                SET memo_status = 'rejected', resolved_dt = %s,
-                    resolved_by = %s, rejection_reason = %s, updated_at = NOW()
-                WHERE credit_memo_id = %s::uuid AND memo_status = 'submitted'
-            """, (sim_dt, RESOLVER_VENDOR, rejection_reason, memo_id))
-            counts['rejected'] += cur.rowcount
+            pay_rate, rejection_reason = REASON_PAY_PROFILE.get(
+                reason, REASON_PAY_PROFILE['warehouse_shortage'])
+            if random.random() < pay_rate:
+                cur.execute("""
+                    UPDATE inv.supplier_credit_memos
+                    SET memo_status = 'paid', resolved_dt = %s,
+                        resolved_by = %s, updated_at = NOW()
+                    WHERE credit_memo_id = %s::uuid AND memo_status = 'submitted'
+                """, (sim_dt, RESOLVER_VENDOR, memo_id))
+                counts['paid'] += cur.rowcount
+            else:
+                cur.execute("""
+                    UPDATE inv.supplier_credit_memos
+                    SET memo_status = 'rejected', resolved_dt = %s,
+                        resolved_by = %s, rejection_reason = %s, updated_at = NOW()
+                    WHERE credit_memo_id = %s::uuid AND memo_status = 'submitted'
+                """, (sim_dt, RESOLVER_VENDOR, rejection_reason, memo_id))
+                counts['rejected'] += cur.rowcount
 
     conn.commit()
     if any(counts.values()):
@@ -769,6 +862,77 @@ def advance_credit_memos(conn, cfg: Config, sim_dt: datetime,
                  counts['submitted'], counts['paid'], counts['rejected'],
                  counts['expired'])
     return counts
+
+
+# ---------------------------------------------------------------------------
+# The daily claim pass
+# ---------------------------------------------------------------------------
+
+def open_pending_credit_memos(conn, cfg: Config, sim_dt: datetime,
+                              vendors: Optional[List[Dict]] = None) -> int:
+    """
+    File the claims the day's shortfalls are owed — one pass over unclaimed events.
+
+    THE DEFECT THIS CLOSES (t_d74d67a3). `record_short_ships` (the receiving
+    dock, i.e. every warehouse vendor) wrote `inv.short_ship_events` and stopped:
+    `open_credit_memo` was called only from `generate_dsd_deliveries`, and
+    `advance_credit_memos` only advances memos that already exist. So 147
+    shortfalls over an 8-day backfill produced ZERO claims — green, silent, and
+    `inv.supplier_credit_memos` empty on every seed. A procurement mart built on
+    it had no days-to-pay, no credited dollars and no rejection mix, not because
+    no vendor ever shorted us but because nobody ever filed the paperwork.
+
+    WHICH EVENTS. Creditable, unclaimed, from an ACTIVE vendor, dated inside the
+    vendor book's longest claim window (`claim_window_days`) and not after
+    `sim_dt`'s day. The window is a bound, not a rule: `open_credit_memo` refuses
+    any event whose own window has closed, so a gap-fill pass that lands weeks
+    later cannot re-date an old shortfall into the future — it simply claims the
+    events that can still be claimed. The NOT EXISTS is what makes a replayed
+    day idempotent; `open_credit_memo` re-checks it under the UNIQUE on
+    `short_ship_id`.
+
+    Note the date is compared to the day, not the instant: the backfill writes a
+    day's receiving short-ships at 23:59 while the vendor phase runs at 23:30, so
+    an instant-bounded pass would leave the backfill's own day unclaimed.
+
+    Returns the number of memos opened.
+    """
+    today = sim_dt.date() if hasattr(sim_dt, 'date') else sim_dt
+    if vendors is None:
+        vendors = fetch_suppliers(conn)
+    if not vendors:
+        return 0
+
+    window = claim_window_days(vendors)
+    by_id = {str(v['supplier_id']): v for v in vendors}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT se.short_ship_id::text, se.supplier_id::text
+            FROM inv.short_ship_events se
+            JOIN inv.suppliers s ON s.supplier_id = se.supplier_id
+            WHERE se.is_creditable
+              AND s.is_active
+              AND se.event_dt::date > (%s::date - %s::int)
+              AND se.event_dt::date <= %s::date
+              AND NOT EXISTS (
+                    SELECT 1 FROM inv.supplier_credit_memos m
+                    WHERE m.short_ship_id = se.short_ship_id)
+            ORDER BY se.event_dt, se.short_ship_id
+        """, (today, window, today))
+        pending = cur.fetchall()
+
+    opened = 0
+    for short_ship_id, supplier_id in pending:
+        vendor = by_id.get(str(supplier_id))
+        if not vendor:
+            continue
+        if open_credit_memo(conn, cfg, str(short_ship_id), vendor, sim_dt):
+            opened += 1
+
+    if opened:
+        log.info("Credit memos: %d of %d unclaimed short-ship(s) inside the "
+                 "claim window filed", opened, len(pending))
+    return opened
 
 
 # ---------------------------------------------------------------------------
@@ -863,9 +1027,15 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
         delivered_hour = random.choice([5, 6, 7, 8, 9])
         delivered_at = datetime(today.year, today.month, today.day,
                                 delivered_hour, 0, 0)
-        # A DSD truck that misses its window is short by the whole drop.
-        missed = random.random() < float(
-            getattr(cfg.vendors, 'dsd_short_ship_bonus', 0.0) or 0.0)
+        # P(a LINE on this drop comes up short). `dsd_short_ship_bonus` is
+        # exactly what `short_probability_for` adds for a DSD line — a vendor
+        # truck that misses its window leaves the shelf short the same morning.
+        #
+        # It used to be read as "the whole drop is missed", and the shortfall it
+        # then computed was `short_quantity(quantity, quantity)` on both
+        # branches — i.e. identically zero — so no DSD line could ever be short
+        # and `dsd_short_ship_bonus` was a dial nothing listened to (t_d74d67a3).
+        short_rate = short_probability_for(vendor, cfg, DETECTED_DSD)
 
         delivery_items = []
         short_rows = []
@@ -873,36 +1043,34 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
         total_value = 0.0
         for product_id, supplier_id_ref, cost in chosen:
             unit_cost = round(cost, 4)
-            if missed:
-                quantity = 0.0
+            # What the vendor's drop sheet SAYS it is bringing, then what it
+            # actually brought. A short line arrives with anything from nothing
+            # to all-but-one unit, so a missed line (picked = 0) and a partial
+            # one are the same arithmetic rather than two branches.
+            promised_qty = float(random.randint(6, 48))
+            if random.random() < short_rate:
+                picked_qty = float(random.randint(0, int(promised_qty) - 1))
             else:
-                quantity = float(random.randint(6, 48))
-            line_total = round(quantity * unit_cost, 2)
-            total_units += quantity
-            total_value += line_total
-            delivery_items.append((delivery_id, product_id, quantity,
-                                   unit_cost, line_total))
+                picked_qty = promised_qty
+            short = short_quantity(promised_qty, picked_qty)
 
-            # What the vendor PROMISED on this run, against what it did. A zero
-            # delivery is the whole drop missed, which is the extreme case of the
-            # same arithmetic rather than a separate branch.
-            #
-            # NOTE (t_d74d67a3): `short` is 0 on BOTH branches — `picked` equals
-            # `requested` unless the drop was missed, and a missed drop requested
-            # 0 — so this path writes no DSD short-ship today. Do not "fix" the
-            # arithmetic on its own: the INSERT below puts fabricated uuids in
-            # `fulfillment_item_id` / `fulfillment_id`, which are NOT NULL FKs to
-            # fulfillment.items/orders, so it needs the schema decision that card
-            # carries (and the data-lab ticket that goes with it).
-            promised = draw_lead_time_days(vendor)
-            short = short_quantity(quantity, quantity if not missed else 0.0)
+            if picked_qty > 0:
+                line_total = round(picked_qty * unit_cost, 2)
+                total_units += picked_qty
+                total_value += line_total
+                delivery_items.append((delivery_id, product_id, picked_qty,
+                                       unit_cost, line_total))
+
             if short >= MIN_SHORT_UNITS:
+                # `dsd_delivery_items` records what ARRIVED, so a fully missed
+                # line writes no item row — its whole promise lives in the
+                # short-ship event below.
                 short_rows.append({
                     'product_id': product_id,
-                    'quantity_requested': round(quantity, 3),
-                    'quantity_picked': 0.0,
+                    'quantity_requested': round(promised_qty, 3),
+                    'quantity_picked': round(picked_qty, 3),
                     'unit_cost': unit_cost,
-                    'promised': promised,
+                    'promised': draw_lead_time_days(vendor),
                 })
 
         with conn.cursor() as cur:
@@ -951,6 +1119,19 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
         counts['lines'] += len(delivery_items)
 
         # 2) The DSD short-ship path.
+        #
+        # A DSD drop has NO fulfillment behind it: no pallet on one of our
+        # `transport.loads`, no `fulfillment.orders` row. So both parent columns
+        # are honestly NULL here and `short_ship_requires_its_parents` ties that
+        # to `detected_source = 'dsd_delivery'`. The previous revision wrote
+        # fabricated `00000000-0000-0000-0000-<random>` uuids, which the FKs
+        # rejected — and because the whole phase is wrapped in a non-raising
+        # `except`, that INSERT failure is what kept this path dark (t_d74d67a3).
+        #
+        # The claim is NOT filed here: `open_pending_credit_memos` files it in
+        # the same vendor phase, a few lines later, from the events that exist.
+        # One writer for the memo book is what keeps the receiving path (which
+        # has no other way to reach `open_credit_memo`) and this one identical.
         for row in short_rows:
             short = short_quantity(row['quantity_requested'],
                                    row['quantity_picked'])
@@ -966,30 +1147,20 @@ def generate_dsd_deliveries(conn, cfg: Config, sim_dt: datetime,
                          unit_cost, short_value, promised_lead_time_days,
                          realized_lead_time_days, is_creditable, event_dt,
                          scenario_tag)
-                    SELECT %s::uuid, %s::uuid, %s::uuid, %s::uuid, %s::uuid,
-                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                    RETURNING short_ship_id::text
-                """, ('00000000-0000-0000-0000-%012d'
-                       % random.randrange(0, 10 ** 12),
-                       '00000000-0000-0000-0000-%012d'
-                       % random.randrange(0, 10 ** 12),
-                       supplier_id, row['product_id'], location_id,
-                       DETECTED_DSD, row['quantity_requested'],
-                       row['quantity_picked'], short, unit_cost,
-                       round(short * unit_cost, 2), row['promised'],
-                       draw_lead_time_days(vendor),
-                       bool(vendor['credit_eligible']), delivered_at, tag))
-                short_ship_id = cur2.fetchone()[0]
+                    VALUES (NULL, NULL, %s::uuid, %s::uuid, %s::uuid,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (supplier_id, row['product_id'], location_id,
+                      DETECTED_DSD, row['quantity_requested'],
+                      row['quantity_picked'], short, unit_cost,
+                      round(short * unit_cost, 2), row['promised'],
+                      draw_lead_time_days(vendor),
+                      bool(vendor['credit_eligible']), delivered_at, tag))
             conn.commit()
-
-            memo_id = open_credit_memo(conn, cfg, short_ship_id, vendor,
-                                       delivered_at)
-            if memo_id:
-                counts['short_lines'] += 1
+            counts['short_lines'] += 1
 
     conn.commit()
     if counts['deliveries']:
-        log.info("DSD: %d drop(s), %d line(s), %d short line(s) credited",
+        log.info("DSD: %d drop(s), %d line(s), %d short line(s) recorded",
                  counts['deliveries'], counts['lines'], counts['short_lines'])
     return counts
 

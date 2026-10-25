@@ -84,7 +84,14 @@ enforce.
   against (`SEMA-26` asserts a delivery lands on a weekday the schedule visits).
 - **`inv.short_ship_events`** referenced by: `inv.supplier_credit_memos`
   (`short_ship_id`, UNIQUE — one claim per shortfall, which is what makes
-  `open_credit_memo` idempotent).
+  `open_credit_memo` idempotent). Its own two parents — `fulfillment_item_id`
+  and `fulfillment_id` — are **nullable and conditional on
+  `detected_source`** (t_d74d67a3): a `receiving` short came off one of our
+  fulfillment lines and must carry both; a `dsd_delivery` short came off the
+  vendor's own truck, has no fulfillment behind it, and must carry neither.
+  `short_ship_requires_its_parents` is the CHECK, restated as harness assertion
+  `SEMA-28`, and `HARD-32` (the item FK anti-join) skips the NULL rows — a
+  consumer joining either column must expect NULLs on the DSD half.
 - **`inv.dsd_deliveries`** referenced by: `inv.dsd_delivery_items`
   (`dsd_delivery_id`).
 

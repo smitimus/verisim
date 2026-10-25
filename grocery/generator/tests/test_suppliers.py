@@ -60,6 +60,7 @@ on their own settlement terms. Before this, the 20 cases simply were not in the
 receipt.
 """
 import random
+import re
 from datetime import datetime, timedelta
 
 import pytest
@@ -658,3 +659,61 @@ def test_a_short_ship_can_never_be_zero_quantity():
     short would fail the INSERT — so the floor is enforced before the write."""
     assert suppliers.MIN_SHORT_UNITS >= 1.0
     assert suppliers.short_quantity(50, 50) < suppliers.MIN_SHORT_UNITS
+
+
+# ---------------------------------------------------------------------------
+# 11. The short-ship row's two shapes (t_d74d67a3)
+# ---------------------------------------------------------------------------
+# A shortfall detected at our dock has a fulfillment behind it; one detected on
+# the shelf after a DSD vendor's truck left does not. Reading this from
+# schema.sql keeps the check running on a CI job with no Postgres, where
+# test_supplier_schema.py skips.
+def _schema_text():
+    return (__import__('pathlib').Path(__file__).resolve().parents[1]
+            / 'schema.sql').read_text()
+
+
+def test_the_short_ship_parents_are_nullable_for_a_dsd_short():
+    """NOT NULL there is what made the DSD INSERT impossible: the path had to
+    invent uuids and the FKs rejected them."""
+    schema = _schema_text()
+    assert re.search(r'CREATE TABLE inv\.short_ship_events \((.*?)\n\);',
+                     schema, re.S), 'short_ship_events not found in schema.sql'
+    body = re.search(r'CREATE TABLE inv\.short_ship_events \((.*?)\n\);',
+                     schema, re.S).group(1)
+    assert re.search(r'fulfillment_item_id\s+UUID\s+REFERENCES', body), (
+        'fulfillment_item_id must be nullable — a DSD short has no line')
+    assert re.search(r'fulfillment_id\s+UUID\s+REFERENCES', body), (
+        'fulfillment_id must be nullable — a DSD short has no order')
+    assert not re.search(r'fulfillment_item_id\s+UUID\s+NOT NULL', body)
+    assert not re.search(r'fulfillment_id\s+UUID\s+NOT NULL', body)
+
+
+def test_the_schema_ties_the_parents_to_the_detected_source():
+    """Two nullable columns nothing reconciles would let a receiving short lose
+    its fulfillment (every mart joining it silently drops the row) and a DSD
+    short claim one that does not exist."""
+    schema = _schema_text()
+    assert 'CONSTRAINT short_ship_requires_its_parents CHECK' in schema
+    block = schema.split('short_ship_requires_its_parents CHECK', 1)[1]
+    block = block.split(');', 1)[0]
+    assert "detected_source = 'receiving'" in block
+    assert "detected_source = 'dsd_delivery'" in block
+    assert block.count('IS NOT NULL') == 2, (
+        'the receiving branch is the one that requires both parents')
+    assert block.count('IS NULL') == 2, (
+        'the dsd_delivery branch is the one that requires neither')
+
+
+def test_the_boot_migration_exists_for_the_data_dirs_schema_sql_cannot_reach():
+    """`schema.sql` is applied on a first run only, so an existing data dir
+    needs its own path to the new shape. The image applies
+    `/app/migrations/*.sql` on every boot; this asserts the pair exists."""
+    root = __import__('pathlib').Path(__file__).resolve().parents[2]
+    migration = root / 'standalone' / 'migrations' / '001_short_ship_dsd_parents.sql'
+    assert migration.exists(), (
+        'no boot migration for the DSD short-ship parents — an existing data '
+        'dir would keep the NOT NULL columns and the new INSERT would raise')
+    sql = migration.read_text()
+    assert 'DROP NOT NULL' in sql
+    assert 'short_ship_requires_its_parents' in sql

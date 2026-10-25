@@ -608,31 +608,34 @@ def _ensure_realtime(conn):
 
 def _run_vendor_phase(conn, cfg, sim_dt, locations, products, scenario):
     """
-    DSD deliveries, then the credit-memo lifecycle. Never raises.
+    DSD deliveries, the day's claims, then the credit-memo lifecycle. Never raises.
 
-    Order matters and is the reason this is one function rather than two
-    calls at each call site:
+    Order matters and is the reason this is one function rather than three calls
+    at each call site:
 
-      1. DSD drops stock the shelf and record their own short-ships, opening a
-         memo per creditable shortfall.
-      2. The memo pass submits, chases, pays or disputes what is already in
-         flight — which now includes the memos step 1 just opened.
+      1. DSD drops stock the shelf and record their own short-ships.
+      2. The claim pass files a memo for every creditable short-ship with no
+         memo yet — which is the DAY's claims, from BOTH sources: a warehouse
+         vendor's shortfall is recorded in `transport.receive_delivered_loads`
+         earlier in the same day, and until t_d74d67a3 nothing ever turned one
+         into a claim (147 shortfalls, 0 memos on an 8-day backfill).
+      3. The memo pass submits, chases, pays or disputes what is already in
+         flight — which now includes the memos step 2 just opened.
 
-    A step-1 memo therefore cannot be submitted in the same pass it is opened,
-    because step 2's own SQL looks for `memo_status = 'open'` rows and the
-    freshly inserted one is open... which would claim it on the spot. To keep
-    the lifecycle honest, step 2 is called with the memo's OWN clock: the
-    advance only resolves rows whose `submitted_dt` is already at least
+    A step-2 memo therefore cannot be RESOLVED in the same pass it is opened:
+    step 3 only resolves rows whose `submitted_dt` is already at least
     `credit_chase_after_days` old, and a just-opened memo has no `submitted_dt`
-    at all, so it simply cannot be touched. The ordering is documented rather
-    than relied on, because that is the whole invariant.
+    at all. It can be submitted the same midnight (that is `credit_claim_rate`'s
+    second gate, the chase), which is deliberate — the claim is filed and
+    submitted on the day the shortfall is found.
 
-    Returns the two result dicts, or empty ones if the vendor tables are not
+    Returns the three result dicts, or empty ones if the vendor tables are not
     there — a data dir generated before t_57b1a1ab keeps generating instead of
     crashing on every midnight.
     """
     empty = {'deliveries': 0, 'lines': 0, 'short_lines': 0}
-    empty_memos = {'submitted': 0, 'paid': 0, 'rejected': 0, 'expired': 0}
+    empty_memos = {'opened': 0, 'submitted': 0, 'paid': 0, 'rejected': 0,
+                   'expired': 0}
     try:
         vendors = suppliers.fetch_suppliers(conn)
         if vendors:
@@ -643,11 +646,14 @@ def _run_vendor_phase(conn, cfg, sim_dt, locations, products, scenario):
             log.info("No vendors on disk — skipping the vendor phase "
                      "(pre-t_57b1a1ab data dir?)")
             return empty, empty_memos
+        opened = suppliers.open_pending_credit_memos(conn, cfg, sim_dt, vendors)
         memos = suppliers.advance_credit_memos(conn, cfg, sim_dt, scenario)
+        memos['opened'] = opened
         # The DSD counts, not `empty`: the caller logs them, and returning a
         # zero dict for a pass that just wrote forty drops is the kind of
         # "green and silent" that hid the placeholder defect for as long as it
-        # did (t_5a16106b).
+        # did (t_5a16106b). Same for `opened`: a pass that claims nothing is a
+        # number to read, not a silent zero.
         return deliveries, memos
     except Exception:
         # A tick must not die because of the vendor paperwork. The receiving

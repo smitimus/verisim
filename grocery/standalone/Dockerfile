@@ -75,6 +75,14 @@ COPY grocery/standalone/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY grocery/standalone/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# ── Boot-time migrations ──────────────────────────────────────────────────────
+# Applied by entrypoint.sh on EVERY boot, as postgres, in name order. The
+# directory must exist in the image even when it is empty: the entrypoint globs
+# it, and a COPY would otherwise be a build-time surprise rather than a log line.
+# See the header comment in entrypoint.sh for why `schema.sql` alone cannot
+# reach an existing data dir.
+COPY grocery/standalone/migrations/ /app/migrations/
+
 # ── API: strip gas-station routes at build time ───────────────────────────────
 COPY grocery/standalone/strip_gas_station.py /tmp/strip_gas_station.py
 COPY base/api/main.py /tmp/api_src.py

@@ -977,3 +977,228 @@ def test_the_generator_dsd_inserts_match_their_tables():
             f"declared count is {count}")
         assert template.count("%s") == len(written), (
             f"{table}: the row template and the column list disagree")
+
+
+# ---------------------------------------------------------------------------
+# 8. A DSD short-ship has NO fulfillment behind it — t_d74d67a3
+# ---------------------------------------------------------------------------
+# A shortfall is detected in one of two places and only one of them has a
+# fulfillment behind it. `detected_source` says which, and
+# `short_ship_requires_its_parents` is what makes the claim true:
+#
+#   receiving      our dock, on our truck  -> both parent columns NOT NULL
+#   dsd_delivery   the vendor's own shelf  -> both parent columns NULL
+#
+# Before this, both columns were NOT NULL, so the DSD path had to invent
+# `00000000-0000-0000-0000-<random>` uuids, the FKs rejected them, and the
+# short-ship (plus the credit memo behind it) could never be written at all.
+DSD_SHORT_SHIP_SQL = """
+    INSERT INTO inv.short_ship_events
+        (fulfillment_item_id, fulfillment_id, supplier_id, product_id,
+         location_id, detected_source, quantity_requested, quantity_picked,
+         quantity_short, unit_cost, short_value, promised_lead_time_days,
+         realized_lead_time_days, is_creditable, event_dt)
+    VALUES (%(item)s, %(fulfillment)s, %(supplier)s::uuid, %(product)s::uuid,
+            %(store)s::uuid, %(source)s, 40, 25, 15, 4.0, 60.00, 2, 3,
+            TRUE, NOW())
+"""
+
+
+def _dsd_parents(seeded, source='dsd_delivery', with_fulfillment=False):
+    """Params for the row `generate_dsd_deliveries` writes."""
+    item_id, fulfillment_id = (None, None)
+    if with_fulfillment:
+        item_id = '99999999-0000-0000-0000-000000000009'
+        fulfillment_id = '99999999-0000-0000-0000-000000000008'
+    return {'item': item_id, 'fulfillment': fulfillment_id,
+            'supplier': seeded['supplier'], 'product': seeded['product'],
+            'store': seeded['store'], 'source': source}
+
+
+def test_a_dsd_short_ship_needs_no_fulfillment(sandbox, seeded):
+    """The row the DSD path writes: NULL parents, detected_source dsd_delivery.
+
+    This is the INSERT that could never land before the card, and its failure
+    was swallowed by `_run_vendor_phase` — which is why `inv.short_ship_events`
+    had zero `dsd_delivery` rows on every seed while the phase was green.
+    """
+    conn = sandbox_conn(sandbox)
+    ok, detail = accepts(conn, DSD_SHORT_SHIP_SQL,
+                         _dsd_parents(seeded))
+    assert ok, f"a DSD short-ship with no fulfillment was rejected: {detail}"
+
+
+def test_a_receiving_short_ship_needs_its_fulfillment(sandbox, seeded):
+    """The other half of the CHECK: a receiving shortfall ALWAYS came off a
+    fulfillment line, so a NULL parent there is a generator bug the table
+    catches rather than a shape it accepts."""
+    conn = sandbox_conn(sandbox)
+    rejected, detail = rejects(conn, DSD_SHORT_SHIP_SQL,
+                               _dsd_parents(seeded, source='receiving'))
+    assert rejected, (
+        'a receiving short-ship with NULL fulfillment columns was accepted — '
+        'every mart joining it would silently drop the row')
+
+
+def test_a_dsd_short_ship_cannot_claim_a_fulfillment(sandbox, seeded):
+    """And a DSD short must not pretend to descend from one: the whole point of
+    the two columns being nullable is that a DSD drop has none."""
+    conn = sandbox_conn(sandbox)
+    rejected, detail = rejects(
+        conn, DSD_SHORT_SHIP_SQL,
+        _dsd_parents(seeded, source='dsd_delivery', with_fulfillment=True))
+    assert rejected
+
+
+def test_the_short_ship_parent_columns_are_nullable_on_a_fresh_bootstrap(
+        sandbox):
+    """says so in the catalog, not just in the CHECK: a NOT NULL column here is
+    what made the DSD INSERT impossible."""
+    conn = sandbox_conn(sandbox)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'short_ship_events' "
+            "  AND column_name IN ('fulfillment_id', 'fulfillment_item_id')",
+            (inv(sandbox),))
+        nullable = dict(cur.fetchall())
+    assert nullable == {'fulfillment_id': 'YES',
+                        'fulfillment_item_id': 'YES'}, nullable
+
+
+# ---------------------------------------------------------------------------
+# 9. The boot-time migration reaches an EXISTING data dir — t_d74d67a3
+# ---------------------------------------------------------------------------
+# `entrypoint.sh` applies schema.sql only on a FIRST run, and the generator's
+# role does not own the tables, so a DROP NOT NULL in schema.sql alone reaches a
+# fresh data dir and no existing one (CT107 included). The image now applies
+# `/app/migrations/*.sql` on every boot as `postgres`; this is the file, run
+# against a table in the shape every pre-card data dir has.
+MIGRATION_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "standalone", "migrations",
+    "001_short_ship_dsd_parents.sql")
+
+LEGACY_TABLE = "short_ship_events_legacy"
+
+
+def _migration_sql(sandbox, table):
+    """The migration file, pointed at the table this test is about."""
+    sql = open(MIGRATION_PATH, encoding="utf-8").read()
+    return sql.replace("inv.short_ship_events",
+                       f"{sandbox}inv.{table}")
+
+
+def _legacy_clone(conn, sandbox):
+    """A table in the shape a data dir bootstrapped BEFORE the card has."""
+    table = f"{sandbox}inv.{LEGACY_TABLE}"
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+    ok, detail = accepts(
+        conn, f"CREATE TABLE {table} (LIKE {sandbox}inv.short_ship_events "
+              f"INCLUDING ALL)")
+    assert ok, detail
+    ok, detail = accepts(
+        conn, f"ALTER TABLE {table} "
+              f"  ALTER COLUMN fulfillment_item_id SET NOT NULL, "
+              f"  ALTER COLUMN fulfillment_id SET NOT NULL")
+    assert ok, detail
+    ok, detail = accepts(
+        conn, f"ALTER TABLE {table} DROP CONSTRAINT "
+              f"short_ship_requires_its_parents")
+    assert ok, detail
+    return table
+
+
+def _columns(conn, sandbox, table=LEGACY_TABLE):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s "
+            "  AND column_name IN ('fulfillment_id', 'fulfillment_item_id')",
+            (inv(sandbox), table))
+        return dict(cur.fetchall())
+
+
+def _constraints(conn, sandbox, table=LEGACY_TABLE):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT conname, convalidated FROM pg_constraint "
+            "WHERE conrelid = %s::regclass",
+            (f"{sandbox}inv.{table}",))
+        return dict(cur.fetchall())
+
+
+def test_the_migration_converges_a_legacy_short_ship_table(sandbox, seeded):
+    """The measured path: an existing data dir, one boot, the new INSERT lands."""
+    conn = sandbox_conn(sandbox)
+    try:
+        _legacy_clone(conn, sandbox)
+        assert _columns(conn, sandbox) == {
+            'fulfillment_id': 'NO', 'fulfillment_item_id': 'NO'}, (
+            'the fixture is meant to be the OLD shape, where both columns are '
+            'NOT NULL — otherwise this test proves nothing')
+        assert 'short_ship_requires_its_parents' not in _constraints(
+            conn, sandbox)
+
+        ok, detail = accepts(conn, _migration_sql(sandbox, LEGACY_TABLE))
+        assert ok, f"the migration failed on a legacy data dir: {detail}"
+
+        assert _columns(conn, sandbox) == {
+            'fulfillment_id': 'YES', 'fulfillment_item_id': 'YES'}
+        constraints = _constraints(conn, sandbox)
+        assert constraints.get('short_ship_requires_its_parents') is True, (
+            'the migration must leave a VALIDATED constraint, not a NOT VALID '
+            'one nothing ever checks retroactively: %r' % (constraints,))
+
+        # And the new INSERT lands where it used to raise.
+        ok, detail = accepts(
+            conn, DSD_SHORT_SHIP_SQL.replace(
+                'inv.short_ship_events', f'{sandbox}inv.{LEGACY_TABLE}'),
+            _dsd_parents(seeded))
+        assert ok, f"the DSD short-ship still cannot insert: {detail}"
+    finally:
+        accepts(conn, f"DROP TABLE IF EXISTS {sandbox}inv.{LEGACY_TABLE}")
+        conn.close()
+
+
+def test_the_migration_is_idempotent(sandbox):
+    """Every boot re-applies it. A second run must be a no-op — not a duplicate
+    constraint, and not an error that crash-loops the container."""
+    conn = sandbox_conn(sandbox)
+    try:
+        _legacy_clone(conn, sandbox)
+        ok, detail = accepts(conn, _migration_sql(sandbox, LEGACY_TABLE))
+        assert ok, detail
+        first = _constraints(conn, sandbox)
+        ok, detail = accepts(conn, _migration_sql(sandbox, LEGACY_TABLE))
+        assert ok, f'the second application raised: {detail}'
+        assert _constraints(conn, sandbox) == first, (
+            'the constraint count changed on the second application')
+        assert len([name for name in _constraints(conn, sandbox)
+                    if name == 'short_ship_requires_its_parents']) == 1
+    finally:
+        accepts(conn, f"DROP TABLE IF EXISTS {sandbox}inv.{LEGACY_TABLE}")
+        conn.close()
+
+
+def test_the_migration_matches_what_schema_sql_declares(sandbox):
+    """Two copies of one DDL drift, and the copy that drifts is the one nothing
+    runs. This pins the pair the card names: both columns nullable, one CHECK.
+    """
+    source = open(SCHEMA_PATH, encoding="utf-8").read()
+    table = re.search(
+        r"CREATE TABLE inv\.short_ship_events \((.*?)\n\);", source, re.S)
+    assert table, 'short_ship_events not found in schema.sql'
+    body = table.group(1)
+    assert re.search(r"fulfillment_item_id\s+UUID\s+REFERENCES", body), body
+    assert re.search(r"fulfillment_id\s+UUID\s+REFERENCES", body), body
+    assert 'CONSTRAINT short_ship_requires_its_parents CHECK' in body
+
+    migration = open(MIGRATION_PATH, encoding="utf-8").read()
+    for column in ('fulfillment_item_id', 'fulfillment_id'):
+        assert re.search(
+            rf'ALTER COLUMN {column}\s+DROP NOT NULL', migration), (
+            f'the migration does not drop NOT NULL on {column}')
+    assert 'ADD CONSTRAINT short_ship_requires_its_parents CHECK' in migration
+
+

@@ -171,10 +171,10 @@ def recording_execute_values(monkeypatch):
     return _spy
 
 
-def _run(db, sim_dt=SIM_DT):
+def _run(db, sim_dt=SIM_DT, cfg=None):
     random.seed(20261019)
     return suppliers.generate_dsd_deliveries(
-        db, Config(), sim_dt, [_vendor()], [{'location_id': STORE}],
+        db, cfg or Config(), sim_dt, [_vendor()], [{'location_id': STORE}],
         [{'product_id': product[0]} for product in CATALOGUE])
 
 
@@ -286,7 +286,9 @@ def test_the_vendor_phase_writes_the_days_dsd_deliveries(monkeypatch):
     assert deliveries['lines'] > 0
     assert any('INSERT INTO inv.dsd_deliveries' in sql for sql in
                db.statements_containing('INSERT INTO inv.dsd_deliveries'))
-    assert memos == {'submitted': 0, 'paid': 0, 'rejected': 0, 'expired': 0}
+    assert memos['opened'] == 0
+    assert memos['submitted'] == 0 and memos['paid'] == 0
+    assert memos['rejected'] == 0 and memos['expired'] == 0
 
 
 def test_the_vendor_phase_still_contains_a_real_failure(monkeypatch):
@@ -316,8 +318,119 @@ def test_the_vendor_phase_still_contains_a_real_failure(monkeypatch):
         logger.removeHandler(handler)
 
     assert deliveries == {'deliveries': 0, 'lines': 0, 'short_lines': 0}
-    assert memos == {'submitted': 0, 'paid': 0, 'rejected': 0, 'expired': 0}
+    assert memos == {'opened': 0, 'submitted': 0, 'paid': 0, 'rejected': 0,
+                     'expired': 0}
     assert any('Vendor phase failed' in record.getMessage()
                for record in records), (
         'a swallowed vendor-phase failure must leave a log line; got %r'
         % ([r.getMessage() for r in records],))
+
+
+# ---------------------------------------------------------------------------
+# The DSD short-ship path — t_d74d67a3
+#
+# It was dead code twice over: `short = short_quantity(quantity, quantity)`
+# (identically zero on both branches), and if the arithmetic had been right it
+# would have died on `fulfillment_item_id` / `fulfillment_id`, which were NOT
+# NULL FKs and were being handed fabricated uuids for a drop that has no
+# fulfillment behind it. Both halves are pinned here; the DDL half (the columns
+# are nullable and the CHECK ties them to detected_source) is pinned in
+# test_supplier_schema.py.
+# ---------------------------------------------------------------------------
+def _short_inserts(db):
+    return [(sql, params) for sql, params in db.writes
+            if 'INSERT INTO inv.short_ship_events' in sql]
+
+
+def _cfg_with_dsd_short_rate(rate):
+    """A Config whose DSD short probability is exactly `rate`.
+
+    `_vendor()` carries short_ship_rate 0.08 and the DSD rate is that plus
+    `dsd_short_ship_bonus`, so the bonus is what moves it — which is also the
+    assertion that the config key is read at all.
+    """
+    cfg = Config()
+    cfg.vendors.dsd_short_ship_bonus = max(0.0, rate - 0.08)
+    return cfg
+
+
+def test_a_short_dsd_line_writes_a_short_ship_event(recording_execute_values):
+    """The card's arithmetic defect: with the short rate at 1.0 EVERY line is
+    short, and the event must say so (`quantity_short = requested - picked > 0`).
+    """
+    db = _FakeDB()
+    counts = _run(db, cfg=_cfg_with_dsd_short_rate(1.0))
+
+    inserts = _short_inserts(db)
+    assert inserts, 'the DSD drop shorted every line and wrote no short-ship'
+    assert counts['short_lines'] == len(inserts)
+    for _sql, params in inserts:
+        requested, picked, short = params[4], params[5], params[6]
+        assert short == pytest.approx(requested - picked), (requested, picked, short)
+        assert short > 0, 'inv.short_ship_events CHECKs quantity_short > 0'
+        assert 0 <= picked < requested, (requested, picked)
+
+
+def test_a_dsd_short_ship_names_no_fulfillment(recording_execute_values):
+    """A DSD drop has no pallet on our loads: both parent columns are NULL.
+
+    The bug this replaces wrote `00000000-0000-0000-0000-<random>` uuids into
+    both, which the FKs rejected — so the INSERT (and the memo behind it) could
+    never land.
+    """
+    db = _FakeDB()
+    _run(db, cfg=_cfg_with_dsd_short_rate(1.0))
+
+    inserts = _short_inserts(db)
+    assert inserts
+    for sql, params in inserts:
+        assert not any(str(p).startswith('00000000-0000-0000-0000')
+                       for p in params), (
+            'a fabricated uuid is back in the DSD short-ship row: %r' % (params,))
+        assert 'VALUES (NULL, NULL,' in ' '.join(sql.split()), (
+            'the DSD row must write NULL for both fulfillment parents')
+        assert params[3] == suppliers.DETECTED_DSD
+
+
+def test_a_dsd_short_ship_is_creditable_only_on_the_vendors_terms(
+        recording_execute_values):
+    """`is_creditable` travels with the event, so a vendor with no returns
+    agreement records the shortfall and gets no claim (SEMA-17)."""
+    db = _FakeDB()
+    _run(db, cfg=_cfg_with_dsd_short_rate(1.0))
+
+    assert all(params[11] is True for _sql, params in _short_inserts(db))
+
+
+def test_no_short_rate_no_short_ship(recording_execute_values):
+    """The mirror: a vendor that always delivers writes items and no events.
+    This is what makes the test above about the DRAW rather than about rows."""
+    db = _FakeDB()
+    counts = _run(db, cfg=_cfg_with_dsd_short_rate(0.0))
+
+    assert counts['short_lines'] == 0
+    assert _short_inserts(db) == []
+    items = db.batch_for('INSERT INTO inv.dsd_delivery_items')
+    assert items is not None, 'a clean drop still delivers its lines'
+    assert all(row[2] > 0 for row in items[1])
+
+
+def test_a_fully_missed_line_writes_no_delivery_item(recording_execute_values):
+    """`inv.dsd_delivery_items` is what ARRIVED. A line the vendor never brought
+    exists only as a short-ship event, and the delivery's own totals must agree
+    with the items it did write (SEMA-24 reconciles the two at the mart)."""
+    db = _FakeDB()
+    counts = _run(db, cfg=_cfg_with_dsd_short_rate(1.0))
+
+    items = db.batch_for('INSERT INTO inv.dsd_delivery_items')
+    item_rows = items[1] if items else []
+    assert len(item_rows) == counts['lines']
+    assert all(row[2] > 0 for row in item_rows), (
+        'a delivery line with nothing delivered belongs in the short-ship '
+        'event, not in dsd_delivery_items')
+
+    header = db.statements_containing('INSERT INTO inv.dsd_deliveries')[0]
+    params = db.writes[[sql for sql, _ in db.writes].index(header)][1]
+    assert params[6] == pytest.approx(sum(row[2] for row in item_rows)), (
+        'total_units must be the sum of the units that actually arrived')
+    assert params[8] == len(item_rows)

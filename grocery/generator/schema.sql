@@ -937,12 +937,31 @@ CREATE INDEX idx_weather_location ON weather.daily (location_id, weather_date);
 -- that never resolves is a real finding (the vendor is not paying), so
 -- `resolved_dt IS NULL` is a legitimate state, not a defect — see the CHECK.
 --
--- Declared AFTER fulfillment.items because the short event references the pick
--- that was short, and the memo references the short event.
+-- Declared AFTER fulfillment.items because a RECEIVING short event references
+-- the pick that was short, and the memo references the short event.
+--
+-- THE TWO FULFILLMENT COLUMNS ARE NULLABLE ON PURPOSE (t_d74d67a3). A shortfall
+-- has two detection shapes and only one of them has a fulfillment behind it:
+--
+--   detected_source = 'receiving'     found at OUR dock on one of our loads.
+--                                     There IS a fulfillment line and order;
+--                                     both columns are NOT NULL.
+--   detected_source = 'dsd_delivery'  found on the shelf after the vendor's own
+--                                     truck left. There is no pallet on our
+--                                     transport.loads and no fulfillment.orders
+--                                     row anywhere behind it, so both columns
+--                                     are NULL — the honest value.
+--
+-- A DSD short used to write fabricated `00000000-0000-0000-0000-<random>`
+-- uuids here, which is why the path could never insert (the FKs rejected them)
+-- and was dead code on every seed. `short_ship_requires_its_parents` below is
+-- what keeps the two shapes from being confused: a row claims which shape it is
+-- via `detected_source`, and the CHECK makes that claim true.
 CREATE TABLE inv.short_ship_events (
     short_ship_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    fulfillment_item_id  UUID         NOT NULL REFERENCES fulfillment.items(item_id),
-    fulfillment_id       UUID         NOT NULL REFERENCES fulfillment.orders(fulfillment_id),
+    -- NULL for a DSD short; NOT NULL for a receiving one (see the CHECK).
+    fulfillment_item_id  UUID         REFERENCES fulfillment.items(item_id),
+    fulfillment_id       UUID         REFERENCES fulfillment.orders(fulfillment_id),
     supplier_id          UUID         NOT NULL REFERENCES inv.suppliers(supplier_id),
     product_id           UUID         NOT NULL REFERENCES pos.products(product_id),
     -- The store the shortfall hits. For a DSD vendor this is the store the
@@ -979,6 +998,21 @@ CREATE TABLE inv.short_ship_events (
     -- because this is the invariant a mart would otherwise silently violate.
     CONSTRAINT short_ship_creditable_requires_short CHECK (
         NOT is_creditable OR quantity_short > 0
+    ),
+    -- The parents a shortfall has depends on HOW it was detected, and the two
+    -- shapes are mutually exclusive. Written as a CHECK rather than two
+    -- nullable columns nothing reconciles, so a receiving short can never lose
+    -- its fulfillment (a mart joining it would silently drop the row) and a DSD
+    -- short can never claim a fulfillment that does not exist (the fabricated
+    -- uuids this card removed).
+    CONSTRAINT short_ship_requires_its_parents CHECK (
+        (detected_source = 'receiving'
+         AND fulfillment_item_id IS NOT NULL
+         AND fulfillment_id IS NOT NULL)
+        OR
+        (detected_source = 'dsd_delivery'
+         AND fulfillment_item_id IS NULL
+         AND fulfillment_id IS NULL)
     )
 );
 

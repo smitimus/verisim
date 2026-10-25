@@ -259,9 +259,13 @@ SELECT ds.schedule_id, ds.supplier_id
                 WHERE s.supplier_id = ds.supplier_id);
 
 -- [HARD-32] inv.short_ship_events.fulfillment_item_id → fulfillment.items
+-- A DSD short-ship has NO fulfillment behind it (t_d74d67a3), so the column is
+-- NULL for detected_source = 'dsd_delivery' and this anti-join must skip those
+-- rows — otherwise every DSD short reads as an orphaned FK.
 SELECT se.short_ship_id, se.fulfillment_item_id
             FROM inv.short_ship_events se
-            WHERE NOT EXISTS (
+            WHERE se.fulfillment_item_id IS NOT NULL
+              AND NOT EXISTS (
                 SELECT 1 FROM fulfillment.items fi
                 WHERE fi.item_id = se.fulfillment_item_id)
               AND se.event_dt::date < CURRENT_DATE;
@@ -541,6 +545,22 @@ SELECT ip.product_id, ip.supplier_name, s.supplier_name AS vendor_name
             FROM inv.products ip
             JOIN inv.suppliers s ON s.supplier_id = ip.supplier_id
             WHERE ip.supplier_name IS DISTINCT FROM s.supplier_name;
+
+-- [SEMA-28] a short-ship's fulfillment parents must match its detected_source
+-- A receiving short came off one of OUR fulfillment lines (both parents NOT
+-- NULL); a DSD short came off the vendor's own truck, which has no fulfillment
+-- behind it (both parents NULL). The source CHECK short_ship_requires_its_parents
+-- is the same invariant; this restates it where the catalog cannot be trusted to
+-- have the migration yet (t_d74d67a3).
+SELECT se.short_ship_id, se.detected_source,
+                   se.fulfillment_item_id, se.fulfillment_id
+            FROM inv.short_ship_events se
+            WHERE (se.detected_source = 'receiving'
+                   AND (se.fulfillment_item_id IS NULL
+                        OR se.fulfillment_id IS NULL))
+               OR (se.detected_source = 'dsd_delivery'
+                   AND (se.fulfillment_item_id IS NOT NULL
+                        OR se.fulfillment_id IS NOT NULL));
 
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
