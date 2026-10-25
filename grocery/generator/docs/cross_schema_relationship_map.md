@@ -401,6 +401,37 @@ No further serializer changes are required for #26–#31.
 > `inv.receipts → transport.loads` without a second round-trip. Committed in
 > verisim `2cb9bed`.
 
+> **A receipt header has NO vendor, and the route must not pretend otherwise
+> (t_7d966a37).** Every grocery receipt is one of *our own warehouse loads*, so a
+> receipt's goods are the PRODUCTS' vendors', not one vendor's: on a fresh 30-day
+> backfill 75 of 78 receipts carried goods from 2–5 vendors (1 vendor on the other
+> 3 — a coincidence of that day's pick list, not a rule). `inv.receipts.supplier_id`
+> and `inv.receipts.supplier_name` are both therefore **unwritten**: the only
+> grocery writer is `transport.receive_delivered_loads`, whose INSERT is
+> `(receipt_id, location_id, received_dt, po_number, load_id, total_cost)` — no
+> vendor column at all, id *or* name — and a DSD drop deliberately writes no
+> receipt (`suppliers.generate_dsd_deliveries`; its vendor lives on
+> `inv.dsd_deliveries`). Measured: **0 of 78** receipts with a non-NULL
+> `supplier_id` or `supplier_name`, and 0 of 9 on each of four independent 8-day
+> seeds. `supplier_id` is a reserved slot for a future single-vendor receipt path,
+> not a write someone forgot.
+>
+> So `/inventory/receipts` does not serve `supplier_id` — and must not: the route
+> SQL in `base/api/main.py` is shared across industries, and
+> `gas-station/generator/schema.sql`, `base/db/init.sql` and
+> `base/db/03_grocery_schema.sql` all define `inv.receipts` **without** that
+> column, so a shared projection would 500 those data dirs in order to serve a
+> column of NULLs here. (`supplier_name` stays in the projection for gas-station,
+> whose `check_and_restock` DOES populate it — grouped per vendor, one receipt per
+> vendor per location. Grocery leaves it NULL.)
+>
+> **Vendor attribution lives on the LINE, and is complete.** Every
+> `inv.receipt_items` row reaches a vendor through `product_id →
+> inv.products.supplier_id`: 18,539 of 18,539 lines on the same backfill. A
+> vendor-level receipts measure joins `stg_inv_receipt_items → stg_inv_products`
+> on `product_id`; it must not wait for a header column, and a NULL
+> `stg_inv_receipts.supplier_id` is not an ingest gap.
+
 ---
 
 ## 5. Integrity harness
