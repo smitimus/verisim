@@ -452,6 +452,35 @@ The `data-lab` raw copy needs no transformation — this is a source-clock fix,
 but its `assert_online_orders_reconcile` is the natural place for the same
 predicate on the EDW side.
 
+### ...and the band has a ceiling (t_e1278564)
+
+`completed_dt = sim_dt` is only a completion while the pass that sees the row is
+near the row's own time. The test slot's timeline had a **34-day hole** (the
+source retention window, partly re-created by a backfill), so the first pass over
+a 2026-10-08 23:00 order was 2026-11-15 00:00 — and that became its completion:
+**37 days 02 h**, 56 rows over 24 h, and the only reason
+`mart_online_fulfillment`'s two duration bounds (`avg_hours_to_fulfil`,
+`avg_minutes_late`) were red. A contiguous 10-day backfill never does this
+(longest span 17 h), so the class is the clock jump, not a duration
+distribution.
+
+`online.max_fulfillment_hours` (24 h, 4× the longest promise) closes the other
+end:
+
+| Layer | Where | What it does |
+|---|---|---|
+| the law | `models/online._lifecycle_instant` | inside `[placed_dt, placed_dt + ceiling]` the pass clock is used unchanged; past it every instant this pass writes for that row is derived from the order (`_late_instant`, seeded on `order_id`) inside `[floor, placed_dt + ceiling]` |
+| events | same function | the terminal event is stamped with the completion it records, and no stage of a recovered order is written after it |
+| repair | `migrations/006_online_order_ceiling.sql` | clamps rows an earlier image wrote and pulls their events back with the completion; idempotent, no CHECK (the ceiling is a config knob, so a table constraint could not read it) |
+| assertion | `TIME-05` | `completed_dt <= placed_dt + 24 h`, plus `tests/test_online_order_clock.py` (a 37-day gap, a generated day followed by a 34-day gap, and the migration against a pre-card table) |
+
+The generator logs one warning per pass that finds orders past their window, so
+a gap in the timeline is visible in `docker logs` instead of only in the data.
+The `data-lab` side (t_114dc03f) owns the wide-window re-ingest — `online.orders`
+loads incrementally on `placed_dt`, so the repaired rows sit behind the
+watermark.
+
+
 ---
 
 ## 4. API exposure — endpoint → join keys (data-lab #26–#31)

@@ -1097,6 +1097,39 @@ ASSERTIONS: List[AssertionSpec] = [
               AND o.placed_dt::date < CURRENT_DATE
         """,
     ),
+    # t_e1278564: the OTHER end of the same band. `completed_dt` is the pass
+    # clock, so it is only a completion while the pass that sees the order is
+    # near the order's own time. The test slot's timeline had a 34-day hole (the
+    # source retention window, partly re-created by a backfill), so its first
+    # pass over a 2026-10-08 order was 2026-11-15 and that became the completion:
+    # 37 days 02 h, 56 rows over 24 h, and the only reason
+    # `mart_online_fulfillment`'s two duration bounds were red.
+    #
+    # The generator now bounds every instant it writes for an order to
+    # `placed_dt + online.max_fulfillment_hours` (24 h by default) and derives a
+    # late one from the order; `migrations/006_online_order_ceiling.sql` clamps
+    # the rows earlier images wrote.
+    #
+    # Deliberately NOT scoped to completed days, like TIME-03: this is not a
+    # time-bounded column of a partial day (`completed_dt` is outside
+    # `TIME_BOUNDED_COLS`) and the band cannot be transiently violated — an order
+    # placed today cannot be completed more than 24 h after its placement yet, so
+    # an unscoped predicate has no false positive. The 24 h here mirrors the
+    # config default; `test_online_order_clock.py::
+    # test_the_band_assertion_matches_the_config_ceiling` parses this SQL and
+    # fails if the two drift.
+    AssertionSpec(
+        id="TIME-05",
+        dimension="temporal",
+        title="online.orders.completed_dt — an order is completed inside its own lifecycle window (<= placed_dt + 24 h)",
+        sql="""
+            SELECT o.order_id, o.fulfillment_type, o.placed_dt, o.completed_dt,
+                   o.completed_dt - o.placed_dt AS span
+            FROM online.orders o
+            WHERE o.completed_dt IS NOT NULL
+              AND o.completed_dt > o.placed_dt + interval '24 hours'
+        """,
+    ),
 ]
 
 

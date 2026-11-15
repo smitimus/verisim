@@ -171,6 +171,16 @@ class OnlineConfig:
     # extends forward from its promise instead of producing a negative duration.
     pickup_early_grace_minutes: int = 15    # collected before the pickup window opens
     delivery_early_grace_minutes: int = 30  # delivered before promised_delivery_dt
+    # The OTHER end of the same band (t_e1278564). `completed_dt` is stamped
+    # from the pass clock, so a pass that arrives after a GAP in the generator's
+    # timeline (a retention hole, a month-old row replayed) would otherwise
+    # complete an order weeks after it was placed. Completion is therefore
+    # bounded to `placed_dt + max_fulfillment_hours`; when the pass lands beyond
+    # it the instant is derived from the order instead of the clock. 24 h is
+    # 4x the longest promise (2-4 h window + 2-4 h delivery) — a store that
+    # takes more than a day to hand an order over is a different phenomenon and
+    # would need its own model.
+    max_fulfillment_hours: int = 24
 
 
 @dataclass
@@ -486,6 +496,7 @@ SCHEMA = (
      ('online', 'pickup_early_grace_minutes')),
     (('online', 'delivery_early_grace_minutes'),
      ('online', 'delivery_early_grace_minutes')),
+    (('online', 'max_fulfillment_hours'), ('online', 'max_fulfillment_hours')),
     # scenarios
     (('scenarios', 'rush_hour', 'volume_multiplier'), ('scenarios', 'rush_hour_multiplier')),
     (('scenarios', 'rush_hour', 'hours'), ('scenarios', 'rush_hour_hours')),
@@ -750,8 +761,9 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
     for key in ['pickup_share', 'service_fee_delivery', 'cancel_rate', 'noshow_rate']:
         if key in onl:
             setattr(cfg.online, key, float(onl[key]))
-    # Integer allowances, so they are coerced as ints (t_c9ea180f).
-    for key in ['pickup_early_grace_minutes', 'delivery_early_grace_minutes']:
+    # Integer allowances, so they are coerced as ints (t_c9ea180f, t_e1278564).
+    for key in ['pickup_early_grace_minutes', 'delivery_early_grace_minutes',
+                'max_fulfillment_hours']:
         if key in onl:
             setattr(cfg.online, key, int(onl[key]))
 

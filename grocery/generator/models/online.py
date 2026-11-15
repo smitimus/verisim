@@ -11,11 +11,12 @@ Basket behavior is deliberately different from in-store POS:
   * service fee on delivery; pickup has a 2-hour pickup window
   * append-only lifecycle event stream; ~3-8% of orders never complete
     (cancel before ready, no_show after ready_for_pickup window closes)
-  * the clock is monotonic: an order can only be advanced by a pass whose
-    simulated instant is at or after it was placed, and it cannot be completed
-    before its promise (delivery) or its window (pickup) is nearly due —
-    `placed_dt <= completed_dt` is a database CHECK as well as a test
-    (t_c9ea180f)
+  * the clock is monotonic and bounded: an order can only be advanced by a pass
+    whose simulated instant is at or after it was placed, it cannot be completed
+    before its promise (delivery) or its window (pickup) is nearly due, and it
+    cannot be completed later than `online.max_fulfillment_hours` after it was
+    placed — `placed_dt <= completed_dt <= placed_dt + 24 h` is asserted as well
+    as tested (t_c9ea180f, t_e1278564)
 
 Online demand depletes store stock exactly like POS does.
 
@@ -207,6 +208,49 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
     return depletion_info
 
 
+def _lifecycle_instant(order_id: str, placed: datetime, sim_dt: datetime,
+                       ceiling: timedelta,
+                       floor: Optional[datetime] = None) -> datetime:
+    """The instant this pass records for one order (t_e1278564).
+
+    The pass clock while the order is still inside its own lifecycle window —
+    that is every contiguous run, and it is unchanged. Past the window (a pass
+    that arrives after a GAP in the timeline) the pass clock is meaningless for
+    this row, so the instant is derived from the order instead, inside
+    `[floor, placed + ceiling]`. `floor` is the branch's own earliest plausible
+    instant (a promise, a pickup-window edge) and only ever moves forward, so
+    an order recovered across a gap keeps its stages in order.
+    """
+    window_end = placed + ceiling
+    if sim_dt <= window_end:
+        return sim_dt
+    lo = placed if floor is None else min(max(floor, placed), window_end)
+    return _late_instant(order_id, lo, window_end)
+
+
+def _late_instant(order_id: str, floor: datetime, window_end: datetime) -> datetime:
+    """An instant inside `[floor, window_end]`, derived from the ORDER.
+
+    Only used when a pass arrives after the order's own lifecycle window has
+    already closed — a GAP in the generator's timeline (a retention hole, a
+    month-old row replayed after a restart), not a slow order. There is no
+    stored plan to consult, so the instant is derived from the order id: the
+    same row answers the same thing on every pass, and no column, migration or
+    future timestamp is needed. This is the pattern `fulfillment._pick_state`
+    uses for its per-row pick schedule.
+
+    The draw is the same fraction for every stage of one order, and the caller
+    passes a floor that only ever moves forward (placement -> promise), so the
+    stages of a recovered order stay in non-decreasing order inside its window
+    instead of jumping to the replay date and coming back.
+    """
+    span = (window_end - floor).total_seconds()
+    if span <= 0:
+        return window_end
+    return floor + timedelta(
+        seconds=random.Random(f"online-late:{order_id}").random() * span)
+
+
 def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
     """Move open orders through their lifecycle based on elapsed time.
     Each order advances at most one stage per tick. Returns events written.
@@ -240,6 +284,27 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
        (`standalone/migrations/005_online_order_clock.sql` carries it to a data
        dir that already exists, repairing the historical rows first).
 
+    ...AND THE OTHER END IS BOUNDED TOO (t_e1278564)
+    -------------------------------------------------
+    The clock law above says a completion cannot precede its placement. It used
+    to say nothing about the far end, and `sim_dt` is only the completion of an
+    order when the pass that sees the row is near the row's own time. The test
+    slot's timeline had a hole (the source retention window, partly re-created
+    by a backfill), so the first pass to see a 2026-10-08 order again was
+    2026-11-15 00:00 — and that became its completion: 37 days 02 h, 20 rows over
+    48 h, and the only reason `mart_online_fulfillment`'s two duration bounds
+    were red. A contiguous backfill never does this (its longest span is 17 h),
+    so it is the clock jump, not the promise gate.
+
+    A completion — and every other instant this pass writes for the same order —
+    is therefore bounded to `placed_dt + online.max_fulfillment_hours` (24 h, 4x
+    the longest promise). Inside the window the pass clock is still used
+    unchanged, which is every contiguous run; outside it the instant is derived
+    from the order (`_late_instant`), never from the replay date. The terminal
+    event is stamped with the completion it records, so `order_events` cannot
+    disagree with the order, and `standalone/migrations/006_online_order_
+    ceiling.sql` clamps the rows a previous image already wrote.
+
     A long-tail delivery extends the completion FORWARD instead of sampling a
     duration that can go negative: a delivery completes no earlier than
     `promised_delivery_dt - delivery_early_grace_minutes`, and a pickup no
@@ -249,6 +314,7 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
     """
     pickup_grace = timedelta(minutes=cfg.online.pickup_early_grace_minutes)
     delivery_grace = timedelta(minutes=cfg.online.delivery_early_grace_minutes)
+    ceiling = timedelta(hours=cfg.online.max_fulfillment_hours)
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -267,6 +333,7 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
         events = []
         updates = []
         skipped = 0
+        late = 0
         for oid, ftype, status, placed, pws, pwe, promised in rows:
             # Layer 2 of the clock law. Unreachable while the SELECT above holds;
             # a skip keeps a bad clock from taking the whole batch down.
@@ -277,31 +344,38 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
                 skipped += 1
                 continue
             age_min = (sim_dt - placed).total_seconds() / 60
+            if sim_dt > placed + ceiling:
+                late += 1
+
+            def at(floor=None, _oid=oid, _placed=placed):
+                """The instant this pass writes for THIS order."""
+                return _lifecycle_instant(_oid, _placed, sim_dt, ceiling, floor)
+
             if status == 'placed':
                 # cancelled-any-time before ready
                 if random.random() < cfg.online.cancel_rate:
                     if age_min > 5:
                         updates.append(('cancelled', None, oid))
-                        events.append((oid, 'cancelled', sim_dt,
+                        events.append((oid, 'cancelled', at(),
                                        'Customer cancelled from account page'))
                 elif age_min >= random.randint(2, 10):
                     updates.append(('confirmed', None, oid))
-                    events.append((oid, 'confirmed', sim_dt,
+                    events.append((oid, 'confirmed', at(),
                                    'Order accepted, queued for picker'))
             elif status == 'confirmed':
                 if age_min >= random.randint(15, 45):
                     updates.append(('picking', None, oid))
-                    events.append((oid, 'picking_started', sim_dt, None))
+                    events.append((oid, 'picking_started', at(), None))
             elif status == 'picking':
                 if age_min >= random.randint(60, 120):
                     if ftype == 'pickup':
                         updates.append(('ready', None, oid))
-                        events.append((oid, 'ready_for_pickup', sim_dt,
+                        events.append((oid, 'ready_for_pickup', at(),
                                        'Staged in pickup area; SMS sent'))
                     else:
                         updates.append(('out_for_delivery', None, oid))
-                        events.append((oid, 'driver_assigned', sim_dt, None))
-                        events.append((oid, 'out_for_delivery', sim_dt,
+                        events.append((oid, 'driver_assigned', at(), None))
+                        events.append((oid, 'out_for_delivery', at(),
                                        'Route 12, ETA 45 min'))
             elif status == 'ready':
                 if pwe and sim_dt > pwe:
@@ -309,15 +383,16 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
                     # (noshow_rate gates the uncalled share; restock happens in
                     # the shrinkage model as 'returned' goods implicitly).
                     if random.random() < (1.0 - cfg.online.noshow_rate * 4):
-                        updates.append(('completed', sim_dt, oid))
-                        events.append((oid, 'picked_up', sim_dt,
+                        done = at(pwe)
+                        updates.append(('completed', done, oid))
+                        events.append((oid, 'picked_up', done,
                                        'Late pickup past window'))
                     else:
                         # no_show: window closed, goods go back to store stock
                         # later via shrinkage/restock review — completed_dt
                         # stays NULL (order was never completed).
                         updates.append(('no_show', None, oid))
-                        events.append((oid, 'no_show', sim_dt,
+                        events.append((oid, 'no_show', at(pwe),
                                        'Pickup window closed, no collection'))
                 elif pws and sim_dt < pws - pickup_grace:
                     # The customer's window has not opened yet: the goods are
@@ -326,8 +401,9 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
                     # hour that precedes its own placement (t_c9ea180f).
                     continue
                 elif random.random() < 0.35:
-                    updates.append(('completed', sim_dt, oid))
-                    events.append((oid, 'picked_up', sim_dt, None))
+                    done = at(pws - pickup_grace if pws else None)
+                    updates.append(('completed', done, oid))
+                    events.append((oid, 'picked_up', done, None))
             elif status == 'out_for_delivery':
                 if promised and sim_dt < promised - delivery_grace:
                     # Still on the road. The promise is the earliest a driver
@@ -335,14 +411,24 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
                     # from it instead of completing before the order left.
                     continue
                 if random.random() < 0.6:
-                    updates.append(('completed', sim_dt, oid))
-                    events.append((oid, 'delivered', sim_dt, 'Left at door'))
+                    done = at(promised - delivery_grace if promised else None)
+                    updates.append(('completed', done, oid))
+                    events.append((oid, 'delivered', done, 'Left at door'))
 
         if skipped:
             log.warning(
                 "online lifecycle: skipped %d order(s) whose placed_dt is after "
                 "the pass clock %s — a caller is passing a sim_dt behind the "
                 "rows it is asked to advance", skipped, sim_dt)
+        if late:
+            log.warning(
+                "online lifecycle: %d order(s) were already past their %d h "
+                "fulfillment window when the pass clock reached %s — a GAP in "
+                "the timeline (a retention hole or a replay). Their instants are "
+                "derived from the order, inside [placed_dt, placed_dt + %d h], "
+                "not stamped with the pass clock (t_e1278564)",
+                late, cfg.online.max_fulfillment_hours, sim_dt,
+                cfg.online.max_fulfillment_hours)
 
         if updates:
             execute_values(cur, """

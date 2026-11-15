@@ -368,6 +368,19 @@ online:
   delivery_early_grace_minutes: 30 # how early a delivery may complete before
                                    # promised_delivery_dt; a long-tail delivery
                                    # extends FORWARD from the promise.
+  max_fulfillment_hours: 24        # the other end of the band (t_e1278564): an
+                                   # order is completed no later than
+                                   # placed_dt + 24 h. `completed_dt` is the pass
+                                   # clock, so a pass that arrives after a GAP in
+                                   # the timeline (a retention hole, a month-old
+                                   # row replayed) would otherwise complete it
+                                   # weeks late — measured at 37 days. Past the
+                                   # ceiling the instant is derived from the order
+                                   # instead of the clock. 24 h is 4x the longest
+                                   # promise; a slower handover is a different
+                                   # phenomenon and would need its own model.
+                                   # migrations/006_online_order_ceiling.sql clamps
+                                   # existing rows to the same window.
 
 scenarios:
   rush_hour:

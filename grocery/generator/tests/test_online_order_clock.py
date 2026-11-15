@@ -71,6 +71,9 @@ SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "..", "schema.sql")
 MIGRATION_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "standalone", "migrations",
     "005_online_order_clock.sql")
+CEILING_MIGRATION_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "standalone", "migrations",
+    "006_online_order_ceiling.sql")
 
 GENERATOR_SCHEMAS = tuple(sorted(set(re.findall(
     r"CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+(\w+)\s*;",
@@ -624,3 +627,309 @@ def test_migration_repairs_a_legacy_table_then_constrains_it(db):
         cur.execute("DROP TABLE IF EXISTS online.order_events_legacy")
         cur.execute("DROP TABLE IF EXISTS online.orders_legacy")
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# 4. The OTHER end of the band: a clock jump across a timeline gap
+#    (t_e1278564)
+# ---------------------------------------------------------------------------
+# `completed_dt = sim_dt` is a correct completion only while the generator's
+# timeline is contiguous. The test slot's timeline had a 34-day hole (the source
+# retention window, partly re-created by a backfill), so the first pass to see a
+# 2026-10-08 23:00 order again was 2026-11-15 00:00 — and that became its
+# completion: 37 days 02 h, 56 rows over 24 h, the only reason
+# `mart_online_fulfillment`'s two duration bounds were red. A contiguous 10-day
+# backfill never does this (longest span 17 h), so the fix is a ceiling derived
+# from the ORDER, not a different duration distribution.
+
+def test_the_ceiling_is_a_configurable_knob_beyond_the_longest_promise():
+    """24 h is a knob, and it has to outlast the promise it must contain."""
+    cfg = Config()
+    ceiling = cfg.online.max_fulfillment_hours
+    assert isinstance(ceiling, int)
+    # The longest promise the generator can derive: a 2 h window plus a 4 h
+    # delivery, both measured from placement. A ceiling below that would make
+    # the band unsatisfiable and the promise gate below it dead code.
+    assert ceiling > 2 + 4, ceiling
+    assert ceiling <= 7 * 24, "a week is not a fulfillment ceiling, it is an outage"
+
+
+def test_a_pass_inside_the_window_still_uses_the_pass_clock():
+    """Nothing changes for a contiguous run — the clamp must be inert there."""
+    placed = SIM_DT
+    window = timedelta(hours=24)
+    for minutes in (0, 45, 6 * 60, 24 * 60 - 1):
+        sim_dt = placed + timedelta(minutes=minutes)
+        assert online._lifecycle_instant('any-order', placed, sim_dt, window) == sim_dt
+
+
+def test_a_late_pass_is_derived_from_the_order_and_stays_inside_the_band():
+    """The pure law: past the window the instant is derived, not the clock.
+
+    Deterministic per order (a replay answers the same thing), inside
+    `[floor, placed + ceiling]`, and not one constant for every order.
+    """
+    placed = SIM_DT
+    window = timedelta(hours=24)
+    late_pass = placed + timedelta(days=37, hours=2)
+    floor = placed + timedelta(hours=5, minutes=30)     # a delivery promise - grace
+
+    picked = {online._lifecycle_instant(f'order-{i}', placed, late_pass, window, floor)
+              for i in range(200)}
+    for instant in picked:
+        assert placed <= instant <= placed + window, instant
+        assert instant >= floor, instant
+    assert len(picked) > 100, "the derived instant collapsed onto a single value"
+    # ...and the same order answers the same instant on every pass.
+    assert (online._lifecycle_instant('order-7', placed, late_pass, window, floor)
+            == online._lifecycle_instant('order-7', placed, late_pass, window, floor))
+
+
+def test_a_gap_pass_completes_inside_the_order_window(db):
+    """The card's gap case, end to end: place, jump 37 days, complete.
+
+    Both fulfillment types, both completion branches. Before the ceiling these
+    rows completed at the pass clock — 37 days after placement, which is what
+    the test slot held.
+    """
+    conn = db
+    cfg = Config()
+    cfg.online.noshow_rate = 0.0          # a closed pickup window always collects
+    seed = _seed(conn)
+    ceiling = timedelta(hours=cfg.online.max_fulfillment_hours)
+    placed = SIM_DT
+    window_start = placed + timedelta(hours=2)
+    promised = placed + timedelta(hours=6)
+    with conn.cursor() as cur:
+        pickup = _insert_order(cur, seed, placed, ftype='pickup', status='ready',
+                               window_start=window_start,
+                               window_end=window_start + timedelta(hours=2))
+        delivery = _insert_order(cur, seed, placed, ftype='delivery',
+                                 status='out_for_delivery', promised=promised)
+    conn.commit()
+
+    # The gap: the next pass to see these rows is 37 days later, exactly like
+    # the slot's replay after its retention hole.
+    gap_clock = placed + timedelta(days=37, hours=2)
+    for _ in range(40):                   # 0.4**40: the delivery dice cannot hide
+        online.advance_online_lifecycle(conn, cfg, gap_clock)
+        if all(_orders(conn)[oid][2] is not None for oid in (pickup, delivery)):
+            break
+    conn.commit()
+
+    rows = _orders(conn)
+    for oid, floor in ((pickup, window_start + timedelta(hours=2)),
+                       (delivery, promised - timedelta(
+                           minutes=cfg.online.delivery_early_grace_minutes))):
+        status, placed_dt, completed, promised_dt, ws, ftype = rows[oid]
+        assert completed is not None, f"{ftype} {oid} never completed — vacuous case"
+        assert placed_dt <= completed <= placed_dt + ceiling, (
+            f"{ftype} {oid}: completed {completed} is outside "
+            f"[{placed_dt}, {placed_dt + ceiling}] — the pass clock leaked through")
+        assert completed >= floor, (
+            f"{ftype} {oid}: completed {completed} is before its own earliest "
+            f"plausible instant {floor}")
+
+    # The terminal event IS the completion, and nothing else of the order sits
+    # outside its window — the same pass wrote all of them.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT e.order_id::text, e.event_type, e.event_dt::timestamp,
+                   o.placed_dt::timestamp, o.completed_dt::timestamp
+            FROM online.order_events e
+            JOIN online.orders o ON o.order_id = e.order_id
+        """)
+        events = cur.fetchall()
+    assert events, "the gap pass journalled no events"
+    for oid, etype, event_dt, placed_dt, completed in events:
+        assert placed_dt <= event_dt <= placed_dt + ceiling, (
+            f"{etype} on {oid} is at {event_dt}, outside the order's window")
+        if etype in ('picked_up', 'delivered'):
+            assert event_dt == completed, (etype, event_dt, completed)
+
+
+def test_a_generated_day_then_a_gap_never_leaves_the_band(db):
+    """A whole generated day, then a 34-day jump: every row stays in its window.
+
+    This is the slot's shape at scale — orders placed and advanced hour by hour,
+    then a hole, then a pass that has no business completing any of them at its
+    own clock.
+    """
+    conn = db
+    cfg = Config()
+    seed = _seed(conn)
+    random.seed(20261115)
+    ceiling = timedelta(hours=cfg.online.max_fulfillment_hours)
+
+    day = datetime(2026, 3, 12, 0, 0, 0)
+    for hour in range(24):
+        for quarter in range(0, 60, 15):
+            sim_dt = day + timedelta(hours=hour, minutes=quarter)
+            online.generate_online_orders(conn, cfg, sim_dt, 2, _ctx(cfg, sim_dt),
+                                          [{'location_id': seed['location_id']}],
+                                          seed['products'], [])
+            online.advance_online_lifecycle(conn, cfg, sim_dt)
+    conn.commit()
+
+    # The gap. Eight passes at the far side of it move the open rows through the
+    # remaining stages (one stage per pass); they have to do it INSIDE the
+    # order's own window, not at this clock.
+    gap_clock = day + timedelta(days=34, hours=2)
+    for _ in range(8):
+        online.advance_online_lifecycle(conn, cfg, gap_clock)
+    conn.commit()
+
+    rows = _orders(conn)
+    completed = {oid: r for oid, r in rows.items() if r[2] is not None}
+    assert len(completed) > len(rows) // 2, (
+        f"only {len(completed)} of {len(rows)} orders completed — vacuous case")
+
+    failures = []
+    for oid, (_status, placed, done, _promised, _ws, ftype) in completed.items():
+        if done > placed + ceiling:
+            failures.append(f"{oid} {ftype}: completed {done}, which is "
+                            f"{done - placed} after placement (ceiling {ceiling})")
+    assert not failures, failures[:5]
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT o.order_id::text, e.event_type, e.event_dt::timestamp,
+                   o.placed_dt::timestamp
+            FROM online.order_events e
+            JOIN online.orders o ON o.order_id = e.order_id
+            WHERE e.event_dt > o.placed_dt + interval '24 hours'
+        """)
+        leaked = cur.fetchall()
+    assert not leaked, (
+        "an event landed more than a day after its order was placed — the replay "
+        f"clock was used for a row the gap had already passed: {leaked[:5]}")
+
+
+def test_the_band_assertion_matches_the_config_ceiling():
+    """`TIME-05` hardcodes 24 h; the config default is the ceiling. Pin them.
+
+    The integrity spec is a committed SQL file that cannot read `config.yaml`, so
+    the number is spelled out there. This is the test that fails when someone
+    moves one and not the other.
+    """
+    from tests.cross_schema_integrity import ASSERTIONS
+
+    spec = next(a for a in ASSERTIONS if a.id == "TIME-05")
+    hours = {int(h) for h in re.findall(r"interval '(\d+) hours'", spec.sql)}
+    assert hours == {Config().online.max_fulfillment_hours}, (
+        f"TIME-05 asserts {hours} but online.max_fulfillment_hours is "
+        f"{Config().online.max_fulfillment_hours}")
+
+
+def test_migration_clamps_a_legacy_over_ceiling_completion(db):
+    """A pre-card data dir: completions past the ceiling, events out of band.
+
+    `migrations/006_online_order_ceiling.sql` has to repair both without a
+    constraint (the ceiling is a config knob, so there is no CHECK to add) and
+    be idempotent.
+    """
+    conn = db
+    cfg = Config()
+    ceiling = timedelta(hours=cfg.online.max_fulfillment_hours)
+    seed = _seed(conn)
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS online.order_events_legacy")
+        cur.execute("DROP TABLE IF EXISTS online.orders_legacy")
+        cur.execute("CREATE TABLE online.orders_legacy "
+                    "(LIKE online.orders INCLUDING ALL)")
+        cur.execute("CREATE TABLE online.order_events_legacy "
+                    "(LIKE online.order_events INCLUDING ALL)")
+        cur.execute("ALTER TABLE online.order_events_legacy "
+                    "DROP CONSTRAINT IF EXISTS order_events_order_id_fkey")
+
+        # The slot's shape: placed, then completed by a pass 37 days later, with
+        # the terminal event at that same instant.
+        gap_done = SIM_DT + timedelta(days=37, hours=2)
+        over_pickup = _insert_legacy(
+            cur, seed, SIM_DT, 'pickup',
+            completed=gap_done,
+            window_start=SIM_DT + timedelta(hours=2))
+        over_delivery = _insert_legacy(
+            cur, seed, SIM_DT, 'delivery',
+            completed=gap_done,
+            promised=SIM_DT + timedelta(hours=6))
+        # A stage of that same order written by the same late pass, so it sits
+        # after the completion once the completion is clamped.
+        _insert_legacy_event(cur, over_delivery, 'out_for_delivery', gap_done)
+        _insert_legacy_event(cur, over_delivery, 'delivered', gap_done)
+        _insert_legacy_event(cur, over_pickup, 'picked_up', gap_done)
+        # Never completed (a no_show), but the same pass wrote its event.
+        no_show = _insert_legacy(
+            cur, seed, SIM_DT, 'pickup', completed=None,
+            window_start=SIM_DT + timedelta(hours=2))
+        cur.execute("""
+            UPDATE online.orders_legacy SET status = 'no_show'
+             WHERE order_id = %s::uuid
+        """, (no_show,))
+        _insert_legacy_event(cur, no_show, 'no_show', gap_done)
+        # Already inside the band: the migration must not touch it.
+        untouched = _insert_legacy(
+            cur, seed, SIM_DT, 'delivery',
+            completed=SIM_DT + timedelta(hours=4),
+            promised=SIM_DT + timedelta(hours=6))
+        _insert_legacy_event(cur, untouched, 'delivered',
+                             SIM_DT + timedelta(hours=4))
+    conn.commit()
+
+    sql = (open(CEILING_MIGRATION_PATH, encoding="utf-8").read()
+           .replace("online.order_events", "online.order_events_legacy")
+           .replace("online.orders", "online.orders_legacy"))
+
+    def _snapshot(cur):
+        cur.execute("""
+            SELECT order_id::text, placed_dt::timestamp, completed_dt::timestamp
+            FROM online.orders_legacy
+        """)
+        orders = {r[0]: r[1:] for r in cur.fetchall()}
+        cur.execute("""
+            SELECT order_id::text, event_type, event_dt::timestamp
+            FROM online.order_events_legacy
+        """)
+        return orders, cur.fetchall()
+
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        orders, events = _snapshot(cur)
+
+    for oid, (placed, completed) in orders.items():
+        if completed is not None:
+            assert placed <= completed <= placed + ceiling, (
+                f"{oid} is still completed at {completed}, outside "
+                f"[{placed}, {placed + ceiling}]")
+    assert orders[over_pickup][1] == SIM_DT + ceiling
+    assert orders[over_delivery][1] == SIM_DT + ceiling
+    assert orders[untouched][1] == SIM_DT + timedelta(hours=4), (
+        "the migration rewrote a completion that was already inside the band")
+
+    by_order = {}
+    for oid, etype, event_dt in events:
+        by_order.setdefault(oid, []).append((etype, event_dt))
+        assert event_dt <= orders[oid][0] + ceiling, (
+            f"{etype} on {oid} is still past the order's ceiling")
+        if etype in ('picked_up', 'delivered'):
+            assert event_dt == orders[oid][1], (
+                f"{etype} on {oid} does not match the completion it records")
+        if orders[oid][1] is not None:
+            assert event_dt <= orders[oid][1], (
+                f"{etype} on {oid} happens after the order completed")
+    # The no_show has no completion to anchor to; its event is clamped instead.
+    assert by_order[no_show] == [('no_show', SIM_DT + ceiling)], by_order[no_show]
+    assert by_order[untouched] == [('delivered', SIM_DT + timedelta(hours=4))]
+
+    # Idempotent: the second boot of the same volume is a no-op, not an error.
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        orders_again, events_again = _snapshot(cur)
+        cur.execute("DROP TABLE IF EXISTS online.order_events_legacy")
+        cur.execute("DROP TABLE IF EXISTS online.orders_legacy")
+    conn.commit()
+    assert orders_again == orders
+    assert sorted(events_again) == sorted(events)
