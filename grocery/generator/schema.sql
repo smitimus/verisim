@@ -285,8 +285,22 @@ CREATE TABLE fulfillment.orders (
     store_order_id          UUID        NOT NULL REFERENCES ordering.store_orders(order_id),
     warehouse_location_id   UUID        NOT NULL REFERENCES hr.locations(location_id),
     assigned_to             UUID        REFERENCES hr.employees(employee_id),
+    -- The warehouse lifecycle (t_5a408514): received -> packed -> shipped ->
+    -- delivered, advanced by the fulfillment pass and the two transport events.
+    -- 'pending', 'picking' and 'loaded' are what earlier images wrote and must
+    -- keep loading; 'picked' is the spelling of the step between received and
+    -- packed if a future model needs to pause there.
+    --
+    -- NAMED, not an inline unnamed CHECK: `schema.sql` reaches a first run
+    -- only, so an existing data dir gets this through
+    -- `standalone/migrations/003_fulfillment_lifecycle.sql`, which has to drop
+    -- the auto-named `orders_status_check` and add this one. A stable name is
+    -- what makes that migration idempotent.
     status                  VARCHAR(20) NOT NULL DEFAULT 'pending'
-                                CHECK (status IN ('pending','picking','packed','loaded','cancelled')),
+                                CONSTRAINT fulfillment_orders_status_lifecycle
+                                CHECK (status IN ('pending','received','picked','picking',
+                                                  'packed','loaded','shipped','delivered',
+                                                  'cancelled')),
     started_at              TIMESTAMPTZ,
     completed_at            TIMESTAMPTZ,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()

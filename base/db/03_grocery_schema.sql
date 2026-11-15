@@ -233,8 +233,12 @@ CREATE TABLE fulfillment.orders (
     store_order_id          UUID        NOT NULL REFERENCES ordering.store_orders(order_id),
     warehouse_location_id   UUID        NOT NULL REFERENCES hr.locations(location_id),
     assigned_to             UUID        REFERENCES hr.employees(employee_id),
+    -- Warehouse lifecycle (t_5a408514) — mirrors grocery/generator/schema.sql.
     status                  VARCHAR(20) NOT NULL DEFAULT 'pending'
-                                CHECK (status IN ('pending','picking','packed','loaded','cancelled')),
+                                CONSTRAINT fulfillment_orders_status_lifecycle
+                                CHECK (status IN ('pending','received','picked','picking',
+                                                  'packed','loaded','shipped','delivered',
+                                                  'cancelled')),
     started_at              TIMESTAMPTZ,
     completed_at            TIMESTAMPTZ,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()

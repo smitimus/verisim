@@ -349,16 +349,65 @@ Asserted by harness checks `TIME-01` / `TIME-02`; data-lab mirrors them with
 ### Generation-order guarantee
 
 `grocery/generator/main.py::run_tick` runs the supply-chain block
-(POS → timeclock → store orders → fulfillment → truck dispatch → delivery
-receipts → shrinkage → promotions → scheduling) **once per simulated day, at the
-hour-0 midnight boundary**. Parents therefore always exist before their children
-within a completed day.
+(ordering → store orders → fulfillment → truck dispatch → delivery receipts)
+with **ordering once per simulated day, at the hour-0 midnight boundary**, and
+**the warehouse working every tick**:
+
+* `ordering.check_and_create_orders` — daily (one replenishment cycle per
+  simulated day);
+* `fulfillment.process_pending_orders` → `transport.dispatch_loads` →
+  `transport.receive_delivered_loads` — every tick (t_5a408514). A realtime
+  tick is an *instant*, and a pick that comes due at 03:20 has to be recorded at
+  03:20; while these ran inside the midnight block the next pass that could
+  advance a row was 24 h away, which put a day of dwell on every
+  replenishment lead. In the backfill they still run once per simulated day,
+  in the end-of-day pass, with `day_wide_pass=True`.
+
+Parents therefore always exist before their children within a completed day.
 
 **Partial-day tolerance.** A backfill day that is still in progress (today) only
 runs up to the current hour, so downstream rows may legitimately be absent. The
 harness scopes every time-bounded assertion to *completed* days
 (`<column>::date < CURRENT_DATE`), so an in-flight day never produces a false
 orphan.
+
+### Fulfillment lifecycle and its two clocks (t_5a408514)
+
+`fulfillment.orders` carries a real state machine, advanced by the passes above:
+
+```
+received ──pick starts──▶ picking ──pick+pack done──▶ packed ──load departs──▶ shipped ──load arrives──▶ delivered
+```
+
+* `created_at` is the instant the **warehouse received the order** — the store
+  order's `approved_dt`, i.e. a *business* clock, not the INSERT wall clock.
+  That is what `mart_fulfillment_operations.order_received_at` and
+  `hours_to_pick_start` already assume. Nothing watermarks on this column:
+  data-lab loads `fulfillment.orders` with a FULL refresh, and the API
+  paginates on it with a primary-key tiebreak. (The force-backfill clear in
+  `base/api/main.py` keys on it too — so a forced backfill of a past window now
+  clears these rows, which it never did while `created_at` was the wall clock.)
+* `started_at` / `completed_at` are the pick start and the end of pick+pack.
+  `hours_to_fulfill = completed_at - started_at`,
+  `hours_to_pick_start = started_at - created_at`; both are non-negative by
+  construction, and `hours_to_fulfill` is capped at `MAX_PICK_MINUTES` (4 h) —
+  one warehouse shift, not a day and a half.
+* **No instant is ever stamped after `sim_dt`.** A business timestamp in the
+  future is what data-lab's `column_profile.py` fails (`future_dates`,
+  tolerance 0.001), so a row whose pick has not finished stays `picking` with
+  `completed_at` NULL, and one whose pick has not started stays `received` with
+  both NULL.
+* The per-row schedule (how long the order waited, how long the pick takes,
+  whether it is one of the ~10 % queued orders that miss the day's truck) is
+  **derived from the row's own `fulfillment_id`**, not stored: every pass, and
+  every process restart, recomputes the same plan without a plan column and
+  without writing a future timestamp.
+* `transport.dispatch_loads` moves a row to `shipped` (and its store order with
+  it); `transport.receive_delivered_loads` moves it to `delivered`. A `packed`
+  row with no load behind it is swept onto the next pass's truck — the sweep is
+  why a missed truck delays an order by one pass instead of orphaning it.
+* `pending` / `loaded` / `cancelled` are still accepted by the CHECK: rows
+  written by earlier images carry them and must keep loading.
 
 ---
 

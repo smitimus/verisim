@@ -142,6 +142,22 @@ def dispatch_loads(
                 VALUES %s
             """, load_item_records, template="(%s::uuid,%s::uuid,%s::uuid)")
 
+            # The lifecycle advances with the truck (t_5a408514): a fulfillment
+            # is 'shipped' when it is on a load, not when it was packed, and its
+            # store order moves with it. Without this the status column stayed
+            # at the one value the fulfillment pass wrote, which is what made
+            # `fulfillment_status` constant across five marts.
+            cur.execute("""
+                UPDATE fulfillment.orders SET status = 'shipped'
+                WHERE fulfillment_id = ANY(%s::uuid[])
+                  AND status IN ('pending', 'received', 'picked', 'picking', 'packed')
+            """, ([f_id for f_id, _o_id in items],))
+            cur.execute("""
+                UPDATE ordering.store_orders
+                SET status = 'shipped', updated_at = %s
+                WHERE order_id = ANY(%s::uuid[])
+            """, (sim_dt, [o_id for _f_id, o_id in items]))
+
             load_ids.append(load_id)
 
     conn.commit()
@@ -211,6 +227,17 @@ def receive_delivered_loads(conn, sim_dt: datetime, scenario=None,
                 SET status = 'delivered', arrived_at = %s
                 WHERE load_id = %s::uuid
             """, (sim_dt, load_id))
+
+            # The fulfillment behind this load reaches the terminal state with
+            # it (t_5a408514). `<> 'cancelled'` keeps a cancelled fulfillment
+            # from being resurrected by a load that still carried its lines.
+            cur.execute("""
+                UPDATE fulfillment.orders fo SET status = 'delivered'
+                FROM transport.load_items li
+                WHERE li.load_id = %s::uuid
+                  AND fo.fulfillment_id = li.fulfillment_id
+                  AND fo.status <> 'cancelled'
+            """, (load_id,))
 
             # Get fulfillment items for this load. BOTH pick statuses: the short
             # lines are what the receipt must NOT contain and what the

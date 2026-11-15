@@ -721,20 +721,30 @@ GROCERY_TABLE_DOCS = {
     },
     "fulfillment.orders": {
         "title": "Fulfillment — Orders",
-        "description": "Warehouse fulfillment of store orders. Created when warehouse picks an approved store order.",
+        "description": "Warehouse fulfillment of a store order. One row per approved order; "
+                       "carries the pick/pack timeline the fulfilment marts measure.",
         "columns": [
             ("fulfillment_id", "UUID PK", "Primary key"),
             ("store_order_id", "UUID FK → ordering.store_orders", "Which store order is being fulfilled"),
-            ("filled_by", "UUID FK → hr.employees", "Warehouse employee who filled (nullable)"),
-            ("fulfillment_dt", "TIMESTAMPTZ", "When fulfillment was created"),
-            ("status", "VARCHAR(20)", "picking, packed, or dispatched"),
+            ("warehouse_location_id", "UUID FK → hr.locations", "Warehouse / DC doing the work"),
+            ("assigned_to", "UUID FK → hr.employees", "Picker assigned (nullable)"),
+            ("status", "VARCHAR(20)",
+             "received → picking → packed → shipped → delivered "
+             "('pending'/'loaded'/'cancelled' are legacy/terminal values)"),
+            ("started_at", "TIMESTAMPTZ", "First scan of the pick; NULL while the order waits (t_5a408514)"),
+            ("completed_at", "TIMESTAMPTZ", "Pick + pack finished; NULL until then"),
+            ("created_at", "TIMESTAMPTZ",
+             "The instant the warehouse RECEIVED the order — the order's own "
+             "business clock (approved_dt), not the wall clock at INSERT"),
         ],
         "relationships": [
             "fulfillment.orders.store_order_id → ordering.store_orders.order_id",
             "Referenced by fulfillment.items(fulfillment_id)",
             "Referenced by transport.load_items(fulfillment_id)",
         ],
-        "notes": "~5% short-fill rate per line — some items may be filled at less than requested qty.",
+        "notes": "hours_to_fulfill = completed_at − started_at; hours_to_pick_start = "
+                 "started_at − created_at. Both are non-negative by construction. "
+                 "~5% short-fill rate per line — some items may be filled at less than requested qty.",
     },
     "fulfillment.items": {
         "title": "Fulfillment — Items",

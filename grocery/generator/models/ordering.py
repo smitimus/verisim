@@ -53,6 +53,15 @@ fake = Faker('en_US')
 # greppable (t_959cd040).
 SUPPLY_DISRUPTION_SKIP_RATE = 0.40
 
+# How long before the ordering pass the store raised the order, and how long
+# before it the DC approved it (t_5a408514). Both are minutes BEFORE `sim_dt`
+# because the pass is the generator's "now"; the approval window is strictly
+# inside the order's age, so an order can never be approved before it exists.
+# `hours_to_approve` is (approved_dt - order_dt), which these two ranges put at
+# 1.25-5.75 h — a distribution, where it used to be exactly 0 on every row.
+ORDER_AGE_MINUTES = (120, 360)
+APPROVAL_LAG_MINUTES = (5, 45)
+
 
 def expected_daily_demand(conn, window_days: int = 1,
                           as_of: Optional[date] = None) -> Dict:
@@ -200,7 +209,16 @@ def check_and_create_orders(
             order_id = str(uuid4())
             created_by = mgr_map.get(store_loc_id)
             requested_delivery = (sim_dt + timedelta(days=random.randint(1, 3))).date()
-            approved_dt = sim_dt  # auto-approved in simulation
+
+            # The store raises the order during the day and the DC approves it
+            # near the end-of-day pass — NOT at one instant, which is what made
+            # `hours_to_approve` 0 on all 6,849 orders (t_5a408514). Both
+            # instants stay at or before `sim_dt`: the pass is the generator's
+            # "now", and a business timestamp after it is a future date that
+            # data-lab's `column_profile.py` fails. The two ranges do not
+            # overlap, so `approved_dt > order_dt` always holds.
+            order_dt = sim_dt - timedelta(minutes=random.randint(*ORDER_AGE_MINUTES))
+            approved_dt = sim_dt - timedelta(minutes=random.randint(*APPROVAL_LAG_MINUTES))
 
             cur.execute("""
                 INSERT INTO ordering.store_orders
@@ -209,7 +227,7 @@ def check_and_create_orders(
                      approved_by, approved_dt, status)
                 VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s, %s::uuid, %s, 'approved')
             """, (order_id, store_loc_id, warehouse['location_id'],
-                   created_by, sim_dt, requested_delivery,
+                   created_by, order_dt, requested_delivery,
                    created_by, approved_dt))
 
             item_records = [(order_id, prod_id, qty, qty) for prod_id, qty in items]

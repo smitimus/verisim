@@ -844,28 +844,39 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
     hr.maybe_hire_employee(conn, cfg, locations)
     hr.maybe_terminate_employee(conn)
 
+    # The warehouse and the trucks run on their own clock, not at midnight
+    # (t_5a408514). A realtime tick is an instant, so a pick that comes due at
+    # 03:20 has to be recorded at 03:20: leaving fulfilment inside the midnight
+    # block put a whole day of dwell on every replenishment lead, because the
+    # next pass that could advance a 'received' row was 24 h away. Ordering
+    # stays daily (one replenishment cycle per simulated day) — this is the
+    # warehouse working through what ordering raised.
+    #
+    # Cheap when there is nothing to do: every statement below is an indexed
+    # lookup that matches no row.
+    warehouse_employees = [e for e in employees if e['location_type'] == 'warehouse']
+    drivers = [e for e in warehouse_employees if e['department'] == 'transport']
+
+    fulfilled = fulfillment.process_pending_orders(
+        conn, warehouse_employees, sim_dt,
+        vendor_cfg=cfg.vendors, scenario=scenario)
+
+    if fulfilled and locations['warehouses'] and trucks:
+        wh_loc_id = locations['warehouses'][0]['location_id']
+        transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id, sim_dt, scenario)
+
+    transport.receive_delivered_loads(conn, sim_dt, scenario,
+                                      vendor_cfg=cfg.vendors)
+
     # Supply chain + daily models (once per simulated day — check at midnight boundary)
     orders_count = 0
     if sim_dt.hour == 0:
-        warehouse_employees = [e for e in employees if e['location_type'] == 'warehouse']
-        drivers = [e for e in warehouse_employees if e['department'] == 'transport']
         managers = [e for e in employees if e['department'] == 'management']
 
         order_ids = ordering.check_and_create_orders(
             conn, locations['stores'], locations['warehouses'], managers, sim_dt,
             scenario, inventory_cfg=cfg.inventory)
         orders_count = len(order_ids)
-
-        fulfilled = fulfillment.process_pending_orders(
-            conn, warehouse_employees, sim_dt,
-            vendor_cfg=cfg.vendors, scenario=scenario)
-
-        if fulfilled and locations['warehouses'] and trucks:
-            wh_loc_id = locations['warehouses'][0]['location_id']
-            transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id, sim_dt, scenario)
-
-        transport.receive_delivered_loads(conn, sim_dt, scenario,
-                                          vendor_cfg=cfg.vendors)
 
         # Phase 2: perishable expiry dates + shrinkage
         shrinkage.set_expiry_dates(conn, sim_dt)
@@ -1131,7 +1142,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 eod_scenario, inventory_cfg=cfg.inventory)
             fulfilled = fulfillment.process_pending_orders(conn, warehouse_employees,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 23, 0),
-                vendor_cfg=cfg.vendors, scenario=eod_scenario)
+                vendor_cfg=cfg.vendors, scenario=eod_scenario, day_wide_pass=True)
             if fulfilled and locations['warehouses'] and trucks:
                 wh_loc_id = locations['warehouses'][0]['location_id']
                 transport.dispatch_loads(conn, fulfilled, trucks, drivers, wh_loc_id,
