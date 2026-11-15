@@ -722,7 +722,19 @@ CREATE TABLE online.orders (
     customer_count      SMALLINT,          -- party size for no-show realism
     scenario_tag        VARCHAR(50),
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    -- An order cannot be completed before it was placed (t_c9ea180f).
+    -- `completed_dt` is the pass clock at the moment the lifecycle completed the
+    -- order, so a completion earlier than `placed_dt` is not a simulation of
+    -- anything: it is a pass whose clock was behind the row it advanced, and it
+    -- poisons every downstream duration/SLA/on-time metric for that order (988
+    -- such rows on dev, worst -20 h 46 m). The generator refuses to advance a
+    -- row before its own clock (`models/online.advance_online_lifecycle`); this
+    -- constraint is the tripwire for anything else that writes the column, and
+    -- `standalone/migrations/004_online_order_clock.sql` carries it to a data
+    -- dir that already exists (repairing its historical rows first).
+    CONSTRAINT online_orders_completed_after_placed
+        CHECK (completed_dt IS NULL OR completed_dt >= placed_dt)
 );
 
 CREATE TABLE online.order_items (

@@ -165,6 +165,12 @@ class OnlineConfig:
     service_fee_delivery: float = 5.99
     cancel_rate: float = 0.06     # per placed order, before ready
     noshow_rate: float = 0.05     # ready orders that pass window uncalled
+    # How early a completed order may land before the time the store promised
+    # the customer (t_c9ea180f). These are the *only* allowance: the completion
+    # instant is the pass clock, always >= placed_dt, so a long-tail delivery
+    # extends forward from its promise instead of producing a negative duration.
+    pickup_early_grace_minutes: int = 15    # collected before the pickup window opens
+    delivery_early_grace_minutes: int = 30  # delivered before promised_delivery_dt
 
 
 @dataclass
@@ -476,6 +482,10 @@ SCHEMA = (
     (('online', 'service_fee_delivery'), ('online', 'service_fee_delivery')),
     (('online', 'cancel_rate'), ('online', 'cancel_rate')),
     (('online', 'noshow_rate'), ('online', 'noshow_rate')),
+    (('online', 'pickup_early_grace_minutes'),
+     ('online', 'pickup_early_grace_minutes')),
+    (('online', 'delivery_early_grace_minutes'),
+     ('online', 'delivery_early_grace_minutes')),
     # scenarios
     (('scenarios', 'rush_hour', 'volume_multiplier'), ('scenarios', 'rush_hour_multiplier')),
     (('scenarios', 'rush_hour', 'hours'), ('scenarios', 'rush_hour_hours')),
@@ -740,6 +750,10 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
     for key in ['pickup_share', 'service_fee_delivery', 'cancel_rate', 'noshow_rate']:
         if key in onl:
             setattr(cfg.online, key, float(onl[key]))
+    # Integer allowances, so they are coerced as ints (t_c9ea180f).
+    for key in ['pickup_early_grace_minutes', 'delivery_early_grace_minutes']:
+        if key in onl:
+            setattr(cfg.online, key, int(onl[key]))
 
     sc = data.get('scenarios', {})
     rh = sc.get('rush_hour', {})

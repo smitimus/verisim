@@ -361,6 +361,13 @@ online:
   service_fee_delivery: 5.99       # flat fee per delivery order
   cancel_rate: 0.06                # placed orders cancelled before ready
   noshow_rate: 0.05                # ready pickup orders that pass window uncalled
+  pickup_early_grace_minutes: 15   # how early a pickup may be collected before
+                                   # its window opens (t_c9ea180f). Completion is
+                                   # stamped with the pass clock, never a sampled
+                                   # duration, so this is the only early allowance.
+  delivery_early_grace_minutes: 30 # how early a delivery may complete before
+                                   # promised_delivery_dt; a long-tail delivery
+                                   # extends FORWARD from the promise.
 
 scenarios:
   rush_hour:

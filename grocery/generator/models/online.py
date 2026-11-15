@@ -11,6 +11,11 @@ Basket behavior is deliberately different from in-store POS:
   * service fee on delivery; pickup has a 2-hour pickup window
   * append-only lifecycle event stream; ~3-8% of orders never complete
     (cancel before ready, no_show after ready_for_pickup window closes)
+  * the clock is monotonic: an order can only be advanced by a pass whose
+    simulated instant is at or after it was placed, and it cannot be completed
+    before its promise (delivery) or its window (pickup) is nearly due —
+    `placed_dt <= completed_dt` is a database CHECK as well as a test
+    (t_c9ea180f)
 
 Online demand depletes store stock exactly like POS does.
 
@@ -203,24 +208,74 @@ def generate_online_orders(conn, cfg: Config, sim_dt: datetime, count: int, ctx,
 
 
 def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
-    """
-    Move open orders through their lifecycle based on elapsed time.
+    """Move open orders through their lifecycle based on elapsed time.
     Each order advances at most one stage per tick. Returns events written.
+
+    THE CLOCK LAW — an order cannot be completed before it was placed
+    -----------------------------------------------------------------
+    `completed_dt` is a wall-clock event, not a sampled duration: it is the
+    `sim_dt` of the pass that completed the order. So the only way it can land
+    before `placed_dt` is a pass whose clock is BEHIND the order — and that is
+    exactly what used to happen (kanban t_c9ea180f: 988 orders on dev, worst
+    -20 h 46 m, 2 already in the EDW).
+
+    The mechanism was a replay. `advance_online_lifecycle` selected every open
+    order with no bound on `placed_dt`, so a backfill replaying an early hour of
+    a day whose later hours were already written (a restart, or a partial-day
+    replay that starts at hour 0 for *today*) advanced orders that did not
+    exist yet on its own clock. The `placed`/`confirmed`/`picking` branches are
+    age-gated and were safe; `ready` and `out_for_delivery` completed on a bare
+    dice roll with no age check at all, so an order placed at 13:00 and stamped
+    00:00 by the hour-0 pass was routine.
+
+    Three layers now hold the invariant:
+
+    1. the SELECT refuses rows the clock has not reached (`placed_dt <= sim_dt`),
+       which is the fix: a pass can only ever move rows that already exist in
+       its own timeline;
+    2. a row-level guard below (`sim_dt < placed`) skips and warns rather than
+       raising, so a future caller with a bad clock cannot poison the batch;
+    3. `schema.sql` carries `online_orders_completed_after_placed`, so the
+       database itself rejects a completion before its placement
+       (`standalone/migrations/005_online_order_clock.sql` carries it to a data
+       dir that already exists, repairing the historical rows first).
+
+    A long-tail delivery extends the completion FORWARD instead of sampling a
+    duration that can go negative: a delivery completes no earlier than
+    `promised_delivery_dt - delivery_early_grace_minutes`, and a pickup no
+    earlier than `pickup_window_start - pickup_early_grace_minutes`. Both are
+    config knobs (`config.yaml` -> `online:`) so the warehouse can be tuned
+    without a code change.
     """
+    pickup_grace = timedelta(minutes=cfg.online.pickup_early_grace_minutes)
+    delivery_grace = timedelta(minutes=cfg.online.delivery_early_grace_minutes)
+
     with conn.cursor() as cur:
         cur.execute("""
             SELECT order_id::text, fulfillment_type, status, placed_dt::timestamp,
-                   pickup_window_end::timestamp
+                   pickup_window_start::timestamp,
+                   pickup_window_end::timestamp,
+                   promised_delivery_dt::timestamp
             FROM online.orders
             WHERE status IN ('placed','confirmed','picking','ready','out_for_delivery')
+              AND placed_dt <= %s
             ORDER BY placed_dt
             LIMIT 400
-        """, )
+        """, (sim_dt,))
         rows = cur.fetchall()
 
         events = []
         updates = []
-        for oid, ftype, status, placed, pwe in rows:
+        skipped = 0
+        for oid, ftype, status, placed, pws, pwe, promised in rows:
+            # Layer 2 of the clock law. Unreachable while the SELECT above holds;
+            # a skip keeps a bad clock from taking the whole batch down.
+            # (`placed_dt` is NOT NULL; the None branch is for an untyped row.)
+            if placed is None:
+                continue
+            if sim_dt < placed:
+                skipped += 1
+                continue
             age_min = (sim_dt - placed).total_seconds() / 60
             if status == 'placed':
                 # cancelled-any-time before ready
@@ -264,13 +319,30 @@ def advance_online_lifecycle(conn, cfg: Config, sim_dt: datetime) -> int:
                         updates.append(('no_show', None, oid))
                         events.append((oid, 'no_show', sim_dt,
                                        'Pickup window closed, no collection'))
+                elif pws and sim_dt < pws - pickup_grace:
+                    # The customer's window has not opened yet: the goods are
+                    # staged but nothing has been collected. An unguarded
+                    # dice roll here is what stamped a pickup completed at an
+                    # hour that precedes its own placement (t_c9ea180f).
+                    continue
                 elif random.random() < 0.35:
                     updates.append(('completed', sim_dt, oid))
                     events.append((oid, 'picked_up', sim_dt, None))
             elif status == 'out_for_delivery':
+                if promised and sim_dt < promised - delivery_grace:
+                    # Still on the road. The promise is the earliest a driver
+                    # can plausibly arrive, so the long tail extends FORWARD
+                    # from it instead of completing before the order left.
+                    continue
                 if random.random() < 0.6:
                     updates.append(('completed', sim_dt, oid))
                     events.append((oid, 'delivered', sim_dt, 'Left at door'))
+
+        if skipped:
+            log.warning(
+                "online lifecycle: skipped %d order(s) whose placed_dt is after "
+                "the pass clock %s — a caller is passing a sim_dt behind the "
+                "rows it is asked to advance", skipped, sim_dt)
 
         if updates:
             execute_values(cur, """

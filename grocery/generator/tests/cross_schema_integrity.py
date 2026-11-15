@@ -1047,6 +1047,56 @@ ASSERTIONS: List[AssertionSpec] = [
               AND t.transaction_dt::date < CURRENT_DATE
         """,
     ),
+    # t_c9ea180f: `completed_dt` is the pass clock at the instant the order was
+    # completed, never a sampled duration, so a completion earlier than its
+    # placement is not a simulation of anything — it is a pass whose clock was
+    # behind the row it advanced, and it makes every duration/SLA/on-time metric
+    # for that order read negative. 988 rows on dev (worst -20 h 46 m) reached the
+    # EDW this way, from `advance_online_lifecycle` selecting open orders with no
+    # bound on `placed_dt` and completing them on a bare dice roll. The generator
+    # now refuses to advance a row before its own clock, and the source carries
+    # `online_orders_completed_after_placed`; this restates the invariant for a
+    # slot whose data dir has not had the boot migration yet.
+    #
+    # Deliberately NOT scoped to completed days, unlike the `event_dt` assertions:
+    # a partial day is a snapshot of missing *downstream* rows, and this is the
+    # opposite — a row that exists is complete in itself, `completed_dt < placed_dt`
+    # can never be a transient state, and today is exactly where the replay that
+    # caused it starts.
+    AssertionSpec(
+        id="TIME-03",
+        dimension="temporal",
+        title="online.orders.completed_dt — an order cannot be completed before it was placed",
+        sql="""
+            SELECT o.order_id, o.placed_dt, o.completed_dt
+            FROM online.orders o
+            WHERE o.completed_dt IS NOT NULL
+              AND o.completed_dt < o.placed_dt
+        """,
+    ),
+    # t_c9ea180f, second half: the same lifecycle pass that completed the order
+    # early journalled the event at the same early instant, so `order_events`
+    # carried events that predate the order they belong to (12 on the test slot's
+    # dev data the day the fix landed). A terminal event belongs at the completion
+    # it recorded; `migrations/005_online_order_clock.sql` moves the historical
+    # ones, and the generator cannot write one any more.
+    #
+    # Scoped to completed days like every other `event_dt` assertion (the harness
+    # in `test_cross_schema_integrity.py` requires it, and a partial day is a
+    # snapshot). Today is not uncovered: the order-side CHECK
+    # `online_orders_completed_after_placed` is enforced at write time, every day.
+    AssertionSpec(
+        id="TIME-04",
+        dimension="temporal",
+        title="online.order_events.event_dt — an event cannot precede the order it belongs to",
+        sql="""
+            SELECT e.event_id, e.event_type, e.event_dt, o.placed_dt
+            FROM online.order_events e
+            JOIN online.orders o ON o.order_id = e.order_id
+            WHERE e.event_dt < o.placed_dt
+              AND o.placed_dt::date < CURRENT_DATE
+        """,
+    ),
 ]
 
 

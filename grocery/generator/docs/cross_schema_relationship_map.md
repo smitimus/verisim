@@ -409,6 +409,49 @@ received ──pick starts──▶ picking ──pick+pack done──▶ packed
 * `pending` / `loaded` / `cancelled` are still accepted by the CHECK: rows
   written by earlier images carry them and must keep loading.
 
+### The online order clock (t_c9ea180f)
+
+`online.orders.completed_dt` is a **clock**, not a sampled duration: it is the
+`sim_dt` of the pass that completed the order. That makes
+`placed_dt <= completed_dt` a physical invariant, and it was broken — 988 of
+510,405 completed orders on dev, worst **-20 h 46 m**, 2 of them already in the
+EDW. Every downstream duration / SLA / on-time metric reads negative or
+nonsense for those rows, and nothing rejected them.
+
+The cause was a replay, not a distribution. `advance_online_lifecycle` selected
+every open order with **no bound on `placed_dt`**; `placed`/`confirmed`/`picking`
+are age-gated and were safe, but `ready` and `out_for_delivery` completed on a
+bare dice roll. A backfill replaying hour 0 of a day whose later hours were
+already written — a restart, or `today`'s partial-day replay, which always
+starts at hour 0 — therefore stamped `completed_dt = 00:00` on orders placed at
+11:00–13:00. The signature in the source is unmissable: hour-boundary
+`completed_dt`, same date, `updated_at` ~11 minutes after `created_at`.
+
+Three layers now hold it:
+
+| Layer | Where | What it does |
+|---|---|---|
+| selection | `models/online.advance_online_lifecycle` | `AND placed_dt <= :sim_dt` — a pass can only move rows that already exist on its own clock |
+| row guard | same function | `sim_dt < placed` skips and logs, so a future caller with a bad clock cannot poison the batch |
+| DDL | `schema.sql` + `migrations/005_online_order_clock.sql` | `online_orders_completed_after_placed CHECK (completed_dt IS NULL OR completed_dt >= placed_dt)` |
+
+The long tail extends **forward**. A delivery completes no earlier than
+`promised_delivery_dt - delivery_early_grace_minutes` (default 30 min) and a
+pickup no earlier than `pickup_window_start - pickup_early_grace_minutes`
+(15 min) — both `config.yaml` knobs, so "when may a customer be told their order
+is ready" is tunable without a code change. Before this, deliveries completed
+~2.5 h after placement against a 4–6 h promise (3,577 of 4,048 early against the
+promise, 1,166 more than 4 h early) and 1,797 of 3,093 pickups were collected
+before their window opened — an on-time metric that is ~100 % on-time by
+construction is not a metric.
+
+Assertions: `TIME-03` in the integrity sweep (any slot, no boot migration
+needed) and `tests/test_online_order_clock.py` (the invariant over a generated
+day, both promise gates, the CHECK, and the migration against a pre-card table).
+The `data-lab` raw copy needs no transformation — this is a source-clock fix,
+but its `assert_online_orders_reconcile` is the natural place for the same
+predicate on the EDW side.
+
 ---
 
 ## 4. API exposure — endpoint → join keys (data-lab #26–#31)
