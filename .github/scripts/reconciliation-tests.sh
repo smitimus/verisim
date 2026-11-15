@@ -95,8 +95,23 @@ field() { printf '%s\n' "${MAIN_OUT}" | grep "^$1=" | head -1 | cut -d= -f2-; }
 #     matches, because the character before an element is a COMMA, not a colon.
 #
 # So: split on commas and ask whether one element equals the needle.
+#
+# NO `| tr | grep -q` PIPELINE — and that is not a style preference. ubuntu-latest
+# moved 24.04 -> 26.04 on 2026-11-15, and 26.04 ships uutils coreutils: its
+# `tr` is `tr (uutils coreutils) 0.10.0`. `grep -q` exits at the FIRST match, the
+# still-running `tr` then writes into a closed pipe and dies of SIGPIPE, and
+# `set -o pipefail` reports the PIPELINE as failed — so a ref that IS in the list
+# reads as missing, and which refs are lost depends on scheduling.
+#
+# Measured on the shipped construct (t_a96f7f37), six runs of this script in
+# `ubuntu:26.04`: 19-22 passed / 1-4 failed, with the instrumentation showing
+# PIPESTATUS "0 141 0" for every false negative — grep matched (0), tr was
+# killed (141). On `ubuntu:24.04` (GNU tr) the same script is 23/0. Splitting
+# the list in bash removes the pipeline, so there is nothing left to race.
 has_tag() {  # has_tag <full-ref>
-  printf '%s' "$(field tags)" | tr ',' '\n' | grep -qxF "$1"
+  local list
+  list="$(field tags)"
+  grep -qxF "$1" <<< "${list//,/$'\n'}"
 }
 
 if [ -n "$(field version)" ]; then

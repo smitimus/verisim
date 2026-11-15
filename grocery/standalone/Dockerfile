@@ -41,13 +41,27 @@ LABEL org.opencontainers.image.title="Verisim Grocery" \
       org.opencontainers.image.source="https://github.com/smiti/verisim-grocery"
 
 # Install PostgreSQL 18 from the official PGDG apt repository + supervisor
+#
+# The key is FETCHED TO A FILE and verified before it is trusted, instead of being
+# piped straight into gpg. A single truncated TLS read (`curl: (56) … unexpected
+# eof while reading`, seen at 187 s into an otherwise healthy build) used to leave
+# an empty keyring and fail the build on `gpg: no valid OpenPGP data found`, which
+# is the integration flake on t_a96f7f37. Two changes:
+#
+#   * `--retry-all-errors` — curl's default retry set does not cover a connection
+#     that dies mid-body with (56), which is exactly this failure; and
+#   * `gpg --show-keys` on the result, so a bad keyring fails HERE, by name, rather
+#     than as a confusing `apt-get update` signature error two layers down.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     gnupg curl ca-certificates lsb-release supervisor locales \
  && echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen \
  && locale-gen \
- && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-    | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+ && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+    -o /tmp/pgdg.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && gpg --dearmor -o /usr/share/keyrings/pgdg.gpg /tmp/pgdg.asc \
+ && gpg --show-keys /usr/share/keyrings/pgdg.gpg > /dev/null \
+ && rm -f /tmp/pgdg.asc \
  && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] \
     https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
     > /etc/apt/sources.list.d/pgdg.list \

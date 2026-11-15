@@ -61,6 +61,28 @@ def pyproject_version(root: pathlib.Path = CHECKOUT) -> str:
     return match.group(1) if match else ""
 
 
+def print_failures(label: str, stdout: str) -> None:
+    """Reprint a harness's failures WITH the reason line under each one.
+
+    Both harnesses print `  FAIL <claim>` and, immediately below it, an indented
+    reason ("not in the pushed tag list: …"). This used to reprint only the
+    `  FAIL` lines, so the CI log named the broken claim and dropped the
+    evidence — the same class of bug as reading ${TMP}/err only on the success
+    path (t_a96f7f37). The tail is printed as text, not as a list repr.
+    """
+    lines = stdout.strip().splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("  FAIL"):
+            continue
+        print(f"{label}: {line.strip()}")
+        following = lines[index + 1] if index + 1 < len(lines) else ""
+        # The reason lines start with eight spaces; a following `  FAIL` is the
+        # next claim, not this claim's reason.
+        if following.startswith("        ") and not following.lstrip().startswith("FAIL"):
+            print(f"{label}:   {following.strip()}")
+    print(f"{label}: FAIL — {lines[-1] if lines else 'no output'}")
+
+
 def main(root: pathlib.Path | None = None) -> int:
     # The repo under test. Defaults to the real checkout; the tests pass a
     # mutated copy so the gate can be watched failing (a gate nobody has seen
@@ -194,8 +216,7 @@ def main(root: pathlib.Path | None = None) -> int:
         ["bash", str(harness), str(root)], capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        tail = proc.stdout.strip().splitlines()[-1:]
-        print(f"publish-tag-tests.sh: FAIL — {tail}")
+        print_failures("publish-tag-tests.sh", proc.stdout)
         rc = 1
     else:
         print(f"OK — {proc.stdout.strip().splitlines()[-1]}")
@@ -220,14 +241,36 @@ def main(root: pathlib.Path | None = None) -> int:
             capture_output=True, text=True,
         )
         if proc.returncode != 0:
-            for line in proc.stdout.strip().splitlines():
-                if line.startswith("  FAIL"):
-                    print(f"reconciliation-tests.sh: {line.strip()}")
-            tail = proc.stdout.strip().splitlines()[-1:]
-            print(f"reconciliation-tests.sh: FAIL — {tail}")
+            print_failures("reconciliation-tests.sh", proc.stdout)
             rc = 1
         else:
             print(f"OK — {proc.stdout.strip().splitlines()[-1]}")
+
+    # ── No `producer | tr … | grep -q` pipeline anywhere in the publish path ──
+    # The class of bug that kept the `test` gate red for six weeks is invisible on
+    # a dev host and INTERMITTENT on the runner: `grep -q` exits at the first
+    # match, a still-running `tr` then writes into a closed pipe and dies of
+    # SIGPIPE, and `set -o pipefail` reports the PIPELINE as failed — so a ref
+    # that IS in the list reads as missing. It reproduces only when the producer is
+    # a real process (uutils coreutils on ubuntu 26.04, which is what
+    # `ubuntu-latest` became on 2026-11-15): measured PIPESTATUS "0 141 0" and 1-4
+    # false failures per run of reconciliation-tests.sh (t_a96f7f37). Trusting CI
+    # to fail loudly here is what cost the six weeks, so the shape is asserted
+    # statically — seeing this gate fail must never be the way it is discovered.
+    risky_pipe = re.compile(r"\btr\b[^|]*\|[^|]*\bgrep\b\s+-[A-Za-z]*q")
+    for name in ("reconciliation-tests.sh", "publish-tag-tests.sh", "compute-push-tags.sh"):
+        path = root / ".github" / "scripts" / name
+        if not path.exists():
+            continue
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if risky_pipe.search(line):
+                print(f"{name}:{lineno}: FAIL — `… | tr … | grep -q …` under "
+                      f"`set -o pipefail`: fast `grep -q` plus uutils `tr` on ubuntu "
+                      f"26.04 turns SIGPIPE(141) into a false negative (t_a96f7f37). "
+                      f"Split the list in bash instead of piping it through tr.")
+                rc = 1
 
     return rc
 

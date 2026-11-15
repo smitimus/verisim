@@ -18,10 +18,12 @@ env:
   #     REGISTRY_NAME   e.g. <internal-host>
   #     REGISTRY_IMAGE  e.g. <internal-host>/<owner>/verisim-grocery
   #
-  # Both are OPTIONAL. Empty means single-registry (Docker Hub only) and the publish
-  # job skips the second push with a notice — so the default is the safe one and this
-  # workflow stays public-safe with no configuration at all. Set them only on a private
-  # fork or a self-hosted runner where the internal host may be named.
+  # Both are OPTIONAL. Empty means single-registry (Docker Hub only): the publish job
+  # skips the second login, the second push and the cross-registry digest comparison,
+  # still asserts that the Hub release actually landed, and says so in a notice — so
+  # the default is the safe one and this workflow stays public-safe with no
+  # configuration at all. Set them only on a private fork or a self-hosted runner where
+  # the internal host may be named.
   #
   # Why the indirection rather than a placeholder string: data-lab pins this image BY
   # DIGEST, so a wrong or empty registry is a broken pull on every slot, not a cosmetic
@@ -252,8 +254,12 @@ jobs:
           username: ${{ env.DOCKER_USERNAME }}
           password: ${{ env.DOCKER_PASSWORD }}
 
+      # Gated on the same variable the tag step reads: with no REGISTRY_IMAGE there
+      # is no second registry to log in to, and running this step with an empty
+      # registry and empty credentials failed the whole publish on a mirror that
+      # legitimately has none (t_a96f7f37).
       - name: Log in to our registry
-        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true' && vars.REGISTRY_IMAGE != ''
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY_NAME }}
@@ -277,10 +283,18 @@ jobs:
       # reconciliation this step exists to be (t_e1b1de67). PR #9 computed the Gitea
       # refs inline HERE while t_4b05829c moved the Hub refs into the script; the two
       # touched the same hunk, so whichever merged second silently dropped the other.
-      # Now one script owns every tag name for both registries, and
-      # REQUIRE_SECOND_REGISTRY makes an unset REGISTRY_IMAGE a loud failure rather
-      # than a Hub-only publish — the four-secret gate above would still pass in that
-      # case, so the protection has to live here as well.
+      # Now one script owns every tag name for both registries.
+      #
+      # `REQUIRE_SECOND_REGISTRY` FOLLOWS the variable rather than being hard-coded
+      # to `true`. The script still refuses an unset REGISTRY_IMAGE when the
+      # requirement is on, and reconciliation-tests.sh calls it directly to prove
+      # that; but on a mirror with no repository variables — which is what this
+      # public mirror is — the documented default (single registry, Docker Hub
+      # only, second push skipped with a notice) used to be unreachable: a green
+      # test+integration still died here with "REGISTRY_IMAGE is not set"
+      # (t_a96f7f37). With the expression below, "configured" and "required" are
+      # the same fact, so a configured second registry still cannot degrade to a
+      # Hub-only push and an unconfigured one still publishes what it describes.
       #
       # The script emits the refs the verification step below re-reads: hub_ref,
       # registry_ref and version_ref, all as GITHUB_OUTPUT keys.
@@ -288,15 +302,19 @@ jobs:
         id: meta
         if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |
-          REGISTRY_IMAGE="${REGISTRY_IMAGE}" REQUIRE_SECOND_REGISTRY=true \
+          REGISTRY_IMAGE="${REGISTRY_IMAGE}" REQUIRE_SECOND_REGISTRY=${{ vars.REGISTRY_IMAGE != '' }} \
             bash .github/scripts/compute-push-tags.sh >> "$GITHUB_OUTPUT"
-          {
+          if [ -n "${REGISTRY_IMAGE}" ]; then
             echo "::notice title=Published version::${IMAGE_NAME} will be tagged :${VERSION}, and ${REGISTRY_IMAGE} at ${registry_version_ref#*:} / ${dev_tag}"
             echo "hub:"
             echo "${hub_tags}"
             echo "registry:"
             echo "${registry_tags}"
-          }
+          else
+            echo "::notice title=Published version::${IMAGE_NAME} will be tagged :${VERSION} on Docker Hub only — no second registry is configured (REGISTRY_IMAGE repository variable is unset)."
+            echo "hub:"
+            echo "${hub_tags}"
+          fi
 
       # ONE build, ONE push, TWO registries.
       #
@@ -327,6 +345,11 @@ jobs:
       # Assert the ARTIFACT, not the run status. A green job that pushed nothing is
       # precisely the failure this repo already had once, and it is why this step reads
       # both registries back and compares digests instead of trusting the push log.
+      #
+      # With no second registry configured, `registry_ref` is empty and the verifier
+      # runs its Hub-only mode: same assertion ("a NON-EMPTY index really resolves for
+      # the ref we pushed"), one registry instead of two. It does not become a no-op —
+      # a tag that did not land still fails here (t_a96f7f37).
       - name: Verify the release is in both registries at one digest
         if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
         run: |

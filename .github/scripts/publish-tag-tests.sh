@@ -81,7 +81,15 @@ out()   { cat "${TMP}/out"; }
 err()   { cat "${TMP}/err"; }
 rc()    { cat "${TMP}/rc"; }
 field() { grep "^${1}=" "${TMP}/out" | head -1 | cut -d= -f2-; }
-has_tag() { echo "$(field tags)" | tr ',' '\n' | grep -qx "$1"; }
+has_tag() {
+  # No `| tr | grep -q` pipeline: on ubuntu 26.04 (uutils coreutils) `tr` dies of
+  # SIGPIPE when `grep -q` exits at the first match, and under `set -o pipefail`
+  # that reads as "not found" — measured as PIPESTATUS "0 141 0" (t_a96f7f37).
+  # `-F` as well as `-x`: the needles are literal refs, and `grep -x` alone treats
+  # the '.' in `smiti/verisim-grocery:1.3.4` as a wildcard.
+  local list; list="$(field tags)"
+  grep -qxF "$1" <<< "${list//,/$'\n'}"
+}
 # A version tag, not an opaque identifier. This is the card's actual complaint:
 # Docker Hub filled up with c6280a084ecc6068…-style tags.
 is_version_tag() {

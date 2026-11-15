@@ -34,12 +34,20 @@
 #
 # usage:
 #   verify-release-in-both-registries.sh <hub-ref> <gitea-ref> [<label>]
+#   verify-release-in-both-registries.sh <hub-ref> [<label>]      # Hub-only image
 #
 #   hub-ref    e.g. smiti/verisim-grocery:416ea83c67757676fee328eb0f74b35660bbd6a2
 #   registry-ref  e.g. <registry-host>/<owner>/verisim-grocery:dev-2026-10-04-1011
 #
+#   With no second ref the script verifies the Hub only (see "Hub-only mode"
+#   below). That is the shape of a mirror with no second registry configured:
+#   there is no second digest to compare, but "the Hub serves a non-empty index
+#   for the ref we pushed" is still an assertion worth failing on.
+#
 # exit 0  both registries serve the same, anonymously-resolvable index digest
-# exit 1  the release is NOT safely in both registries (message names which check)
+#         (or, Hub-only: the Hub serves a non-empty index digest)
+# exit 1  the release is NOT safely in the expected registry/registries (message
+#         names which check)
 # exit 2  usage error
 # =============================================================================
 set -uo pipefail
@@ -48,8 +56,9 @@ HUB_REF="${1:-}"
 GITEA_REF="${2:-}"
 LABEL="${3:-${GITHUB_SHA:-unknown}}"
 
-if [ -z "$HUB_REF" ] || [ -z "$GITEA_REF" ]; then
-  echo "usage: $(basename "$0") <hub-ref> <gitea-ref> [label]" >&2
+if [ -z "$HUB_REF" ]; then
+  echo "usage: $(basename "$0") <hub-ref> [<gitea-ref>] [label]" >&2
+  echo "       (omit the second ref only when the image has NO second registry)" >&2
   exit 2
 fi
 
@@ -166,6 +175,39 @@ digest_of() {  # ref -> index digest via imagetools, falling back to the HTTP re
   # directly, which is also what the anonymous-pull check below does.
   index_digest "$ref"
 }
+
+# ---------------------------------------------------------------------------
+# Hub-only mode
+#
+# An image with no second registry configured publishes to Docker Hub alone —
+# the documented default for the public mirror, which holds no repository
+# variables at all (t_a96f7f37). There is no second digest to compare, so the
+# assertion is the one that still has teeth: the Hub really serves a NON-EMPTY
+# index for the ref we just pushed. A missing tag and a broken probe still fail,
+# because "published" is a fact about the registry, not about the job status.
+if [ -z "$GITEA_REF" ]; then
+  echo "=== verifying release ${LABEL} is in Docker Hub (no second registry configured) ==="
+  echo "  hub   : ${HUB_REF}"
+  echo
+
+  HUB_DIGEST="$(digest_of "$HUB_REF")"
+  echo "  hub   index digest : ${HUB_DIGEST:-<none>}"
+  echo
+
+  [ -z "$HUB_DIGEST" ] && die \
+    "Docker Hub has no index for ${LABEL}" \
+    "docker buildx imagetools inspect ${HUB_REF} returned no digest. The Hub push did not land, or the tag does not exist. Do NOT treat this run as published."
+
+  case "$HUB_DIGEST" in
+    HTTP-*|TRANSPORT-FAILED)
+      die "Docker Hub probe failed for ${LABEL}" \
+        "${HUB_REF} answered ${HUB_DIGEST}. That is the registry's answer (or a broken probe), not a published artifact." ;;
+  esac
+
+  echo "=== release ${LABEL} verified in Docker Hub ==="
+  echo "    ${HUB_DIGEST}"
+  exit 0
+fi
 
 echo "=== verifying release ${LABEL} is in BOTH registries ==="
 echo "  hub   : ${HUB_REF}"
