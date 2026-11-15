@@ -6,6 +6,7 @@ import os
 import random
 import logging
 from datetime import datetime, date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Optional, Tuple
 from uuid import uuid4
 
@@ -472,8 +473,8 @@ def price_of_record(products: List[Dict], ad_prices: Dict[str, float]) -> Dict[s
     `current_price`. The demand curve is keyed on this, so a discount works
     through the same law as any other price move instead of needing a special
     case — and the price actually charged is recorded in
-    `transaction_items.unit_price` as before, so `assert_line_totals_balance`
-    (`line_total = (unit_price - discount) * quantity`) is untouched.
+    `transaction_items.unit_price` as before, so the line's own money
+    (`line_total = quantity * unit_price - discount`, t_0a72c6a5) is untouched.
     """
     prices: Dict[str, float] = {}
     for product in products:
@@ -497,6 +498,109 @@ def _price_of(product: Dict, price_record: Dict[str, float]) -> float:
     if price is None:
         price = product.get('price', product.get('current_price'))
     return float(price) if price is not None else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Discount money, in cents (t_0a72c6a5)
+# ---------------------------------------------------------------------------
+# `pos.transaction_items.discount` is a LINE-LEVEL dollar amount and
+# `line_total = quantity * unit_price - discount`. Every allocation below works
+# in integer cents: a coupon/deal saving has to be split across the lines that
+# earned it and the parts have to add back up to the header exactly, and float
+# dollars do not add up.
+
+def _cents(amount) -> int:
+    """Money as integer cents — every dollar figure in this module is 2-dp."""
+    return int(Decimal(str(amount)).quantize(Decimal('0.01'),
+                                             rounding=ROUND_HALF_UP) * 100)
+
+
+def _line_gross_cents(qty, unit_price) -> int:
+    """`quantity * unit_price` in cents, rounded the way NUMERIC rounds it.
+
+    A weighed line can land exactly on a half cent: 2.06 lb x $7.75 is $15.965,
+    which the till — and every SQL consumer — calls $15.97, while Python's
+    banker's `round()` on an inexact float says $15.96. Postgres rounds a
+    NUMERIC half away from zero, so the generator has to do its line arithmetic
+    in Decimal to keep `line_total = quantity * unit_price - discount` exactly
+    true (39 lines of a 10-day backfill disagreed before this).
+    """
+    gross = Decimal(str(qty)) * Decimal(str(unit_price))
+    return int(gross.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) * 100)
+
+
+def _line_room_cents(item_recs: List[List], indices: List[int]) -> int:
+    """Cents still discountable on the given lines (gross minus what they carry).
+
+    A promo may never take a line below zero, so "room" is the honest ceiling
+    for an allocation.
+    """
+    room = 0
+    for i in indices:
+        rec = item_recs[i]
+        room += max(0, _line_gross_cents(rec[2], rec[3]) - _cents(rec[4]))
+    return room
+
+
+def _split_cents(total_c: int, weights: List[int]) -> List[int]:
+    """Split `total_c` cents across `weights` so the parts sum EXACTLY.
+
+    Largest-remainder (Hamilton) apportionment: floor each exact share, then
+    give the leftover cents to the largest fractional remainders. No part ever
+    exceeds its own weight, which is what keeps a line's discount inside the
+    value of the line.
+    """
+    shares = [0] * len(weights)
+    live = [(w, i) for i, w in enumerate(weights) if w > 0]
+    if total_c <= 0 or not live:
+        return shares
+    denom = sum(w for w, _ in live)
+    remainders = []
+    for weight, i in live:
+        exact = total_c * weight / denom
+        shares[i] = int(exact)
+        remainders.append((exact - shares[i], i))
+    leftover = total_c - sum(shares)
+    for _, i in sorted(remainders, key=lambda pair: (-pair[0], pair[1]))[:leftover]:
+        shares[i] += 1
+    return shares
+
+
+def _apply_line_discount(item_recs: List[List], indices: List[int], amount,
+                         coupon_id: Optional[str] = None,
+                         deal_id: Optional[str] = None) -> float:
+    """Move `amount` of transaction-level saving onto the lines that earned it.
+
+    Writes the share into `discount`, keeps `line_total = quantity * unit_price
+    - discount` true for the line, and stamps the promo id on the same rows —
+    so a line that references a coupon or deal always carries a non-zero
+    `discount` and the references are never decorative.
+
+    Pro-rata is by remaining *room*, not by unit price: a weighed or multi-unit
+    line has to absorb its own share of the money. Returns the amount actually
+    applied (cents-exact); the caller books that figure on the transaction
+    header, which is what makes
+    `sum(discount) = coupon_savings + deal_savings` hold for every transaction.
+    """
+    rooms = [_line_room_cents(item_recs, [i]) for i in indices]
+    total_room = sum(rooms)
+    applied_c = min(_cents(amount), total_room)
+    if applied_c <= 0:
+        return 0.0
+    for i, share in zip(indices, _split_cents(applied_c, rooms)):
+        rec = item_recs[i]
+        if share <= 0:
+            # No money landed on this line, so it must not claim the promo: a
+            # reference with a zero discount is exactly the decoration this card
+            # removes (and ROWS the acceptance criterion forbids).
+            continue
+        rec[4] = (_cents(rec[4]) + share) / 100.0
+        if coupon_id:
+            rec[5] = coupon_id
+        if deal_id:
+            rec[6] = deal_id
+        rec[7] = (_line_gross_cents(rec[2], rec[3]) - _cents(rec[4])) / 100.0
+    return applied_c / 100.0
 
 
 def draw_cart(products: List[Dict], num_items: int, cfg: Config,
@@ -893,57 +997,95 @@ def generate_pos_transactions(
             # tick by main.commit_sales from the uncapped lines.
             continue
 
-        subtotal = 0.0
+        # The line is where the money has to be (t_0a72c6a5).
+        #
+        # `transaction_items.discount` is a LINE-LEVEL dollar amount and
+        # `line_total = quantity * unit_price - discount`. Before this card the
+        # only thing that ever reached it was a scenario department promotion,
+        # so a normal backfill wrote 0 on every one of 7.7 M rows while the
+        # header carried $5.1 M of coupon/deal savings — a permanently-zero
+        # money column that four marts published as if it were a measurement.
+        #
+        # `transactions.subtotal` keeps its old meaning: the line net BEFORE the
+        # transaction-level coupon/deal, i.e.
+        #   subtotal = sum(line_total) + coupon_savings + deal_savings
+        # so data-lab's `total = subtotal + tax - coupon/deal_savings` is
+        # untouched. The gross a line was sold at is `quantity * unit_price`.
+        subtotal_c = 0
         for line in demand_lines:
             qty = line['quantity']
             unit_price = line['unit_price']
-            discount = 0.0
-            coupon_id = None
-            deal_id = None
+            gross_c = _line_gross_cents(qty, unit_price)
+            discount_c = 0
+            promo_pct = promo_dept_discount.get(line['department'])
+            if promo_pct:
+                # A department promotion the scenario switched on. A line keeps
+                # at least one cent, as the old per-unit floor did.
+                discount_c = min(
+                    int((Decimal(gross_c) * Decimal(str(promo_pct)))
+                        .quantize(Decimal('1'), rounding=ROUND_HALF_UP)),
+                    max(0, gross_c - 1))
+            net_c = gross_c - discount_c
+            subtotal_c += net_c
+            item_recs.append([txn_id, line['product_id'], qty, unit_price,
+                              discount_c / 100.0, None, None, net_c / 100.0])
+        subtotal = subtotal_c / 100.0
 
-            # Promotional discount
-            if line['department'] in promo_dept_discount:
-                discount += round(unit_price * promo_dept_discount[line['department']], 2)
-
-            effective_price = max(0.01, unit_price - discount)
-            line_total = round(effective_price * qty, 2)
-            subtotal += line_total
-
-            item_recs.append((txn_id, line['product_id'], qty,
-                               unit_price, discount, coupon_id, deal_id, line_total))
-
-        # Apply a coupon to the whole transaction (loyalty members only)
+        # Apply a coupon to the whole transaction (loyalty members only).
+        # Scope is resolved FIRST: a "10% off produce" coupon rung on a basket
+        # with no produce is not a redemption, and a saving that cannot reach a
+        # line is exactly the unattributable money this card removes.
         coupon_savings = 0.0
         coupon = None
+        coupon_scope: List[int] = []
         loyalty_eng = getattr(scenario, 'loyalty_engagement_modifier', 1.0)
-        if member_id and active_coupons and random.random() < cfg.coupons.coupon_use_rate * scenario.coupon_multiplier * loyalty_eng:
+        if (member_id and active_coupons and random.random() <
+                cfg.coupons.coupon_use_rate * scenario.coupon_multiplier * loyalty_eng):
             coupon = random.choice(active_coupons)
-            if coupon['coupon_type'] == 'percent_off':
-                coupon_savings = round(subtotal * coupon['discount_value'] * scenario.coupon_multiplier, 2)
-            elif coupon['coupon_type'] == 'dollar_off':
-                coupon_savings = round(min(subtotal * 0.5, coupon['discount_value'] * scenario.coupon_multiplier), 2)
+            coupon_scope = _promo_line_indices(cart, coupon, 'coupon')
+            scoped_c = _line_room_cents(item_recs, coupon_scope)
+            if scoped_c > 0:
+                # The saving is computed against the coupon's OWN scope, not the
+                # whole basket: a percentage off produce must not discount the
+                # beer, and pro-rating a basket-wide figure onto the produce
+                # lines would write a discount larger than its own terms.
+                scoped_value = scoped_c / 100.0
+                if coupon['coupon_type'] == 'percent_off':
+                    coupon_savings = round(
+                        scoped_value * coupon['discount_value'] * scenario.coupon_multiplier, 2)
+                elif coupon['coupon_type'] == 'dollar_off':
+                    coupon_savings = round(
+                        min(scoped_value, coupon['discount_value'] * scenario.coupon_multiplier), 2)
+            if coupon_savings < 0.01:
+                # A redemption worth nothing is not recorded. A `bogo` coupon
+                # carries no line amount, and a cents-level saving would leave a
+                # coupon-tagged line at discount = 0 — the defect this card is
+                # about.
+                coupon, coupon_savings, coupon_scope = None, 0.0, []
 
         # Apply a combo deal
         deal_savings = 0.0
         deal = None
+        deal_scope: List[int] = []
         if active_deals and random.random() < cfg.combo_deals.combo_use_rate:
-            deal = random.choice(active_deals)
-            deal_dept_products = [p for p in cart
-                                   if deal['trigger_department_id'] is None
-                                   or _dept_id_for_product(p) == deal['trigger_department_id']]
-            if len(deal_dept_products) >= deal['trigger_qty']:
+            candidate = random.choice(active_deals)
+            scope = _promo_line_indices(cart, candidate, 'deal')
+            if len(scope) >= candidate['trigger_qty']:
                 # Saving = sum of trigger_qty items minus deal_price. Priced
                 # off the price OF RECORD (t_08deeddf): comparing a deal
                 # against the pre-ad shelf price would book a saving the
                 # customer never received, and `mart_promotion_effectiveness`
                 # would credit the deal for the weekly ad's discount.
-                trigger_items = sorted(deal_dept_products,
-                                       key=lambda p: _price_of(p, price_record),
-                                       reverse=True)[:deal['trigger_qty']]
-                original = sum(_price_of(p, price_record) for p in trigger_items)
-                deal_savings = max(0.0, round(original - deal['deal_price'], 2))
+                trigger = sorted(scope,
+                                 key=lambda i: _price_of(cart[i], price_record),
+                                 reverse=True)[:candidate['trigger_qty']]
+                original = sum(_price_of(cart[i], price_record) for i in trigger)
+                # Never book more than the lines it applies to can absorb.
+                saving = min(max(0.0, round(original - candidate['deal_price'], 2)),
+                             _line_room_cents(item_recs, scope) / 100.0)
+                if saving >= 0.01:
+                    deal, deal_savings, deal_scope = candidate, round(saving, 2), scope
 
-        subtotal = round(subtotal, 2)
         # Coupons and combo deals are computed independently and can STACK
         # past the subtotal (seen 2026-08-24/25 in prod: 2 rush_hour txns with
         # coupon+deal > subtotal). Floor the combined discounts so the pre-tax
@@ -953,38 +1095,36 @@ def generate_pos_transactions(
         # assert_e2e_revenue_consistency formula check.
         if coupon_savings > subtotal - 0.01:
             coupon_savings = max(0.0, round(subtotal - 0.01, 2))
+            if coupon_savings < 0.01:
+                coupon, coupon_savings, coupon_scope = None, 0.0, []
         max_deal_savings = round(subtotal - coupon_savings - 0.01, 2)
         if deal_savings > max_deal_savings:
             deal_savings = max(0.0, max_deal_savings)
-            if deal_savings == 0.0:
-                deal = None  # deal fully crowded out; don't tag line items
+            if deal_savings < 0.01:
+                deal, deal_savings, deal_scope = None, 0.0, []
 
-        # Tag the applicable line items with the applied coupon/deal IDs so
-        # data-lab can attribute redemptions per promotion. transaction_items
-        # already has coupon_id/deal_id columns (no schema change); we just
-        # populate them on the items the promo actually applied to.
+        # Put the promo money on the lines, and book on the header exactly what
+        # landed — `_apply_line_discount` returns the amount it could place, so
+        # `sum(discount) = coupon_savings + deal_savings` (to the cent) for
+        # every transaction, and `sum(line_total) = subtotal - coupon - deal`.
+        if coupon is not None and coupon_savings:
+            coupon_savings = _apply_line_discount(
+                item_recs, coupon_scope, coupon_savings,
+                coupon_id=coupon['coupon_id'])
+            if coupon_savings <= 0.0:
+                coupon = None
+        if deal is not None and deal_savings:
+            deal_savings = _apply_line_discount(
+                item_recs, deal_scope, deal_savings, deal_id=deal['deal_id'])
+            if deal_savings <= 0.0:
+                deal = None
+
+        # Only a redemption that reached a line item counts as a use — which is
+        # now every redemption the header records, since the money cannot be
+        # booked without a line to carry it.
         if coupon is not None:
-            coupon_products = _applicable_promo_products(cart, coupon, 'coupon')
-            tagged = False
-            for i, p in enumerate(cart):
-                if p['product_id'] in coupon_products:
-                    rec = list(item_recs[i])
-                    rec[5] = coupon['coupon_id']
-                    item_recs[i] = tuple(rec)
-                    tagged = True
-            # Only a redemption that actually reached a line item counts as a
-            # use — a department/product-scoped coupon whose scope is not in
-            # this basket discounts the transaction but attributes to nothing.
-            if tagged:
-                cid = coupon['coupon_id']
-                coupon_uses[cid] = coupon_uses.get(cid, 0) + 1
-        if deal is not None:
-            deal_products = _applicable_promo_products(cart, deal, 'deal')
-            for i, p in enumerate(cart):
-                if p['product_id'] in deal_products:
-                    rec = list(item_recs[i])
-                    rec[6] = deal['deal_id']
-                    item_recs[i] = tuple(rec)
+            cid = coupon['coupon_id']
+            coupon_uses[cid] = coupon_uses.get(cid, 0) + 1
 
         total_before_tax = max(0.01, round(subtotal - coupon_savings - deal_savings, 2))
         tax = round(total_before_tax * cfg.pricing.tax_rate, 2)
@@ -1145,14 +1285,14 @@ def _record_loyalty_points(conn, txn_records: list) -> None:
     conn.commit()
 
 
-def _applicable_promo_products(cart: List[Dict], promo: Dict, kind: str) -> set:
-    """Return the set of product_ids in this cart that the promo applies to.
+def _promo_line_indices(cart: List[Dict], promo: Dict, kind: str) -> List[int]:
+    """Indices (into `cart`, hence into `item_recs`) of the lines a promo covers.
 
-    Used to tag the correct transaction_items rows with the applied
-    coupon_id / deal_id. Mirrors the scope rules used when computing the
-    savings: a product-scoped promo tags only that product; a department-
-    scoped promo tags every cart item in that department; a promo with no
-    scope tags the whole basket.
+    Mirrors the scope rules used when computing the savings: a product-scoped
+    promo covers only that product's lines; a department-scoped promo covers
+    every line in that department; a promo with no scope covers the basket.
+    Returns positions, not product ids, because the same product can appear on
+    two lines and each of them has to carry its own share of the money.
     """
     if kind == 'coupon':
         pid = promo.get('product_id')
@@ -1161,15 +1301,11 @@ def _applicable_promo_products(cart: List[Dict], promo: Dict, kind: str) -> set:
         pid = promo.get('trigger_product_id')
         did = promo.get('trigger_department_id')
     if pid:
-        return {pid}
+        return [i for i, product in enumerate(cart) if product['product_id'] == pid]
     if did:
-        return {p['product_id'] for p in cart if p.get('department_id') == did}
-    return {p['product_id'] for p in cart}
-
-
-def _dept_id_for_product(product: Dict) -> Optional[str]:
-    """Products carry department_id once seed_products enriches them."""
-    return product.get('department_id')
+        return [i for i, product in enumerate(cart)
+                if product.get('department_id') == did]
+    return list(range(len(cart)))
 
 
 # ---------------------------------------------------------------------------

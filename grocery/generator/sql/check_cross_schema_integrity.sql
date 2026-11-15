@@ -615,6 +615,50 @@ SELECT m.credit_memo_id, m.short_reason, m.rejection_reason
               AND (m.rejection_reason IS NULL
                    OR btrim(m.rejection_reason) = '');
 
+-- [SEMA-32] pos.transaction_items — line_total = quantity*unit_price - discount, and a coupon/deal-tagged line carries a non-zero discount
+-- A coupon / deal reference used to be decoration: `transaction_items.discount`
+-- was 0 on 7.67 M rows of a normal backfill while the headers carried $5.1 M of
+-- coupon+deal savings, so `mart_product_performance.total_discounts` and three
+-- other data-lab marts published a structural zero as if it were a measurement
+-- (t_0a72c6a5). `discount` is a LINE-LEVEL dollar amount — not a per-unit one —
+-- and the line has to balance: `line_total = quantity * unit_price - discount`.
+-- A line that names a promotion must carry some of its money.
+SELECT ti.item_id, ti.transaction_id, ti.quantity, ti.unit_price,
+                   ti.discount, ti.line_total, ti.coupon_id, ti.deal_id
+            FROM pos.transaction_items ti
+            JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+            WHERE (ROUND(ti.line_total, 2)
+                     <> ROUND(ti.quantity * ti.unit_price - ti.discount, 2)
+                   OR ((ti.coupon_id IS NOT NULL OR ti.deal_id IS NOT NULL)
+                       AND ti.discount <= 0))
+              AND t.transaction_dt::date < CURRENT_DATE;
+
+-- [SEMA-33] pos.transactions — the header and its lines agree to the cent: sum(line_total) = subtotal - coupon - deal, and sum(discount) = gross - net
+-- `transactions.subtotal` deliberately keeps its old meaning: the line net
+-- BEFORE the transaction-level coupon/deal. So the two identities are
+--
+--     sum(line_total) = subtotal - coupon_savings - deal_savings
+--     sum(discount)   = sum(quantity * unit_price) - sum(line_total)
+--
+-- and together they mean no discount money exists only on the header. Note the
+-- second one, not `sum(discount) = coupon + deal`, is the general form: a
+-- scenario-activated department promotion is a line discount with no header
+-- column of its own, and it must not make the assertion fail.
+SELECT t.transaction_id, t.subtotal, t.coupon_savings, t.deal_savings,
+                   ROUND(SUM(ti.line_total), 2)               AS line_net,
+                   ROUND(SUM(ti.discount), 2)                 AS line_discount,
+                   ROUND(SUM(ROUND(ti.quantity * ti.unit_price, 2)), 2) AS line_gross
+            FROM pos.transactions t
+            JOIN pos.transaction_items ti
+              ON ti.transaction_id = t.transaction_id
+            WHERE t.transaction_dt::date < CURRENT_DATE
+            GROUP BY t.transaction_id, t.subtotal, t.coupon_savings, t.deal_savings
+            HAVING ABS(ROUND(SUM(ti.line_total), 2)
+                       - (t.subtotal - t.coupon_savings - t.deal_savings)) > 0.01
+                OR ABS(ROUND(SUM(ti.discount), 2)
+                       - (ROUND(SUM(ROUND(ti.quantity * ti.unit_price, 2)), 2)
+                          - ROUND(SUM(ti.line_total), 2))) > 0.01;
+
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
 -- --------------------------------------------------------------------------

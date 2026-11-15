@@ -1012,6 +1012,58 @@ ASSERTIONS: List[AssertionSpec] = [
                    OR btrim(m.rejection_reason) = '')
         """,
     ),
+    # ---- DISCOUNT MONEY ON THE LINE (t_0a72c6a5) --------------------------
+    # A coupon / deal reference used to be decoration: `transaction_items.
+    # discount` was 0 on 7.67 M rows while the headers carried $5.1 M of
+    # coupon+deal savings, so `mart_product_performance.total_discounts` and
+    # three other mart columns published a structural zero as a measurement.
+    # The contract these two assertions hold the generator to:
+    #
+    #   transaction_items.discount   = line-level DOLLAR amount discounted
+    #   transaction_items.line_total = quantity * unit_price - discount
+    #   transactions.subtotal        = sum(line_total) + coupon + deal
+    #
+    # which means every coupon/deal dollar is on some line, and a line that
+    # names a promotion always carries some of its money.
+    AssertionSpec(
+        id="SEMA-32",
+        dimension="semantic_type",
+        title="pos.transaction_items — line_total = quantity*unit_price - discount, "
+              "and a coupon/deal-tagged line carries a non-zero discount",
+        sql="""
+            SELECT ti.item_id, ti.transaction_id, ti.quantity, ti.unit_price,
+                   ti.discount, ti.line_total, ti.coupon_id, ti.deal_id
+            FROM pos.transaction_items ti
+            JOIN pos.transactions t ON t.transaction_id = ti.transaction_id
+            WHERE (ROUND(ti.line_total, 2)
+                     <> ROUND(ti.quantity * ti.unit_price - ti.discount, 2)
+                   OR ((ti.coupon_id IS NOT NULL OR ti.deal_id IS NOT NULL)
+                       AND ti.discount <= 0))
+              AND t.transaction_dt::date < CURRENT_DATE
+        """,
+    ),
+    AssertionSpec(
+        id="SEMA-33",
+        dimension="semantic_type",
+        title="pos.transactions — the header and its lines agree to the cent: "
+              "sum(line_total) = subtotal - coupon - deal, and sum(discount) = gross - net",
+        sql="""
+            SELECT t.transaction_id, t.subtotal, t.coupon_savings, t.deal_savings,
+                   ROUND(SUM(ti.line_total), 2)               AS line_net,
+                   ROUND(SUM(ti.discount), 2)                 AS line_discount,
+                   ROUND(SUM(ROUND(ti.quantity * ti.unit_price, 2)), 2) AS line_gross
+            FROM pos.transactions t
+            JOIN pos.transaction_items ti
+              ON ti.transaction_id = t.transaction_id
+            WHERE t.transaction_dt::date < CURRENT_DATE
+            GROUP BY t.transaction_id, t.subtotal, t.coupon_savings, t.deal_savings
+            HAVING ABS(ROUND(SUM(ti.line_total), 2)
+                       - (t.subtotal - t.coupon_savings - t.deal_savings)) > 0.01
+                OR ABS(ROUND(SUM(ti.discount), 2)
+                       - (ROUND(SUM(ROUND(ti.quantity * ti.unit_price, 2)), 2)
+                          - ROUND(SUM(ti.line_total), 2))) > 0.01
+        """,
+    ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
     # The promo key resolves, but the promotion's validity window does not
     # cover the transaction date it was applied to. Fixed at the source by

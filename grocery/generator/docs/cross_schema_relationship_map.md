@@ -346,6 +346,56 @@ Enforced at the source in `models/pos.py`:
 Asserted by harness checks `TIME-01` / `TIME-02`; data-lab mirrors them with
 `assert_coupon_dates_valid` / `assert_deal_dates_valid`.
 
+### Discount money lives on the line (t_0a72c6a5)
+
+The promotion *reference* (`coupon_id` / `deal_id`) and the promotion *money*
+used to live on different tables: the header carried `coupon_savings` and
+`deal_savings`, the lines carried the ids, and `transaction_items.discount` was
+0 on every one of 7.67 M rows — so `mart_product_performance.total_discounts`
+and three other data-lab marts published a structural zero that read as "there
+were no promotions".
+
+The contract now is:
+
+    transaction_items.discount   = the DOLLAR amount discounted off that LINE
+    transaction_items.line_total = quantity * unit_price - discount
+    transactions.subtotal        = sum(line_total) + coupon_savings + deal_savings
+    transactions.total           = subtotal + tax - coupon_savings - deal_savings
+
+Three things worth knowing:
+
+* **`discount` is a line amount, not a per-unit amount.** `unit_price` stays the
+  price of record (gross) and the line's money is `discount`, so a weighed line
+  (0.2 kg … 3.5 kg) and a 3-unit line carry a figure that actually sums to the
+  transaction's savings. Summing `discount` over lines is therefore a real
+  dollar measure, which is what the marts do.
+* **`subtotal` did not change meaning.** It is still the line net *before* the
+  transaction-level coupon/deal, which is why data-lab's
+  `total = subtotal + tax - coupon - deal` is untouched. The consequence is
+  `sum(line_total) = subtotal - coupon_savings - deal_savings`, and the gross is
+  `sum(quantity * unit_price)`.
+* **A promotion only applies when a line can carry it.** The saving is computed
+  against the promo's own scope (a "10% off produce" coupon discounts the produce
+  lines, not the basket) and is then spread pro-rata over the room each scoped
+  line has left, in integer cents with a largest-remainder pass, so
+  `sum(discount)` equals the header to the cent and no line goes negative. A
+  redemption that reaches no line is not booked at all: a coupon whose scope is
+  not in the basket does not appear on the header, and a line never carries a
+  promo id with a zero discount. `bogo` coupons have no line amount and are not
+  applied.
+
+Line arithmetic uses `Decimal` with `ROUND_HALF_UP`, because a weighed line can
+land exactly on a half cent (2.06 lb x $7.75 = $15.965): Postgres rounds that up
+and Python's float `round()` rounds it down, which left 39 lines of a 10-day
+backfill 1 ¢ out of balance.
+
+Asserted by harness checks `SEMA-32` (the line balances and a tagged line carries
+money) and `SEMA-33` (the header and its lines agree to the cent per
+transaction). data-lab's staging model derives `line_total` from
+`quantity * unit_price - discount` — it used to recompute
+`(unit_price - discount) * quantity`, i.e. the old per-unit reading — so the two
+repos have to move together.
+
 ### Generation-order guarantee
 
 `grocery/generator/main.py::run_tick` runs the supply-chain block

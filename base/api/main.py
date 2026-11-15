@@ -911,6 +911,21 @@ def pos_transaction_items(
     no timestamp of its own — its rows are written in the same statement batch as
     their header, so the header's ``created_at`` *is* the line's ingest time, and
     it is returned in the payload so a consumer can watermark on it (t_6d2ebc52).
+
+    Money convention (t_0a72c6a5), because a discount column that is always zero
+    is worse than no column:
+
+    * ``discount`` is the **line-level dollar amount** discounted off this line —
+      ``unit_price`` stays the price of record (gross), and
+      ``line_total = quantity * unit_price - discount``. It is *not* a per-unit
+      discount, so ``sum(discount)`` is real money and equals the transaction's
+      ``coupon_savings + deal_savings`` (plus any scenario department promotion)
+      to the cent.
+    * ``coupon_id`` / ``deal_id`` are set on the lines that actually received the
+      promotion's money. A promotion whose scope is not in the basket is not
+      booked at all, so a non-null id always comes with a non-zero ``discount``.
+    * the header keeps its own meaning: ``subtotal`` is the line net *before* the
+      coupon/deal, i.e. ``sum(line_total) + coupon_savings + deal_savings``.
     """
     pool_for(industry)
     filters, params = ["TRUE"], []
