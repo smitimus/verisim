@@ -34,7 +34,10 @@ What these tests pin:
 8. the online channel uses the same law, so both channels agree on how price
    moves demand;
 9. a degenerate product (zero/negative price, no reference price) cannot make
-   the generator crash or produce an infinite weight.
+   the generator crash or produce an infinite weight;
+10. the price a line is RUNG at is the price of record — the weekly-ad
+   `promoted_price` on an ad, else `current_price` — and never
+   `reference_price`, which is the curve's pivot and not a price to charge.
 
 Read the economics in plain terms: if a cereal box normally costs $4 and the
 store raises it to $4.40, a shopper with a price sensitivity of -0.5 (half as
@@ -518,3 +521,55 @@ def test_the_products_api_route_exposes_the_elasticity_columns():
     )
     assert 'AS reference_price' in src
     assert 'p.price_elasticity' in src
+
+
+# ---------------------------------------------------------------------------
+# 11. The till charges the price of record — never `reference_price`.
+#
+# verisim t_0c390ea4. data-lab measured a POS line at exactly
+# `pos.products.reference_price` (3.83) while the same product's `current_price`
+# was 50.24 and the weekly ad promoted it at 37.68, and read that as the pricing
+# engine falling back to a cost column. There is no such fallback: every line is
+# rung at `price_of_record()` — the ad's `promoted_price` where one is in force,
+# else `current_price`. `reference_price` is read in exactly two places, both of
+# them the demand curve: `seed_products` writes it equal to the seeded
+# `current_price`, and `elasticity.reference_price_of` uses it as the pivot.
+#
+# Which means a line charged exactly `reference_price` is not suspicious by
+# itself — on a fresh catalogue `current_price == reference_price`, so MOST
+# lines on a young data dir sit on that value (measured 370,393 of 429,632 on
+# dev/106 the day after its seed). The value only starts to look like "a cost
+# basis" once the price walk has carried `current_price` away from it. These
+# tests pin the distinction so a future refactor cannot quietly introduce the
+# fallback the card was looking for.
+# ---------------------------------------------------------------------------
+
+def test_price_of_record_ignores_the_reference_price():
+    """`reference_price` is the curve's pivot, never the price to charge."""
+    product = _product('p1', price=50.24, reference=3.83)
+    assert pos.price_of_record([product], {}) == {'p1': 50.24}
+    # The ad price still wins over the shelf price, as it must.
+    assert pos.price_of_record([product], {'p1': 37.68}) == {'p1': 37.68}
+
+
+def test_a_walked_shelf_price_is_what_the_line_is_rung_at():
+    """A shelf price that has moved off the reference is charged, not reverted."""
+    products = [_product('p1', price=50.24, reference=3.83)]
+    items = _run(products, Config(), count=2000)
+    assert items, 'no lines captured'
+    charged = {round(float(row[3]), 2) for row in items}
+    assert charged == {50.24}, (
+        'every line of a SKU whose current_price has walked away from its '
+        f'reference_price must be rung at current_price; got {sorted(charged)}')
+
+
+def test_an_ad_line_is_rung_at_the_promoted_price_and_its_neighbour_at_the_shelf_price():
+    """Two SKUs, one on the ad: each line carries its own price of record."""
+    products = [_product('p1', price=50.24, reference=3.83),
+                _product('p2', price=9.99, reference=9.99)]
+    items = _run(products, Config(), count=4000, ad_prices={'p1': 37.68})
+    charged: dict = {}
+    for row in items:
+        charged.setdefault(row[1], set()).add(round(float(row[3]), 2))
+    assert charged['p1'] == {37.68}, charged['p1']
+    assert charged['p2'] == {9.99}, charged['p2']
