@@ -553,13 +553,55 @@ def _clear_support_range(start_ts, end_ts) -> None:
         pool.putconn(conn)
 
 
+def _relation_exists(cur, relation: str) -> bool:
+    """True when this data dir carries `relation`.
+
+    The clear is one shared routine across industries that do NOT share a
+    schema: grocery has `online`/`ordering`/`fulfillment`/`transport` plus the
+    vendor layer, while a gas-station data dir has none of them. A `DELETE`
+    aimed at a missing relation is a parse-time `UndefinedTable`, so a forced
+    backfill on gas-station raised before it deleted anything. `to_regclass`
+    answers without raising, and the answer cannot change under one call.
+    """
+    cur.execute("SELECT to_regclass(%s)", (relation,))
+    return cur.fetchone()[0] is not None
+
+
 def _clear_date_range(industry: str, start: date, end: date) -> None:
     """
     Delete all generated (time-series) data for the given date range so the
     generator can backfill it fresh.  Reference/seed data (products, employees,
     locations, etc.) is never touched.
 
-    Deletions are ordered to respect FK constraints (children before parents).
+    WHAT DECIDES WHETHER A ROW GOES (t_ddd474f6). Two rules, in this order:
+
+    1. Children before parents, for EVERY relation the window clears. The
+       vendor layer added `inv.short_ship_events` -> `fulfillment.items` /
+       `fulfillment.orders` and `inv.supplier_credit_memos` ->
+       `inv.short_ship_events`, and `inv.stockout_events` names both
+       `pos.transactions` and `online.orders`; none of them was in this
+       routine's list. On a current data dir those FKs are real and VALIDATED,
+       so a forced backfill over a window holding one short-shipped line (or
+       one stockout, or one return) died inside the transaction with
+       `ForeignKeyViolation` and rolled the whole clear back — the endpoint
+       answers HTTP 500 and clears nothing (measured on a seeded scratch data
+       dir, t_ddd474f6). The list below is the full dependent closure, and
+       `grocery/api/tests/test_clear_range_order.py` checks it against
+       `schema.sql` so a new relation with an FK into this set cannot be
+       forgotten again.
+    2. A dependent goes with its parent EVEN WHEN ITS OWN DATE IS OUTSIDE THE
+       WINDOW. A load created at 23:00 delivers the next morning; the receipt,
+       the short-ship event and the credit memo hang off that load and its
+       fulfillment. The window regenerates the parent, so a row naming it
+       cannot survive: keeping it either blocks the delete (rule 1) or leaves
+       it naming an id that no longer exists. Same shape for `pos.returns` (a
+       return can refund a sale weeks later) and `inv.stockout_events`. The
+       replayed window re-creates these rows as it re-creates their parents; a
+       dependent on the far side of the boundary comes back when its own day is
+       generated.
+
+    Relations this industry's data dir does not have are skipped, never guessed
+    (`_relation_exists`).
     """
     from datetime import datetime as _dt
     start_ts = _dt(start.year, start.month, start.day, 0, 0, 0)
@@ -570,128 +612,168 @@ def _clear_date_range(industry: str, start: date, end: date) -> None:
         log.info("Cleared support data for %s → %s", start, end)
         return
 
+    params = {"s": start_ts, "e": end_ts, "sd": start, "ed": end}
+
+    # The windows every reference-qualified delete joins against. Kept as SQL,
+    # not as a materialised id list: the tables are large (375k fulfillment
+    # items on test/107) and the clear is one transaction.
+    fulfillment_window = ("SELECT fulfillment_id FROM fulfillment.orders"
+                          " WHERE created_at BETWEEN %(s)s AND %(e)s")
+    item_window = ("SELECT item_id FROM fulfillment.items"
+                   " WHERE fulfillment_id IN (" + fulfillment_window + ")")
+    load_window = ("SELECT load_id FROM transport.loads"
+                   " WHERE created_at BETWEEN %(s)s AND %(e)s")
+    txn_window = ("SELECT transaction_id FROM pos.transactions"
+                  " WHERE transaction_dt BETWEEN %(s)s AND %(e)s")
+    order_window = ("SELECT order_id FROM online.orders"
+                    " WHERE placed_dt BETWEEN %(s)s AND %(e)s")
+    return_window = ("SELECT return_id FROM pos.returns"
+                     " WHERE return_dt BETWEEN %(s)s AND %(e)s"
+                     "    OR transaction_id IN (" + txn_window + ")")
+
     pool = pool_for(industry)
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
-            # Online orders: events + items → orders (children first)
-            cur.execute(
-                "DELETE FROM online.order_events "
-                "WHERE order_id IN ("
-                "  SELECT order_id FROM online.orders"
-                "  WHERE placed_dt BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM online.order_items "
-                "WHERE order_id IN ("
-                "  SELECT order_id FROM online.orders"
-                "  WHERE placed_dt BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM online.orders WHERE placed_dt BETWEEN %s AND %s",
-                (start_ts, end_ts))
+            # A receipt on the far side of the boundary still has to go with
+            # the load it was booked against; on a data dir with no `transport`
+            # schema (gas-station) the date test is all there is.
+            if _relation_exists(cur, "transport.loads"):
+                receipt_window = ("SELECT receipt_id FROM inv.receipts"
+                                  " WHERE received_dt BETWEEN %(s)s AND %(e)s"
+                                  "    OR load_id IN (" + load_window + ")")
+                receipt_requires = ("transport.loads",)
+            else:
+                receipt_window = ("SELECT receipt_id FROM inv.receipts"
+                                  " WHERE received_dt BETWEEN %(s)s AND %(e)s")
+                receipt_requires = ()
 
-            # Returns reference transaction_items + transactions — clear
-            # children first (t_2382c671 Phase 6 tables).
-            cur.execute(
-                "DELETE FROM pos.return_items "
-                "WHERE return_id IN ("
-                "  SELECT return_id FROM pos.returns"
-                "  WHERE return_dt BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM pos.returns "
-                "WHERE return_dt BETWEEN %s AND %s",
-                (start_ts, end_ts))
+            # (relation, relations the statement also names, the statement).
+            # ORDER IS THE CONTRACT — see rules 1 and 2 in the docstring.
+            statements = [
+                # --- stockouts -------------------------------------------------
+                # A child of BOTH parents below, so it goes first.
+                ("inv.stockout_events", ("pos.transactions", "online.orders"),
+                 "DELETE FROM inv.stockout_events"
+                 " WHERE event_dt BETWEEN %(s)s AND %(e)s"
+                 "    OR pos_transaction_id IN (" + txn_window + ")"
+                 "    OR online_order_id IN (" + order_window + ")"),
+                # --- online orders: events + items → orders --------------------
+                ("online.order_events", (),
+                 "DELETE FROM online.order_events"
+                 " WHERE order_id IN (" + order_window + ")"),
+                ("online.order_items", (),
+                 "DELETE FROM online.order_items"
+                 " WHERE order_id IN (" + order_window + ")"),
+                ("online.orders", (),
+                 "DELETE FROM online.orders"
+                 " WHERE placed_dt BETWEEN %(s)s AND %(e)s"),
+                # --- returns → transactions ------------------------------------
+                # A return refunds a sale; if the sale is regenerated the return
+                # cannot keep naming its lines, so the whole return goes.
+                ("pos.return_items", ("pos.returns", "pos.transactions"),
+                 "DELETE FROM pos.return_items"
+                 " WHERE return_id IN (" + return_window + ")"),
+                ("pos.returns", ("pos.transactions",),
+                 "DELETE FROM pos.returns"
+                 " WHERE return_id IN (" + return_window + ")"),
+                # --- POS: items + loyalty points → transactions ----------------
+                ("pos.transaction_items", ("pos.transactions",),
+                 "DELETE FROM pos.transaction_items"
+                 " WHERE transaction_id IN (" + txn_window + ")"),
+                ("pos.loyalty_point_transactions", ("pos.transactions",),
+                 "DELETE FROM pos.loyalty_point_transactions"
+                 " WHERE transaction_id IN (" + txn_window + ")"),
+                ("pos.transactions", (),
+                 "DELETE FROM pos.transactions"
+                 " WHERE transaction_dt BETWEEN %(s)s AND %(e)s"),
+                # --- timeclock -------------------------------------------------
+                ("timeclock.events", (),
+                 "DELETE FROM timeclock.events"
+                 " WHERE event_dt BETWEEN %(s)s AND %(e)s"),
+                # --- receipts → loads ------------------------------------------
+                ("inv.receipt_items", receipt_requires,
+                 "DELETE FROM inv.receipt_items"
+                 " WHERE receipt_id IN (" + receipt_window + ")"),
+                ("inv.receipts", receipt_requires,
+                 "DELETE FROM inv.receipts"
+                 " WHERE receipt_id IN (" + receipt_window + ")"),
+                ("inv.shrinkage_events", (),
+                 "DELETE FROM inv.shrinkage_events"
+                 " WHERE recorded_at BETWEEN %(s)s AND %(e)s"),
+                # --- DSD deliveries: items → deliveries ------------------------
+                ("inv.dsd_delivery_items", ("inv.dsd_deliveries",),
+                 "DELETE FROM inv.dsd_delivery_items"
+                 " WHERE dsd_delivery_id IN ("
+                 "   SELECT dsd_delivery_id FROM inv.dsd_deliveries"
+                 "   WHERE delivery_date BETWEEN %(sd)s AND %(ed)s)"),
+                ("inv.dsd_deliveries", (),
+                 "DELETE FROM inv.dsd_deliveries"
+                 " WHERE delivery_date BETWEEN %(sd)s AND %(ed)s"),
+                # --- transport: load_items → loads (after the receipts) --------
+                ("transport.load_items", ("transport.loads",),
+                 "DELETE FROM transport.load_items"
+                 " WHERE load_id IN (" + load_window + ")"),
+                ("transport.loads", (),
+                 "DELETE FROM transport.loads"
+                 " WHERE created_at BETWEEN %(s)s AND %(e)s"),
+                # --- vendor layer: credit memos → short-ship events ------------
+                ("inv.supplier_credit_memos", ("inv.short_ship_events",),
+                 "DELETE FROM inv.supplier_credit_memos"
+                 " WHERE short_ship_id IN ("
+                 "   SELECT short_ship_id FROM inv.short_ship_events"
+                 "   WHERE event_dt BETWEEN %(s)s AND %(e)s"
+                 "      OR fulfillment_id IN (" + fulfillment_window + ")"
+                 "      OR fulfillment_item_id IN (" + item_window + "))"),
+                ("inv.short_ship_events",
+                 ("fulfillment.orders", "fulfillment.items"),
+                 "DELETE FROM inv.short_ship_events"
+                 " WHERE event_dt BETWEEN %(s)s AND %(e)s"
+                 "    OR fulfillment_id IN (" + fulfillment_window + ")"
+                 "    OR fulfillment_item_id IN (" + item_window + ")"),
+                # --- fulfillment: items → orders -------------------------------
+                ("fulfillment.items", ("fulfillment.orders",),
+                 "DELETE FROM fulfillment.items"
+                 " WHERE fulfillment_id IN (" + fulfillment_window + ")"),
+                ("fulfillment.orders", (),
+                 "DELETE FROM fulfillment.orders"
+                 " WHERE created_at BETWEEN %(s)s AND %(e)s"),
+                # --- ordering: store_order_items → store_orders ----------------
+                ("ordering.store_order_items", ("ordering.store_orders",),
+                 "DELETE FROM ordering.store_order_items"
+                 " WHERE order_id IN ("
+                 "   SELECT order_id FROM ordering.store_orders"
+                 "   WHERE created_at BETWEEN %(s)s AND %(e)s)"),
+                ("ordering.store_orders", (),
+                 "DELETE FROM ordering.store_orders"
+                 " WHERE created_at BETWEEN %(s)s AND %(e)s"),
+                # --- HR schedules ----------------------------------------------
+                ("hr.schedules", (),
+                 "DELETE FROM hr.schedules"
+                 " WHERE scheduled_date BETWEEN %(sd)s AND %(ed)s"),
+                # --- tick ledger ------------------------------------------------
+                # Keyed on `simulation_dt`, like every other delete above, so it
+                # covers the rows this backfill is about to re-generate. Without
+                # it a forced backfill leaves the OLD ledger rows for a range
+                # whose fact tables were just emptied — and now that the backfill
+                # writes a row per simulated hour, it would append a second,
+                # equally valid set beside them: two ledger rows per hour,
+                # differing counts, with nothing to tell a consumer which is the
+                # one that describes the data on disk (t_ac80c514).
+                ("control.generation_stats", (),
+                 "DELETE FROM control.generation_stats"
+                 " WHERE simulation_dt BETWEEN %(s)s AND %(e)s"),
+            ]
 
-            # POS: items + loyalty points → transactions
-            cur.execute(
-                "DELETE FROM pos.transaction_items "
-                "WHERE transaction_id IN ("
-                "  SELECT transaction_id FROM pos.transactions"
-                "  WHERE transaction_dt BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM pos.loyalty_point_transactions "
-                "WHERE transaction_id IN ("
-                "  SELECT transaction_id FROM pos.transactions"
-                "  WHERE transaction_dt BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM pos.transactions "
-                "WHERE transaction_dt BETWEEN %s AND %s",
-                (start_ts, end_ts))
-
-            # Timeclock
-            cur.execute(
-                "DELETE FROM timeclock.events WHERE event_dt BETWEEN %s AND %s",
-                (start_ts, end_ts))
-
-            # Inventory: receipt_items → receipts; shrinkage
-            cur.execute(
-                "DELETE FROM inv.receipt_items "
-                "WHERE receipt_id IN ("
-                "  SELECT receipt_id FROM inv.receipts"
-                "  WHERE received_dt BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM inv.receipts WHERE received_dt BETWEEN %s AND %s",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM inv.shrinkage_events "
-                "WHERE recorded_at BETWEEN %s AND %s",
-                (start_ts, end_ts))
-
-            # Transport: load_items → loads (keyed by created_at)
-            cur.execute(
-                "DELETE FROM transport.load_items "
-                "WHERE load_id IN ("
-                "  SELECT load_id FROM transport.loads"
-                "  WHERE created_at BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM transport.loads WHERE created_at BETWEEN %s AND %s",
-                (start_ts, end_ts))
-
-            # Fulfillment: items → orders
-            cur.execute(
-                "DELETE FROM fulfillment.items "
-                "WHERE fulfillment_id IN ("
-                "  SELECT fulfillment_id FROM fulfillment.orders"
-                "  WHERE created_at BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM fulfillment.orders WHERE created_at BETWEEN %s AND %s",
-                (start_ts, end_ts))
-
-            # Ordering: store_order_items → store_orders
-            cur.execute(
-                "DELETE FROM ordering.store_order_items "
-                "WHERE order_id IN ("
-                "  SELECT order_id FROM ordering.store_orders"
-                "  WHERE created_at BETWEEN %s AND %s)",
-                (start_ts, end_ts))
-            cur.execute(
-                "DELETE FROM ordering.store_orders WHERE created_at BETWEEN %s AND %s",
-                (start_ts, end_ts))
-
-            # HR schedules
-            cur.execute(
-                "DELETE FROM hr.schedules "
-                "WHERE scheduled_date BETWEEN %s AND %s",
-                (start, end))
-
-            # Tick ledger for the window (t_ac80c514). Keyed on `simulation_dt`, like
-            # every other delete above, so it covers the rows this backfill is about to
-            # re-generate. Without it a forced backfill leaves the OLD ledger rows for a
-            # range whose fact tables were just emptied — and now that the backfill
-            # writes a row per simulated hour, it would append a second, equally valid
-            # set beside them: two ledger rows per hour, differing counts, with nothing
-            # to tell a consumer which is the one that describes the data on disk.
-            cur.execute(
-                "DELETE FROM control.generation_stats "
-                "WHERE simulation_dt BETWEEN %s AND %s",
-                (start_ts, end_ts))
+            for relation, requires, sql in statements:
+                missing = [rel for rel in (relation,) + tuple(requires)
+                           if not _relation_exists(cur, rel)]
+                if missing:
+                    log.info("Clear: skipped %s — absent on this data dir: %s",
+                             relation, ", ".join(missing))
+                    continue
+                cur.execute(sql, params)
+                log.info("Clear: %-34s %d row(s)", relation, cur.rowcount)
 
         conn.commit()
         log.info("Cleared data for %s → %s in industry '%s'", start, end, industry)
