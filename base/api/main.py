@@ -235,6 +235,53 @@ def _has_vendor_tables(industry: str) -> bool:
     return present
 
 
+# Cache of the per-COLUMN presence probe, keyed by (industry, schema, table,
+# column). Same reason as the probes above, one level finer: the schemas
+# disagree about columns as well as about tables, and `base/api/main.py` runs
+# ONE SQL string per path for every industry (t_04e1e8be).
+_COLUMN_PRESENT: Dict[tuple, bool] = {}
+
+
+def _has_column(industry: str, schema: str, table: str, column: str) -> bool:
+    """True when this data dir's `<schema>.<table>` carries `<column>`.
+
+    A shared `/{industry}/...` route serves every industry from a single SQL
+    string, so naming a column only SOME industries' `schema.sql` declares is a
+    parse-time `42703` — HTTP 500 — on the rest, for every page, not just the
+    pages whose rows would have used it. That was measured on a data dir built
+    from `gas-station/generator/schema.sql`: `inv.receipts` there has no
+    `load_id` and `inv.products` has no `supplier_id`, while
+    `grocery/generator/schema.sql` declares both (kanban t_04e1e8be).
+
+    So do not justify a column in a shared projection by symmetry with a
+    neighbouring route. Probe it, and when it is absent omit the key — an
+    always-NULL column is not the same payload as a column the schema cannot
+    have, and data-lab builds `raw_*` tables from the payload's keys. The
+    probe is cached per process: the schema of a data dir does not change
+    under a running API, so this is one `information_schema` lookup per
+    industry per column, not one per page.
+
+    `tools/check_api_schema_agreement.py` fails the build when a shared route
+    projects a column without a guard like this one around it.
+    """
+    key = (industry, schema, table, column)
+    cached = _COLUMN_PRESENT.get(key)
+    if cached is not None:
+        return cached
+    try:
+        rows = query("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s AND column_name = %s
+        """, [schema, table, column], industry)
+        present = bool(rows)
+    except Exception:
+        # A probe that cannot answer must not take the route down with it: the
+        # guarded key is the optional one, so omitting it is the safe answer.
+        present = False
+    _COLUMN_PRESENT[key] = present
+    return present
+
+
 def query_write(sql: str, params, industry: str) -> List[Dict]:
     """Execute a write statement with RETURNING and commit."""
     pool = pool_for(industry)
@@ -2385,8 +2432,18 @@ def inventory_receipts(
     # One row per receipt, so the count is of receipts and needs no join.
     total = query(f"SELECT COUNT(*) AS n FROM inv.receipts r WHERE {where}",
                   params, industry)[0]["n"]
+    # `r.load_id` is the receipt → `transport.loads` edge, and only grocery's
+    # schema declares it: `gas-station/generator/schema.sql`,
+    # `base/db/init.sql` and `base/db/03_grocery_schema.sql` define
+    # `inv.receipts` without it (gas-station has no `transport` schema at all).
+    # This SQL is shared, so naming it unconditionally was a parse-time `42703`
+    # — HTTP 500 on every gas-station data dir, not an empty column
+    # (t_04e1e8be). Absent columns are omitted from the payload rather than
+    # returned as NULL: the key set IS data-lab's `raw_inv.receipts` shape.
+    load_id = ("r.load_id, " if _has_column(industry, "inv", "receipts", "load_id")
+               else "")
     rows = query(f"""
-        SELECT r.receipt_id, r.load_id, r.location_id, r.received_dt, r.supplier_name,
+        SELECT r.receipt_id, {load_id}r.location_id, r.received_dt, r.supplier_name,
                r.po_number, r.total_cost,
                COUNT(ri.receipt_item_id) AS line_items
         FROM inv.receipts r
@@ -2408,10 +2465,20 @@ def inventory_products(industry: str, limit: int = Query(500, le=2000), offset: 
     # `_ensure_table` builds `raw_inv.products` from these keys, so a column missing
     # here does not exist downstream however clearly `schema.sql` declares it — and
     # `mart_vendor_performance.product_count` is keyed on it (kanban t_ed802fa6).
-    rows = query("""
+    #
+    # ...but only where the data dir HAS the vendor layer. `inv.suppliers` and
+    # `inv.products.supplier_id` are grocery's: `gas-station/generator/schema.sql`,
+    # `base/db/init.sql` and `base/db/03_grocery_schema.sql` define the same table
+    # without either, and this SQL is shared by every industry, so naming the column
+    # unconditionally answered HTTP 500 `42703` on a gas-station data dir
+    # (kanban t_04e1e8be). The key is omitted there, not NULLed — data-lab builds
+    # `raw_inv.products` from the payload's keys.
+    supplier_id = ("ip.supplier_id, "
+                   if _has_column(industry, "inv", "products", "supplier_id") else "")
+    rows = query(f"""
         SELECT ip.inv_product_id, ip.product_id, p.name AS product_name,
                p.category, p.sku, ip.reorder_point, ip.reorder_qty,
-               ip.unit_of_measure, ip.supplier_id, ip.supplier_name,
+               ip.unit_of_measure, {supplier_id}ip.supplier_name,
                ip.lead_time_days
         FROM inv.products ip
         JOIN pos.products p ON p.product_id = ip.product_id

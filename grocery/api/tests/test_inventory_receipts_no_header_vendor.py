@@ -107,14 +107,26 @@ def test_the_receipts_route_does_not_project_a_header_vendor():
 def test_the_receipts_route_keeps_the_supplier_name_display_copy():
     """
     `supplier_name` is populated by gas-station's restock path (one receipt per vendor
-    per location), so it must survive even though grocery leaves it NULL.
+    per location), so it must survive even though grocery leaves it NULL. `load_id` is
+    the receipt → `transport.loads` edge; it is GUARDED rather than bare, because
+    `gas-station/generator/schema.sql`, `base/db/init.sql` and
+    `base/db/03_grocery_schema.sql` define `inv.receipts` without it and this SQL is
+    shared (t_04e1e8be) — an unguarded `r.load_id` was a parse-time `42703`, HTTP 500,
+    on every gas-station data dir.
     """
-    projection = _page_projection(_route_source(RECEIPTS_SOURCE_PATH))
-    for column in ("r.supplier_name", "r.load_id", "r.po_number", "r.total_cost"):
+    body = _route_source(RECEIPTS_SOURCE_PATH)
+    projection = _page_projection(body)
+    assert "_has_column(industry, \"inv\", \"receipts\", \"load_id\")" in body, (
+        "`/inventory/receipts` projects `r.load_id` without probing for it; the three "
+        "non-grocery schemas declare `inv.receipts` without that column, so the shared "
+        f"route would 500 them (t_04e1e8be). Route source was:\n{body}")
+    assert "r.load_id" in body, (
+        "`/inventory/receipts` stopped projecting `r.load_id`, the receipt → "
+        "`transport.loads` join grocery data dirs carry")
+    for column in ("r.supplier_name", "r.po_number", "r.total_cost"):
         assert column in projection, (
             f"`/grocery/inventory/receipts` stopped projecting `{column}`; "
-            "`supplier_name` is gas-station's vendor key on a receipt and `load_id` is "
-            "the receipt -> transport.loads join")
+            "`supplier_name` is gas-station's vendor key on a receipt")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +193,12 @@ def test_the_receipts_payload_carries_exactly_the_contracted_keys(
     The route returns the `{data, total, limit, offset}` envelope its siblings use
     (t_2ab8e903) — it was the last receipt-shaped route answering with a bare JSON
     array — so the rows come out of `data`.
+
+    `load_id` is in the contract only where `inv.receipts` declares it (grocery's
+    `schema.sql`); the shared route omits it on the three schemas that do not, so a
+    data dir without the column skips the exact-key assertion rather than failing on
+    a key the schema cannot have (t_04e1e8be). The source-level test above pins that
+    the key is still projected where it exists.
     """
     client = quiesced_generator
     body = client.get(RECEIPTS_REQUEST_PATH, params={"limit": 1}).json()
@@ -193,6 +211,9 @@ def test_the_receipts_payload_carries_exactly_the_contracted_keys(
         "the receipts route returned no rows, or a `total` smaller than the page it "
         "just served")
     keys = set(rows[0])
+    if "load_id" not in keys:
+        pytest.skip("this data dir's `inv.receipts` has no `load_id`, so the shared "
+                    "route omits the key by design (t_04e1e8be)")
     assert keys == PAYLOAD_KEYS, (
         f"the receipts payload keys changed: missing {sorted(PAYLOAD_KEYS - keys)}, "
         f"unexpected {sorted(keys - PAYLOAD_KEYS)}")

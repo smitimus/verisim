@@ -622,6 +622,43 @@ No further serializer changes are required for #26–#31.
 > on `product_id`; it must not wait for a header column, and a NULL
 > `stg_inv_receipts.supplier_id` is not an ingest gap.
 
+> **A shared route must PROBE an industry-specific column, not assume it
+> (t_04e1e8be).** `base/api/main.py` runs **one SQL string per path for every
+> industry**, and the schemas disagree about columns as well as about tables:
+>
+> | column | grocery | gas-station / `base/db/init.sql` / `base/db/03_grocery_schema.sql` |
+> |---|---|---|
+> | `inv.receipts.load_id` | declared (FK → `transport.loads`) | absent (gas-station has no `transport` schema at all) |
+> | `inv.products.supplier_id` | declared (FK → `inv.suppliers`) | absent (gas-station has no `inv.suppliers`) |
+>
+> Two shared routes projected them unconditionally — `/{industry}/inventory/receipts`
+> (`r.load_id`, from the `#11` change above) and `/{industry}/inventory/products`
+> (`ip.supplier_id`, from t_ed802fa6) — so on a data dir generated from
+> `gas-station/generator/schema.sql` both answered **HTTP 500 `42703`**: measured
+> `column r.load_id does not exist` and `column ip.supplier_id does not exist`, on a
+> scratch data dir built from that schema with the entrypoint's grants. Note the
+> shape of the failure: a *parse-time* error, so the whole route dies for every page,
+> not just the rows that would have used the column.
+>
+> Both projections are now guarded with `_has_column(industry, schema, table,
+> column)` — a per-process-cached `information_schema.columns` probe, the column
+> analogue of `_has_vendor_tables` / `_products_has_elasticity_columns`. Where the
+> data dir lacks the column the key is **omitted from the payload**, not returned as
+> NULL: the key set is what data-lab's `raw_inv.receipts` / `raw_inv.products` are
+> built from, so an always-NULL column would be a landzone column of nulls. Grocery
+> data dirs are unchanged (both keys still served).
+>
+> `tools/check_api_schema_agreement.py` now audits this class: for every route that
+> serves all industries with one projection, each `alias.column` it names must exist
+> in **every** industry's `schema.sql` unless the route guards it with
+> `_has_column(industry, ...)`. The union-level table check that already existed could
+> not see it — those tables exist everywhere, only the columns do not.
+>
+> Rule of thumb: when adding a column to a shared `/{industry}/` route, `git grep` it
+> across every `schema.sql` first, and if the sets differ, probe it. "Symmetry with the
+> neighbouring route" has now caused this bug twice (receipts `load_id`, products
+> `supplier_id`).
+
 ---
 
 ## 5. Integrity harness

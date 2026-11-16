@@ -13,6 +13,7 @@ Run:  python -m pytest gas-station/generator/tests/test_build_checks.py -v
 """
 import importlib.util
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -137,9 +138,84 @@ def test_strip_scripts_keep_only_their_own_industry():
 
 
 def test_api_schema_agreement_holds():
-    """No route queries a table that no schema.sql creates."""
+    """No route queries a table that no schema.sql creates, and no shared route
+    projects a column an industry's schema.sql does not declare."""
     check = _load("check_api_schema_agreement")
     assert check.main() == 0
+
+
+def test_api_schema_agreement_audits_the_shared_routes_it_was_written_for():
+    """The column half must actually examine the routes of t_04e1e8be.
+
+    That defect was invisible to the table half: `inv.receipts` and `inv.products`
+    exist in every `schema.sql`, but `inv.receipts.load_id` and
+    `inv.products.supplier_id` exist only in grocery's — so the two shared routes
+    500'd `42703` on a gas-station data dir while the union table check passed.
+    The audit skips a route whose SQL branches per industry or gates on a relation
+    probe, and a skip rule that widened to cover these two would quietly restore
+    exactly that blindness. So the routes are named, and gas-station must be one
+    of the industries they were audited against.
+    """
+    check = _load("check_api_schema_agreement")
+    src = (REPO / "base" / "api" / "main.py").read_text()
+    schemas = {name: check.columns_in_schema(path)
+               for name, path in check.industries(REPO).items()}
+    findings, checked, skipped = check.column_findings(src, schemas)
+
+    skipped_routes = {route for route, _ in skipped}
+    for route in ("/{industry}/inventory/receipts", "/{industry}/inventory/products"):
+        assert route not in skipped_routes, (
+            f"{route} is no longer audited for columns ({dict(skipped)[route]}), so "
+            "an unguarded column there would pass again (t_04e1e8be)")
+    assert checked["gas-station"] > 0, (
+        "no shared route body was audited against the gas-station schema")
+    assert not findings, (
+        "a shared route projects a column the gas-station schema lacks: "
+        f"{findings}")
+
+
+def test_shared_route_column_guard_has_teeth(tmp_path, capsys):
+    """RED: drop the guard and the check must name the column and the industry.
+
+    `inv.products.supplier_id` and `inv.receipts.load_id` are grocery's alone
+    (t_04e1e8be), so projecting either one unconditionally is a parse-time
+    `42703` — HTTP 500 — on every gas-station data dir. Both projections are
+    guarded with `_has_column(industry, ...)` now; this removes each guard in a
+    copy of the repo and requires the checker to fail *and* to say what broke.
+    """
+    check = _load("check_api_schema_agreement")
+    tree = _mini_tree(tmp_path, "repo_unguarded_column")
+    api = tree / "base" / "api" / "main.py"
+
+    # The clean copy must pass first, or the failing assertions below prove
+    # nothing about the mutation.
+    assert check.main(tree) == 0, "the unmutated copy must pass"
+    capsys.readouterr()
+
+    source = api.read_text()
+    unguarded = re.sub(
+        r'load_id\s*=\s*\(\s*"r\.load_id, "\s*if\s*_has_column\([^)]*\)\s*else\s*""\s*\)',
+        'load_id = "r.load_id, "', source, flags=re.S)
+    assert unguarded != source, (
+        "the receipts route no longer guards `r.load_id` with `_has_column`; if the "
+        "guard moved, move this mutation with it (t_04e1e8be)")
+    api.write_text(unguarded)
+    assert check.main(tree) == 1, "an unguarded `r.load_id` must fail the check"
+    out = capsys.readouterr().out
+    assert "r.load_id" in out and "gas-station" in out, out
+
+    unguarded_vendor = re.sub(
+        r'supplier_id\s*=\s*\(\s*"ip\.supplier_id, "\s*if\s*_has_column\([^)]*\)\s*else\s*""\s*\)',
+        'supplier_id = "ip.supplier_id, "', unguarded, flags=re.S)
+    assert unguarded_vendor != unguarded, (
+        "the products route no longer guards `ip.supplier_id` with `_has_column`; "
+        "if the guard moved, move this mutation with it (t_04e1e8be)")
+    api.write_text(unguarded_vendor)
+    assert check.main(tree) == 1, (
+        "an unguarded `ip.supplier_id` must fail the check — that was the other "
+        "half of t_04e1e8be")
+    out = capsys.readouterr().out
+    assert "ip.supplier_id" in out and "gas-station" in out, out
 
 
 def test_switch_status_sees_every_container_it_creates():

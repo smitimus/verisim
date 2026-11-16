@@ -93,11 +93,23 @@ def test_the_products_route_projects_the_vendor_key():
     `inv.products.supplier_id` is the only column the marts can join to a vendor on.
     `supplier_name` is a denormalised display copy — kept, and still projected, but
     it cannot carry an FK and stops being 1:1 the day a vendor is renamed.
+
+    Guarded, not bare: this route SQL is shared by every industry and
+    `inv.products.supplier_id` is grocery's alone (t_04e1e8be), so the column is
+    named only where `_has_column` says the data dir has it.
     """
-    projection = _page_projection(_route_source(PRODUCTS_SOURCE_PATH))
-    assert "ip.supplier_id" in projection, (
-        "`/grocery/inventory/products` does not project `ip.supplier_id`. The payload "
-        "is data-lab's raw landzone schema, so the column will not exist in "
+    body = _route_source(PRODUCTS_SOURCE_PATH)
+    projection = _page_projection(body)
+    assert "_has_column(industry, \"inv\", \"products\", \"supplier_id\")" in body, (
+        "`/grocery/inventory/products` projects `ip.supplier_id` without probing for "
+        "it. `gas-station/generator/schema.sql`, `base/db/init.sql` and "
+        "`base/db/03_grocery_schema.sql` define `inv.products` WITHOUT that column, "
+        "and the route SQL is shared, so an unguarded projection is a parse-time "
+        "`42703` — HTTP 500 on every gas-station data dir (t_04e1e8be). "
+        f"Route source was:\n{body}")
+    assert "ip.supplier_id" in body, (
+        "`/grocery/inventory/products` does not project `ip.supplier_id` at all. The "
+        "payload is data-lab's raw landzone schema, so the column will not exist in "
         "`raw_inv.products` and `mart_vendor_performance.product_count` stays 0. "
         f"Projection was:\n{projection}")
 
@@ -124,11 +136,21 @@ def test_the_products_payload_carries_exactly_the_contracted_keys(
     """
     Key count, not just key presence: `raw_inv.products` gains and loses columns as
     this list changes, and data-lab's staging model is built against the list.
+
+    On a data dir with no vendor layer (`inv.products.supplier_id` does not exist —
+    a slot on an image older than t_57b1a1ab, or a non-grocery industry) the route
+    omits the key rather than 500ing on it (t_04e1e8be); the suppliers route
+    reports that absence as `available: false`, so that is the skip condition.
     """
     client = quiesced_generator
     body = client.get(PRODUCTS_REQUEST_PATH, params={"limit": 1}).json()
     assert body["total"] > 0, "the products route returned no rows"
     keys = set(body["data"][0])
+    if "supplier_id" not in keys:
+        suppliers = client.get(SUPPLIERS_REQUEST_PATH, params={"limit": 1}).json()
+        if not suppliers.get("available"):
+            pytest.skip("no vendor layer on this data dir — `inv.products` has no "
+                        "`supplier_id`, so the route omits the key by design")
     assert keys == PAYLOAD_KEYS, (
         f"the products payload keys changed: missing {sorted(PAYLOAD_KEYS - keys)}, "
         f"unexpected {sorted(keys - PAYLOAD_KEYS)}")
