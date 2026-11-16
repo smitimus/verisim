@@ -252,6 +252,10 @@ jobs:
   integration:
     if: github.event_name != 'pull_request'
     steps:
+      - name: Reclaim runner disk
+        run: bash .github/scripts/reclaim-runner-disk.sh before
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Build image
         uses: docker/build-push-action@v5
         with:
@@ -260,6 +264,12 @@ jobs:
         run: |
           CANDIDATE_URLS="http://127.0.0.1:8000"
           echo "VERISIM_API_BASE_URL=${CANDIDATE_URLS}" >> "$GITHUB_ENV"
+      - name: Tear down test container
+        if: always()
+        run: docker rm -fv verisim-test 2>/dev/null || true
+      - name: Reclaim runner disk after the job
+        if: always()
+        run: bash .github/scripts/reclaim-runner-disk.sh after "img:sha"
   publish:
     needs: [test, integration]
     steps:
@@ -327,6 +337,69 @@ def test_workflows_checker_catches_the_pr_build_and_localhost_regressions(tmp_pa
     assert "pull requests" in out, out
     assert "localhost" in out, out
     assert "load: true" in out, out
+
+
+# ── the runner's disk: reclaim before build, own leftovers after (t_66c9f612) ──
+
+_DISK_REGRESSED_WORKFLOW = """\
+name: synthetic
+on:
+  pull_request:
+jobs:
+  test:
+    steps:
+      - run: "true"
+  integration:
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          load: true
+      - name: Smoke test
+        run: |
+          CANDIDATE_URLS="http://127.0.0.1:8000"
+          echo "VERISIM_API_BASE_URL=${CANDIDATE_URLS}" >> "$GITHUB_ENV"
+      - name: Tear down test container
+        if: always()
+        run: docker rm -f verisim-test 2>/dev/null || true
+  publish:
+    needs: [test, integration]
+    steps:
+      - name: Require publish credentials
+        run: |
+          if [ -z "${DOCKER_USERNAME}" ]; then exit 1; fi
+"""
+
+
+def test_workflows_checker_catches_the_runner_disk_regressions(tmp_path, capsys):
+    """RED: a build that neither reclaims first nor cleans up after must fail.
+
+    bench/108 is ONE 40 G volume for the act runner and the monitoring pane, and
+    a push runs two image builds on it. On 2026-11-15 the gas-station build died
+    at its buildx export with `no space left on device` twice, so it never reached
+    its API contract suite and its publish job was skipped (t_66c9f612). Three
+    regressions produced that, and each gets a case that must fail by name: no
+    reclaim before buildx, a teardown that keeps the smoke container's anonymous
+    postgres volume (`docker rm -f` without -v), and no reclaim of this job's own
+    image and builder at the end.
+    """
+    check = _load("check_workflows")
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "clean.yml").write_text(_CLEAN_WORKFLOW)
+
+    assert check.main(tmp_path) == 0, "the unmutated workflow must pass"
+    assert "reclaims the runner's disk before buildx" in capsys.readouterr().out
+
+    (wf_dir / "regressed.yml").write_text(_DISK_REGRESSED_WORKFLOW)
+    assert check.main(tmp_path) == 1, "the disk-regressed workflow must fail"
+    out = capsys.readouterr().out
+    assert "reclaiming the runner's disk" in out, out
+    assert "without -v" in out, out
+    assert "reclaim-runner-disk.sh after" in out, out
 
 
 @pytest.mark.parametrize(

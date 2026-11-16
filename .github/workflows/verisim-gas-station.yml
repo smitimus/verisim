@@ -79,6 +79,20 @@ jobs:
       - name: Install test deps
         run: pip install pytest httpx
 
+      # DISK FIRST, BUILD SECOND (t_66c9f612). This job shares ONE 40 G volume with
+      # the monitoring pane and with the other workflow's image job, and on
+      # 2026-11-15 a grocery build immediately before it left the volume with no
+      # room: the two attempts at THIS job's build both died at the buildx export
+      # (`no space left on device`), so it never reached the smoke test or the
+      # contract suite and `publish` was skipped silently. The reclaim step removes
+      # only what the next build rebuilds — superseded `smiti/verisim-*` tags,
+      # orphaned buildx builder state, and the ~900 MB postgres data volumes a
+      # killed smoke test leaves behind — and fails up front, naming the runner, if
+      # the volume still cannot hold a build. Rules and refusals:
+      # `.github/scripts/reclaim-runner-disk.sh`, tests beside it.
+      - name: Reclaim runner disk
+        run: bash .github/scripts/reclaim-runner-disk.sh before
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -199,7 +213,17 @@ jobs:
 
       - name: Tear down test container
         if: always()
-        run: docker rm -f verisim-gas-test 2>/dev/null || true
+        # -v matters: the smoke container's postgres data dir is an ANONYMOUS volume,
+        # and a plain `rm -f` leaves it behind — measured at 900 MB each on bench/108
+        # (t_66c9f612). Without -v, every torn-down run costs the next build a gigabyte.
+        run: docker rm -fv verisim-gas-test 2>/dev/null || true
+
+      # Leave the runner as found: the image this job loaded and the builder buildx
+      # created for it are both gone at the end, so a second image build in the same
+      # push window starts from the same disk a first one did (t_66c9f612).
+      - name: Reclaim runner disk after the job
+        if: always()
+        run: bash .github/scripts/reclaim-runner-disk.sh after "${{ env.IMAGE_NAME }}:${{ github.sha }}"
 
   publish:
     name: Push gas-station image to Docker Hub
@@ -256,6 +280,12 @@ jobs:
             exit 1
           fi
           echo "Docker Hub credentials are present (DOCKER_USERNAME=${DOCKER_USERNAME})."
+
+      # Same disk rule as integration (t_66c9f612): a publish builds a ~1 GB image
+      # too, and it runs in the same push window as the other workflow's jobs.
+      - name: Reclaim runner disk
+        if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'
+        run: bash .github/scripts/reclaim-runner-disk.sh before
 
       - name: Set up Docker Buildx
         if: github.event_name != 'pull_request' && steps.gate.outputs.publish == 'true'

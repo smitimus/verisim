@@ -26,7 +26,9 @@ volume. Nothing pruned any of it for six weeks.
 Infra now prunes the runner every 3 hours (`admin/infra`
 `scripts/ci-runner-prune.sh`: keeps the newest image per repo, drops anything older
 than 45 minutes, never touches `runner-images`, no-ops during a live job) and the host
-is on the disk watchdog at 80 %. That is the safety net, not the fix.
+is on the disk watchdog at 80 %. That is the safety net, not the fix — and on its own
+it was not enough: see §1a (t_66c9f612), where two image builds on one push did not fit
+inside one prune interval at all.
 
 The fix is in the workflows:
 
@@ -49,6 +51,68 @@ The fix is in the workflows:
 A second runner, or a separate buildx cache, was considered and rejected: there is one
 volume, so a second cache directory on it is the same 40 GB, and a second runner is a
 new host to keep rather than disk saved.
+
+### 1a. Two image builds in one push window (t_66c9f612)
+
+The 3-hourly prune is a backstop, not a budget, and on 2026-11-15 the budget was
+exceeded: **ten pushes in three hours** — each loading a ~1 GB grocery image *and* a
+~1 GB gas-station image plus a builder — against a cron that ran once per three hours.
+Run 243 proved it: the grocery job built, smoke-tested and published normally, and the
+gas-station job on the same push then died **at its buildx export**, twice, inside one
+prune interval:
+
+```
+run 243 / job 635  #23 ERROR: write .../pyarrow/libarrow_substrait.so.2600: no space left
+run 243 / job 641  #23 ERROR: write /blobs/sha256/c96992ef…: no space left
+```
+
+The job never reached its smoke test or its API contract suite, and
+`Push gas-station image to Docker Hub` (`needs: integration`) was **skipped** — so the
+published image quietly fell behind `main` and the only visible symptom was a red build.
+
+Measured on the volume when the card was worked:
+
+| what | size |
+|---|---|
+| used / free on the 40 G root | 35 G / **2.4 G** |
+| `smiti/verisim-*` image tags (25 of them) | 20.4 G, **15.4 G reclaimable** |
+| orphaned anonymous volumes (torn-down smoke tests) | 916 M + 899 M + 224 M |
+| `buildx_buildkit_*_state` volumes | 1.3 G mid-build, 18 M stale |
+
+The fix is in the workflows, because the cron cannot be fast enough to make a *second*
+build in the same window safe — it would have to run between the two jobs:
+
+* **`Reclaim runner disk` runs before `setup-buildx` in every image job** — both
+  `integration` jobs and both `publish` jobs — via
+  `.github/scripts/reclaim-runner-disk.sh before`. It removes only what the next build
+  rebuilds: superseded `smiti/verisim-*` tags (newest kept per repo, anything
+  container-referenced kept), orphaned builder state volumes, builder containers older
+  than 30 minutes, dangling images, and **anonymous volumes nobody references** — the
+  postgres data dirs a killed smoke test leaves behind. It refuses to touch
+  `docker.gitea.com/runner-images` (the runner has `force_pull: false`), the monitoring
+  pane's named volumes/images, and never runs `image prune -a` or `system prune`.
+* **It fails up front, as a runner condition**, if the volume is still below
+  `RECLAIM_FLOOR_GB` (default 5) after reclaiming — `::error title=CI runner out of
+  disk` naming bench/108, instead of an ENOSPC 30 seconds later in the build that reads
+  as a fault in the commit.
+* **The teardown is `docker rm -fv`**, not `rm -f`: the smoke container's data dir is an
+  anonymous volume, so a plain `rm -f` left ~900 MB on the volume on every torn-down run
+  (that is where the 916 M / 899 M volumes came from).
+* **`Reclaim runner disk after the job`** (`if: always()`) removes the image this job
+  loaded and the builder buildx created for it, so the job that runs next in the same
+  push window starts on the disk the last one started on.
+
+Measured result of one reclaim pass on the volume: **35 G → 18 G used, 2.4 G → 20 G
+free** (24 image tags, 2.1 G of orphaned anonymous volumes, and one stale builder
+removed; 249 MB of dangling layers included).
+
+`tools/check_workflows.py` now fails the build if any job sets up buildx without
+reclaiming first, if the teardown drops `-v`, or if the integration job has no
+`if: always()` reclaim — with the negative cases in
+`gas-station/generator/tests/test_build_checks.py`. The script's own rules and refusals
+are exercised offline by `.github/scripts/reclaim-runner-disk-tests.sh` (25 assertions,
+stub `docker`/`df`).
+
 
 ## 2. `localhost` inside the job is the job, not the published container
 

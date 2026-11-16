@@ -16,6 +16,7 @@ Usage:  python tools/check_workflows.py <checkout>
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -148,6 +149,58 @@ def main(root: pathlib.Path | None = None) -> int:
                   f"`outputs: type=docker,dest=…` and reloads it; use `load: true` "
                   f"(t_19eb986e)")
             rc = 1
+
+        # ── every image build reclaims the runner's disk FIRST (t_66c9f612) ──
+        # bench/108 has ONE 40 G volume for the act runner AND the monitoring pane.
+        # A push runs two workflows, each loading a ~1 GB image into the daemon, so
+        # a grocery build followed by a gas-station build on the same push ran out
+        # of room at the buildx export — twice — and the gas-station job never
+        # reached its contract suite (run 243 / jobs 635 + 641). The reclaim step
+        # runs before buildx creates its builder and is the only thing that makes
+        # the second build in a push window start from the first one's disk.
+        RECLAIM = ".github/scripts/reclaim-runner-disk.sh"
+        for job_name, job in sorted(jobs.items()):
+            steps = job.get("steps") or []
+            buildx_at = [i for i, s in enumerate(steps)
+                         if isinstance(s, dict) and "setup-buildx-action" in str(s.get("uses") or "")]
+            if not buildx_at:
+                continue
+            before_at = [i for i, s in enumerate(steps)
+                         if RECLAIM in str((s or {}).get("run") or "")
+                         and " before" in str((s or {}).get("run") or "")]
+            if not before_at or before_at[0] > buildx_at[0]:
+                print(f"{name}: FAIL — job {job_name!r} sets up buildx without first "
+                      f"reclaiming the runner's disk ({RECLAIM} before); the second "
+                      f"image build in a push window then runs out of room "
+                      f"(t_66c9f612)")
+                rc = 1
+            else:
+                print(f"{name}: OK — {job_name} reclaims the runner's disk before buildx")
+
+        # ── and the image job must leave the runner as it found it ──
+        # The smoke container's postgres data dir is an ANONYMOUS volume; `docker rm
+        # -f` without -v leaves ~900 MB behind on every torn-down run (measured on
+        # bench/108), and the loaded image itself survives until the next prune.
+        always_runs = [str(s.get("run") or "") for s in (jobs["integration"].get("steps") or [])
+                       if isinstance(s, dict) and "always()" in str(s.get("if") or "")]
+        if any(re.search(r"docker rm -f [^\s-]", r) for r in always_runs):
+            print(f"{name}: FAIL — the smoke teardown uses `docker rm -f` without -v, "
+                  f"so its anonymous postgres volume survives the run (~900 MB per "
+                  f"torn-down run on bench/108, t_66c9f612)")
+            rc = 1
+        elif not any("docker rm -fv" in r for r in always_runs):
+            print(f"{name}: FAIL — no `if: always()` step removes the smoke container "
+                  f"with its data volume (`docker rm -fv …`)")
+            rc = 1
+        else:
+            print(f"{name}: OK — the teardown removes the smoke container and its volume")
+        if not any(f"{RECLAIM} after" in r for r in always_runs):
+            print(f"{name}: FAIL — no `if: always()` step runs `{RECLAIM} after`; the "
+                  f"loaded image and the job's builder are left on the runner "
+                  f"(t_66c9f612)")
+            rc = 1
+        else:
+            print(f"{name}: OK — the job reclaims its own image and builder at the end")
 
     return rc
 
