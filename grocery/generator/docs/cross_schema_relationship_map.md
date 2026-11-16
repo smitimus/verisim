@@ -396,6 +396,41 @@ transaction). data-lab's staging model derives `line_total` from
 `(unit_price - discount) * quantity`, i.e. the old per-unit reading — so the two
 repos have to move together.
 
+### Loyalty points pay out, and a coupon has a usage cap (t_74280120)
+
+Two source columns existed, were read by marts whose whole purpose they are, and
+were never written:
+
+* **`pos.loyalty_point_transactions.points_redeemed`.** The ledger only ever
+  credited — 534,250 `purchase` / `tier_upgrade` / `bonus` rows, zero
+  `redemption` rows, `sum(points_redeemed) = 0` — so
+  `int_loyalty_enriched.points_redeemed`,
+  `mart_loyalty_rfm.lifetime_points_redeemed` and
+  `mart_loyalty_engagement.redemption_rate_pct` published a structural zero.
+  `_record_loyalty_points` now draws a redemption for
+  `loyalty.redemption_rate` (default 3 %) of member tickets, scaled by the
+  `redemption_rush` scenario's `loyalty_redemption_modifier` for A/B runs.
+  The amount is a whole multiple of 100 points (100 points = $1 of basket) and
+  is capped by `min(balance at that instant, ticket value,
+  loyalty.redemption_points_max)`, so `balance_after` can never go negative and
+  a ticket can never pay out more than it is worth.
+  The redemption row is written **before** the earn row for the same ticket:
+  data-lab's `assert_loyalty_points_balance` orders same-instant rows by
+  `balance_after`, and in the other order the redeem row lands lower and reads
+  as a chain break. A redemption never demotes a tier.
+* **`pos.coupons.max_uses`.** It is the denominator of
+  `mart_promotion_redemption.redemption_rate_pct`
+  (`uses_count / max_uses`) and was NULL on 100 % of coupons, so that rate was
+  uncomputable even where `uses_count` was real. Seeding now writes a cap
+  (named coupons from their own catalogue terms, generated coupons from
+  `coupons.max_uses`), and `backfill_coupon_max_uses()` repairs every legacy
+  NULL row in place — it runs at the top of `seed_coupons`, i.e. at boot and
+  every simulated midnight, because a reseed alone never touches rows that
+  already exist.
+
+Neither change alters the DDL: `max_uses` and `points_redeemed` were already
+there, they simply had no writer.
+
 ### Generation-order guarantee
 
 `grocery/generator/main.py::run_tick` runs the supply-chain block

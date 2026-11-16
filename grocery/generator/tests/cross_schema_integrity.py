@@ -559,6 +559,28 @@ ASSERTIONS: List[AssertionSpec] = [
         """,
     ),
 
+    AssertionSpec(
+        id="HARD-40",
+        dimension="semantic_type",
+        title="pos.loyalty_point_transactions — one direction per row, and never a negative balance",
+        sql="""
+            SELECT pt_id, member_id, points_earned, points_redeemed, balance_after
+            FROM pos.loyalty_point_transactions
+            WHERE (points_earned > 0) = (points_redeemed > 0)
+               OR balance_after < 0
+        """,
+    ),
+    AssertionSpec(
+        id="HARD-41",
+        dimension="semantic_type",
+        title="pos.coupons.max_uses — the redemption-rate denominator exists",
+        sql="""
+            SELECT coupon_id, code, uses_count
+            FROM pos.coupons
+            WHERE max_uses IS NULL
+        """,
+    ),
+
     # ---- SEMANTIC TYPE MISMATCHES (NOT FK-enforced) ----------------------
     AssertionSpec(
         id="SEMA-01",

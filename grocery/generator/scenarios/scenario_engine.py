@@ -188,6 +188,11 @@ class ScenarioContext:
     labor_multiplier: float = 1.0             # scale scheduled headcount (holiday=1.2)
     shrinkage_modifier: float = 1.0           # scale shrinkage event rate (supplier_disruption=1.3)
     loyalty_engagement_modifier: float = 1.0  # scale coupon/deal usage probability
+    # Scale the probability that a member spends points at the till
+    # (t_74280120). Separate from `loyalty_engagement_modifier`, which moves
+    # coupon/deal usage — a heavy-redemption regime must be measurable on its
+    # own in the A/B harness, not inferred from a coupon lift.
+    loyalty_redemption_modifier: float = 1.0
     per_store_multipliers: Dict[str, float] = field(default_factory=dict)  # per-store volume overrides
 
     # Synthetic weather (t_2ab1fb0a). The day's WEATHER volume response, which
@@ -252,6 +257,13 @@ def _apply_single_scenario(
     elif scenario_name == 'deep_discount':
         ctx.price_modifier = min(ctx.price_modifier, cfg.scenarios.deep_discount_price_modifier)
         ctx.loyalty_engagement_modifier = max(ctx.loyalty_engagement_modifier, 1.3)
+
+    elif scenario_name == 'redemption_rush':
+        # Points-spend-heavy regime (t_74280120). Only the redemption
+        # probability moves: volume, price and coupon behavior stay at the
+        # baseline, so an A/B run attributes the change to points redemption.
+        ctx.loyalty_redemption_modifier = max(
+            ctx.loyalty_redemption_modifier, cfg.scenarios.redemption_rush_modifier)
 
     else:
         # 'normal', 'rush_hour', or unknown — apply override only

@@ -46,6 +46,21 @@ class LoyaltyConfig:
     loyalty_usage_rate: float = 0.40
     initial_member_count: int = 300
 
+    # Points redemption (t_74280120). The ledger only ever CREDITED points —
+    # 534,250 earn rows and zero redemption rows — so every redemption metric
+    # downstream (`int_loyalty_enriched.points_redeemed`,
+    # `mart_loyalty_rfm.lifetime_points_redeemed`,
+    # `mart_loyalty_engagement.redemption_rate_pct`) published 0 or NULL.
+    #
+    # `redemption_rate` is the share of a member's tickets that spends points
+    # at the till. The amount drawn is a multiple of 100 points (100 points =
+    # $1 of basket, so a ticket can never spend more than it is worth) and is
+    # always capped at the member's balance at that point in time.
+    # `redemption_rush` in the scenario engine scales it for the A/B harness.
+    redemption_rate: float = 0.03
+    redemption_points_min: int = 100
+    redemption_points_max: int = 2500
+
 
 @dataclass
 class CustomersConfig:
@@ -151,6 +166,18 @@ class CouponConfig:
     valid_duration_days: int = 14
     coupon_use_rate: float = 0.20
 
+    # `pos.coupons.max_uses` is the denominator of
+    # `mart_promotion_redemption.redemption_rate_pct`
+    # (uses_count / max_uses). It was seeded NULL on every coupon ever made,
+    # so the rate came out 100 % NULL even where `uses_count` was real
+    # (t_74280120). Generated coupons draw their cap from this range; every
+    # pre-existing NULL row is repaired to the same range on the next boot.
+    # Sized above the redemption volume a coupon accrues in a normal data dir
+    # (measured ~1000 uses over 90 days) so the published rate stays a
+    # percentage, not a multiple of 100.
+    max_uses_min: int = 2000
+    max_uses_max: int = 8000
+
 
 @dataclass
 class TransportConfig:
@@ -210,6 +237,10 @@ class ScenarioConfig:
     supply_disruption_shrinkage_modifier: float = 1.3
     regional_peak_stores: Dict[str, float] = field(default_factory=dict)
     deep_discount_price_modifier: float = 0.8
+    # Heavy-redemption regime (t_74280120). Multiplies
+    # `loyalty.redemption_rate` for the tickets it covers, so the A/B harness
+    # can exercise a points-spend-heavy week without moving the default mix.
+    redemption_rush_modifier: float = 6.0
 
 
 @dataclass
@@ -440,6 +471,11 @@ SCHEMA = (
     (('loyalty', 'signup_rate'), ('loyalty', 'signup_rate')),
     (('loyalty', 'loyalty_usage_rate'), ('loyalty', 'loyalty_usage_rate')),
     (('loyalty', 'initial_member_count'), ('loyalty', 'initial_member_count')),
+    (('loyalty', 'redemption_rate'), ('loyalty', 'redemption_rate')),
+    # min/max are one YAML node feeding two attributes — the fan-out shape
+    # used by volumes/locations above.
+    (('loyalty', 'redemption_points'), ('loyalty',),
+     {'min': 'redemption_points_min', 'max': 'redemption_points_max'}),
     # customers — the pos.customers household dimension (models/customers.py
     # owns the segment taxonomy; these three keys only shape the base).
     (('customers', 'segment_shares'), ('customers', 'segment_shares')),
@@ -480,6 +516,9 @@ SCHEMA = (
     (('coupons', 'active_at_any_time'), ('coupons', 'active_at_any_time')),
     (('coupons', 'valid_duration_days'), ('coupons', 'valid_duration_days')),
     (('coupons', 'coupon_use_rate'), ('coupons', 'coupon_use_rate')),
+    # The redemption-rate denominator (t_74280120) — one YAML node, two attrs.
+    (('coupons', 'max_uses'), ('coupons',),
+     {'min': 'max_uses_min', 'max': 'max_uses_max'}),
     (('combo_deals', 'active_at_any_time'), ('combo_deals', 'active_at_any_time')),
     (('combo_deals', 'valid_duration_days'), ('combo_deals', 'valid_duration_days')),
     (('combo_deals', 'combo_use_rate'), ('combo_deals', 'combo_use_rate')),
@@ -515,6 +554,7 @@ SCHEMA = (
     (('scenarios', 'supplier_disruption', 'shrinkage_modifier'), ('scenarios', 'supply_disruption_shrinkage_modifier')),
     (('scenarios', 'regional_peak', 'stores'), ('scenarios', 'regional_peak_stores')),
     (('scenarios', 'deep_discount', 'price_modifier'), ('scenarios', 'deep_discount_price_modifier')),
+    (('scenarios', 'redemption_rush', 'redemption_modifier'), ('scenarios', 'redemption_rush_modifier')),
     # weather — the synthetic weather covariate (t_2ab1fb0a). Every key is
     # optional and the dataclass defaults are the working configuration, so an
     # absent `weather:` block is normal. The two `scenarios.severe_weather` keys

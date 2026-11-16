@@ -75,7 +75,10 @@ curl -X POST http://localhost:8010/grocery/generator/scenarios \
   -d '{"scenario_name": "rush_hour"}'
 ```
 
-Available scenarios: `rush_hour`, `weekend`, `holiday_week`, `double_coupons`, `promotion`
+Available scenarios: `rush_hour`, `weekend`, `holiday_week`, `double_coupons`,
+`promotion`, `inflation_pressure`, `severe_weather`, `supplier_disruption`,
+`regional_peak`, `deep_discount`, `redemption_rush` (heavy loyalty
+points-spend, for A/B runs)
 
 ---
 

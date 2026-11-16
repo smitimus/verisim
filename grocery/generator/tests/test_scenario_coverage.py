@@ -117,6 +117,23 @@ def test_regional_peak():
     assert isinstance(ctx.per_store_multipliers, dict)
 
 
+def test_redemption_rush():
+    """Heavy-redemption regime (t_74280120) — only the points lever moves."""
+    ctx = _ctx_for('redemption_rush')
+    assert 'redemption_rush' in ctx.scenario_tag
+    assert ctx.loyalty_redemption_modifier == 6.0
+    # Volume, price and coupon behavior stay at baseline, so an A/B run can
+    # attribute the change to redemption and nothing else.
+    assert ctx.volume_multiplier == 24.0
+    assert ctx.price_modifier == 1.0
+    assert ctx.coupon_multiplier == 1.0
+
+
+def test_default_context_has_no_redemption_lift():
+    ctx = _ctx_for('normal')
+    assert ctx.loyalty_redemption_modifier == 1.0
+
+
 # ---------------------------------------------------------------------------
 # Compound scenarios — multiple scenarios active simultaneously
 # ---------------------------------------------------------------------------

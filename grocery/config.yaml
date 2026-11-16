@@ -73,6 +73,13 @@ loyalty:
   signup_rate: 0.06        # slightly higher than gas station
   loyalty_usage_rate: 0.40 # grocery loyalty cards used more often
   initial_member_count: 300 # initial members seeded at startup
+  # Points spent at the till (t_74280120). Share of a member's tickets that
+  # redeems, and the points range one redemption draws from (100 points = $1).
+  # A redemption is always capped at the member's balance at that moment.
+  redemption_rate: 0.03
+  redemption_points:
+    min: 100
+    max: 2500
 
 # Customer / household master dimension (pos.customers). The segment
 # taxonomy — which age bands and household sizes each segment skews to —
@@ -338,6 +345,11 @@ coupons:
   active_at_any_time: 8            # how many coupons are active at once
   valid_duration_days: 14          # coupon validity window
   coupon_use_rate: 0.20            # probability a loyalty member uses a coupon
+  # `pos.coupons.max_uses` — the denominator of the redemption-rate mart.
+  # Drawn per generated coupon; legacy NULL rows are repaired into this range.
+  max_uses:
+    min: 2000
+    max: 8000
 
 combo_deals:
   active_at_any_time: 4            # how many combo deals active at once
@@ -413,6 +425,11 @@ scenarios:
     stores: {}          # e.g. {"store-uuid-1": 1.4, "store-uuid-2": 1.2}
   deep_discount:
     price_modifier: 0.8
+  # Heavy-redemption regime (t_74280120): multiplies loyalty.redemption_rate so
+  # the A/B harness can exercise a points-spend-heavy week without moving the
+  # default mix.
+  redemption_rush:
+    redemption_modifier: 6.0
 
 # =============================================================================
 # Synthetic weather covariate (t_2ab1fb0a)

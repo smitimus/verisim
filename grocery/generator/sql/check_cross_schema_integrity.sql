@@ -321,6 +321,29 @@ SELECT d.dsd_delivery_id, d.supplier_id, s.fulfillment_model
             WHERE s.fulfillment_model <> 'dsd'
               AND d.delivery_date < CURRENT_DATE;
 
+-- [HARD-40] pos.loyalty_point_transactions — one direction per row, and never a negative balance
+-- The ledger was credit-only: 534,250 `purchase` / `tier_upgrade` / `bonus`
+-- rows, zero `redemption` rows, so every redemption metric downstream published
+-- a structural zero (t_74280120). A row that both earns and redeems is equally
+-- wrong — it double-counts the event — and a redemption larger than the balance
+-- would show as a negative `balance_after`. All three are source-side facts, so
+-- they belong in the sweep rather than only in a model test. No time filter:
+-- the invariant is per row and cannot be transiently violated by a partial day.
+SELECT pt_id, member_id, points_earned, points_redeemed, balance_after
+            FROM pos.loyalty_point_transactions
+            WHERE (points_earned > 0) = (points_redeemed > 0)
+               OR balance_after < 0;
+
+-- [HARD-41] pos.coupons.max_uses — the redemption-rate denominator exists
+-- `mart_promotion_redemption.redemption_rate_pct` divides `uses_count` by
+-- `max_uses`. Every coupon was seeded with a NULL cap, so the mart published
+-- 100 % NULL even where the redemption count was real (t_74280120). Seeding now
+-- writes a cap and `pos.backfill_coupon_max_uses()` repairs legacy rows at
+-- boot; this assertion is what notices if either path stops running.
+SELECT coupon_id, code, uses_count
+            FROM pos.coupons
+            WHERE max_uses IS NULL;
+
 -- --------------------------------------------------------------------------
 -- SEMANTIC_TYPE — ordering.store_orders.store_location_id must be a STORE location
 -- --------------------------------------------------------------------------

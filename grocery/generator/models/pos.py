@@ -272,20 +272,29 @@ def seed_named_coupons(conn, departments: List[Dict],
         valid_from = _promo_history_start(cur, history_days)
 
     NAMED_COUPONS = [
-        ("SAVE5OFF50",  "$5 off any purchase of $50 or more",         "dollar_off", 5.00,  50.00, None,                           None),
-        ("PRODUCE10",   "10% off all produce",                         "percent_off", 0.10, None,  dept_by_name.get("produce"),    None),
-        ("DAIRY1OFF",   "$1 off any dairy purchase",                   "dollar_off", 1.00,  None,  dept_by_name.get("dairy"),      None),
-        ("BAKERY2OFF",  "$2 off bakery items",                         "dollar_off", 2.00,  None,  dept_by_name.get("bakery"),     None),
-        ("LOYALTY10",   "10% loyalty member discount",                 "percent_off", 0.10, None,  None,                           None),
-        ("MEATDEPT15",  "15% off meat department",                     "percent_off", 0.15, None,  dept_by_name.get("meat"),       None),
-        ("DELI5PCT",    "5% off deli items",                           "percent_off", 0.05, None,  dept_by_name.get("deli"),       None),
-        ("ORGANIC20",   "20% off organic produce",                     "percent_off", 0.20, None,  dept_by_name.get("produce"),    None),
+        # code, description, type, discount, min purchase, dept, product, max_uses
+        #
+        # `max_uses` is the DENOMINATOR of
+        # `mart_promotion_redemption.redemption_rate_pct`
+        # (uses_count / max_uses). It used to be NULL on every coupon, so the
+        # rate came out 100 % NULL even where the redemption count was real
+        # (t_74280120). Caps sit above the volume a coupon accrues in a normal
+        # data dir (~1000 redemptions over 90 days, measured on dev), so the
+        # published rate stays a percentage rather than a multiple of 100.
+        ("SAVE5OFF50",  "$5 off any purchase of $50 or more",         "dollar_off", 5.00,  50.00, None,                           None, 5000),
+        ("PRODUCE10",   "10% off all produce",                         "percent_off", 0.10, None,  dept_by_name.get("produce"),    None, 3000),
+        ("DAIRY1OFF",   "$1 off any dairy purchase",                   "dollar_off", 1.00,  None,  dept_by_name.get("dairy"),      None, 3000),
+        ("BAKERY2OFF",  "$2 off bakery items",                         "dollar_off", 2.00,  None,  dept_by_name.get("bakery"),     None, 2500),
+        ("LOYALTY10",   "10% loyalty member discount",                 "percent_off", 0.10, None,  None,                           None, 4000),
+        ("MEATDEPT15",  "15% off meat department",                     "percent_off", 0.15, None,  dept_by_name.get("meat"),       None, 2500),
+        ("DELI5PCT",    "5% off deli items",                           "percent_off", 0.05, None,  dept_by_name.get("deli"),       None, 2000),
+        ("ORGANIC20",   "20% off organic produce",                     "percent_off", 0.20, None,  dept_by_name.get("produce"),    None, 2000),
     ]
 
     records = []
-    for code, desc, ctype, disc, min_purch, dept_id, prod_id in NAMED_COUPONS:
+    for code, desc, ctype, disc, min_purch, dept_id, prod_id, max_uses in NAMED_COUPONS:
         records.append((code, desc, ctype, disc, min_purch, dept_id, prod_id,
-                        None, 0, valid_from, valid_until, True))
+                        max_uses, 0, valid_from, valid_until, True))
 
     with conn.cursor() as cur:
         execute_values(cur, """
@@ -299,10 +308,47 @@ def seed_named_coupons(conn, departments: List[Dict],
     log.info("Named coupons seeded (or already present).")
 
 
+def backfill_coupon_max_uses(conn, cfg: Config) -> int:
+    """Give every coupon that has no usage cap one, and return how many changed.
+
+    `pos.coupons.max_uses` is the denominator of data-lab's
+    `mart_promotion_redemption.redemption_rate_pct` (`uses_count / max_uses`).
+    Every coupon this generator has ever made carried NULL there, so that mart
+    published 100 % NULL even on rows whose redemption count was real — the
+    second, independent reason for the defect t_74280120 fixes. Reseeding alone
+    would not heal an existing data dir (the rows already exist and the API
+    keeps serving them), so the repair is an idempotent UPDATE that runs on
+    every seed pass — boot and every simulated midnight.
+
+    The draw is spread per row (`random()`), so the catalogue does not end up
+    with one suspiciously uniform cap. `max_uses_min`/`max_uses_max` come from
+    the config, never from a literal here.
+    """
+    low = int(cfg.coupons.max_uses_min)
+    high = max(low, int(cfg.coupons.max_uses_max))
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE pos.coupons "
+            "SET max_uses = %s + floor(random() * (%s - %s + 1))::int "
+            "WHERE max_uses IS NULL",
+            (low, high, low),
+        )
+        repaired = cur.rowcount
+    conn.commit()
+    if repaired:
+        log.info("Coupon max_uses repaired on %d legacy rows (range %d-%d)",
+                 repaired, low, high)
+    return repaired
+
+
 def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict],
                  history_days: int = DEFAULT_PROMO_HISTORY_DAYS) -> List[Dict]:
     """Seed active coupons. Idempotent; deactivates expired coupons and tops
     the active set back up to `active_at_any_time`."""
+    # The redemption-rate denominator, before anything else this pass does:
+    # a coupon seeded before t_74280120 has no cap, and the mart cannot divide
+    # by it whatever its uses_count says. Idempotent (only NULL rows).
+    backfill_coupon_max_uses(conn, cfg)
     with conn.cursor() as cur:
         # Deactivate coupons whose validity window has passed so the guard
         # below counts only currently-valid coupons (expired-but-active rows
@@ -344,8 +390,12 @@ def seed_coupons(conn, cfg: Config, departments: List[Dict], products: List[Dict
         code = f"FRESH{fake.bothify('??##??').upper()}"
         desc = f"{int(discount * 100)}% off {coupon_type.replace('_', ' ')}" \
             if coupon_type == 'percent_off' else f"${discount:.2f} off"
+        # The usage cap the redemption-rate mart divides by (t_74280120).
+        max_uses = random.randint(int(cfg.coupons.max_uses_min),
+                                  max(int(cfg.coupons.max_uses_min),
+                                      int(cfg.coupons.max_uses_max)))
         records.append((code, desc, coupon_type, discount, None, dept_id, prod_id,
-                         None, 0, valid_from, valid_until, True))
+                         max_uses, 0, valid_from, valid_until, True))
 
     with conn.cursor() as cur:
         execute_values(cur, """
@@ -1195,22 +1245,81 @@ def generate_pos_transactions(
 
     # Record loyalty point transactions and update tiers (outside the main insert)
     if txn_records:
-        _record_loyalty_points(conn, txn_records)
+        _record_loyalty_points(conn, txn_records, cfg, scenario)
 
     return depletion_info
 
+
+# ---------------------------------------------------------------------------
+# Loyalty points: earning, redeeming, tiers
+# ---------------------------------------------------------------------------
 
 # Tier thresholds: minimum points_balance to reach each tier
 TIER_THRESHOLDS = {'bronze': 0, 'silver': 500, 'gold': 2000, 'platinum': 5000}
 TIER_ORDER      = ['bronze', 'silver', 'gold', 'platinum']
 
+# A member spends points at 100 points = $1 of basket. A program law, like
+# TIER_THRESHOLDS, rather than an operator preference — which is why it lives
+# here and not in config.yaml. It is half of what bounds a redemption: nobody
+# pays for a $4 basket with 5,000 points.
+REDEMPTION_POINTS_PER_DOLLAR = 100
+# Redemptions are drawn in whole 100-point increments; a fraction of a point
+# redemption is a ledger row no real program writes.
+REDEMPTION_POINT_STEP = 100
 
-def _record_loyalty_points(conn, txn_records: list) -> None:
+
+def _draw_redemption(cfg: Config, scenario, transaction_total: float,
+                     available: int) -> int:
+    """Points this ticket spends, or 0 for the vast majority of them.
+
+    Bounded three ways, and the bound that matters is the balance:
+
+    * `loyalty.redemption_rate` × the scenario's `loyalty_redemption_modifier`
+      — a few percent of member tickets by default, and the lever the
+      `redemption_rush` scenario pulls for the A/B harness;
+    * never more than `available`, the member's balance at this exact point in
+      the ledger, so `balance_after` can never go negative;
+    * never more than the ticket is worth (100 points = $1) and never more
+      than `loyalty.redemption_points_max`.
+
+    Returns 0 when the balance is below `loyalty.redemption_points_min`: a
+    member who cannot afford the smallest redemption simply pays as usual.
     """
-    For each transaction that had a loyalty member, earn 1 point per dollar,
-    write a pos.loyalty_point_transactions row, update member points_balance
-    and tier, and compute balance_after as a running sum from committed
-    point_transactions (not from the inflated cumulative member balance).
+    floor = max(1, int(cfg.loyalty.redemption_points_min))
+    if available < floor:
+        return 0
+    rate = (float(cfg.loyalty.redemption_rate)
+            * float(getattr(scenario, 'loyalty_redemption_modifier', 1.0) or 1.0))
+    if rate <= 0 or random.random() >= rate:
+        return 0
+    affordable = min(
+        int(available),
+        int(transaction_total * REDEMPTION_POINTS_PER_DOLLAR),
+        int(cfg.loyalty.redemption_points_max),
+    )
+    steps = affordable // REDEMPTION_POINT_STEP
+    if steps < 1:
+        return 0
+    floor_steps = max(1, floor // REDEMPTION_POINT_STEP)
+    return random.randint(min(floor_steps, steps), steps) * REDEMPTION_POINT_STEP
+
+
+def _record_loyalty_points(conn, txn_records: list, cfg: Config,
+                           scenario=None) -> None:
+    """
+    For each transaction that had a loyalty member, earn 1 point per dollar and,
+    for `loyalty.redemption_rate` of them, spend points at the till — one
+    `pos.loyalty_point_transactions` row per event. Updates the member's
+    points_balance and tier, and computes balance_after as a running sum from
+    committed point_transactions (not from the inflated cumulative member
+    balance).
+
+    Why both directions exist (t_74280120): the ledger only ever CREDITED —
+    534,250 earn rows, zero redemption rows, `sum(points_redeemed) = 0` — so
+    `int_loyalty_enriched.points_redeemed`,
+    `mart_loyalty_rfm.lifetime_points_redeemed` and both
+    redemption-rate marts published 0 or NULL. A points program that never
+    pays out is not a program.
 
     This prevents backfill from writing inflated balance_after values when
     realtime has already processed chronologically-later transactions.
@@ -1239,20 +1348,6 @@ def _record_loyalty_points(conn, txn_records: list) -> None:
             if not row:
                 continue
             current_balance, current_tier = row[0], row[1]
-            new_balance = current_balance + points_earned
-
-            # Check tier upgrade
-            new_tier = current_tier
-            for tier in reversed(TIER_ORDER):
-                if new_balance >= TIER_THRESHOLDS[tier]:
-                    new_tier = tier
-                    break
-
-            cur.execute("""
-                UPDATE pos.loyalty_members
-                SET points_balance = %s, tier = %s, updated_at = NOW()
-                WHERE member_id = %s::uuid
-            """, (new_balance, new_tier, member_id))
 
             # Compute balance_after as running sum from committed transactions
             # plus pending points from the current batch — NOT from the
@@ -1265,7 +1360,45 @@ def _record_loyalty_points(conn, txn_records: list) -> None:
             committed = cur.fetchone()[0]
             # Add pending points from earlier items in this batch for this member
             pending = sum(p[2] - p[3] for p in pt_records if p[0] == member_id)
-            balance_after = committed + pending + points_earned
+            available = int(committed + pending)
+
+            # Spend points FIRST, then credit the sale. The shopper pays with
+            # points at the till and the purchase credits points afterwards, so
+            # the ledger's balance_after chain rises across the pair. That order
+            # is load-bearing: data-lab's `assert_loyalty_points_balance` orders
+            # same-instant rows by balance_after, and an earn-then-redeem pair
+            # reads as a chain break because the redeem row lands lower.
+            redeemed = _draw_redemption(cfg, scenario, total, available)
+            if redeemed:
+                pt_records.append((
+                    member_id, txn_id, 0, redeemed, 'redemption',
+                    available - redeemed,
+                ))
+
+            # A redemption is part of the member's balance too. `max(0, ...)`
+            # guards a legacy data dir whose member row lags its ledger; the
+            # ledger (`available`) is what bounds the redemption, so the chain
+            # on disk can never go negative.
+            new_balance = max(0, current_balance + points_earned - redeemed)
+
+            # Check tier upgrade. A redemption must never DEMOTE a member: a
+            # program that takes points back does not take the tier back, and
+            # re-deriving from the lower balance would do exactly that.
+            new_tier = current_tier
+            for tier in reversed(TIER_ORDER):
+                if new_balance >= TIER_THRESHOLDS[tier]:
+                    new_tier = tier
+                    break
+            if TIER_THRESHOLDS.get(new_tier, 0) <= TIER_THRESHOLDS.get(current_tier, 0):
+                new_tier = current_tier
+
+            cur.execute("""
+                UPDATE pos.loyalty_members
+                SET points_balance = %s, tier = %s, updated_at = NOW()
+                WHERE member_id = %s::uuid
+            """, (new_balance, new_tier, member_id))
+
+            balance_after = available + points_earned - redeemed
 
             pt_records.append((
                 member_id, txn_id, points_earned, 0,
