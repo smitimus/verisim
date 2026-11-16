@@ -14,12 +14,16 @@ Backfill behaviour:
     reached hour 23 with a lost or half-written clock is repaired (punches
     only, never a second set of sales) rather than skipped — t_30410dea.
   - When backfill_end_date is today, the last day is treated as a partial
-    day: generates hours 0 → (current_hour - 1) at their hour boundaries,
-    then one final tick at datetime.now() to align exactly with where
-    realtime picks up — zero gap between backfill and realtime.
-  - Full days (any date before today) use generate_day_events() for
-    timeclock; the partial current day uses generate_events() per-hour
-    so that open shifts are handled correctly by realtime thereafter.
+    day, and only the hours nobody has written are generated: for a day the
+    database does not hold at all, hours 0 → current_hour at their hour
+    boundaries with one final tick at datetime.now() to align exactly with
+    where realtime picks up; for a day realtime is already writing, only the
+    whole hours after the newest row on disk and before the hour in progress
+    (t_9951b23c — a restart used to rewrite today from hour 0).
+  - Full days (any date before today, and the hours of today a realtime day
+    leaves behind) use generate_day_events() for timeclock; today's partial
+    hours use generate_events() per-hour so that open shifts are handled
+    correctly by realtime thereafter.
 
 Supply-chain pipeline (runs once per simulated day):
   POS depletion → low stock → store orders → fulfillment → truck dispatch → delivery receipts
@@ -479,6 +483,100 @@ def has_data_for_date(conn, check_date):
         return cur.fetchone() is not None
 
 
+def todays_unwritten_hours(last_txn_time, now_dt):
+    """The hours of TODAY that still need a writer — None when none do.
+
+    Today is the one day the boot gap scan shares with the realtime loop, so
+    "is it complete?" cannot be asked the past-day way (does the last
+    transaction reach hour 23): a running day is incomplete by construction,
+    every second of it. Two shapes have to be separated (t_9951b23c):
+
+    * the day holds nothing at all — a fresh seed, or a data dir restored over
+      night. The whole day up to the hour in progress is the backfill's, and
+      the last hour is written at `now` so realtime continues seamlessly;
+    * the day holds rows — realtime got there. The backfill may write only the
+      WHOLE hours after the newest row on disk and before the hour in
+      progress. Realtime owns the hour it is inside (it cannot see how much of
+      that hour a backfill has already rung, so writing it would double it),
+      and an hour below the newest row was written by realtime — however sparse
+      the hour looks, its empty minutes are a gap in sampling, not in writing.
+
+    Without the second rule a restart re-ran today from hour 0 on top of the
+    day realtime had already written. Measured on dev/106 through 2026-11-15:
+    a 15:43 container restart and a 19:19 deploy recreate each replayed hours
+    0 → now, and the day's per-hour counts came out at ~3x the same hours on
+    the prior day (hour 10: 1,507 vs 440) with the shelf drained by the
+    repeated depletion (`Stockout: 3416 line(s) short — 4742.7 units`).
+    """
+    if last_txn_time is None:
+        return 0, now_dt.hour
+    start = last_txn_time.hour + 1
+    end = now_dt.hour - 1
+    if start > end:
+        return None
+    return start, end
+
+
+def plan_day_write(conn, cur_date, today, now_dt):
+    """What `run_backfill` owes `cur_date` — the day's write plan, one place.
+
+    Returns a dict:
+
+    ``start_hour`` / ``end_hour``  inclusive range of hours still to generate
+    ``skip``                       nothing to write: the day is whole
+    ``punch_repair_only``          sales complete, only the clock needs healing
+    ``punch_gap``                  why the punch stream is not whole (or None)
+    ``day_was_empty``              the day held no POS row when the plan was made
+    ``last_txn``                   the ``max(transaction_dt)`` it was derived from
+
+    One plan for every day, because the alternative — a past-day rule and a
+    separate today rule — is what let a mid-day restart rewrite today from hour
+    0 while a past day resumed after its newest row (t_9951b23c). The only
+    difference today makes is *where it stops*: at the last completed hour
+    (`todays_unwritten_hours`), because the hour in progress belongs to the
+    realtime loop.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT max(transaction_dt)::timestamp FROM pos.transactions "
+            "WHERE transaction_dt::date = %s", (cur_date,)
+        )
+        row = cur.fetchone()
+    last_txn_time = row[0] if row else None
+
+    plan = {
+        'start_hour': 0, 'end_hour': 23, 'skip': False,
+        'punch_repair_only': False, 'punch_gap': None,
+        'day_was_empty': last_txn_time is None, 'last_txn': last_txn_time,
+    }
+
+    if cur_date == today:
+        # Shared with the realtime loop: only whole hours nobody wrote are ours.
+        open_hours = todays_unwritten_hours(last_txn_time, now_dt)
+        if open_hours is None:
+            plan['skip'] = True
+        else:
+            plan['start_hour'], plan['end_hour'] = open_hours
+        return plan
+
+    if last_txn_time is None:
+        return plan                      # nothing on disk: write the whole day
+
+    if last_txn_time.hour >= 23:
+        # The sales are complete. That is only half the question: the clock is
+        # a separate stream and it can be lost or half-written on a day whose
+        # sales finished, which no later pass would ever revisit (t_30410dea).
+        # Repair the punches, not the sales.
+        plan['punch_gap'] = _punch_stream_verdict(conn, cur_date)
+        plan['skip'] = plan['punch_gap'] is None
+        plan['punch_repair_only'] = not plan['skip']
+        return plan
+
+    # Partial day — resume from the hour AFTER the last recorded txn.
+    plan['start_hour'] = min(last_txn_time.hour + 1, 24)
+    return plan
+
+
 def _punch_stream_verdict(conn, day) -> Optional[str]:
     """Why `day`'s punch stream is not whole, or None when it is.
 
@@ -572,24 +670,33 @@ def auto_backfill_if_fresh(conn, cfg):
 
         # A day is "covered" if its last_txn reaches the last open hour (22).
         # Any day with last_txn before that is incomplete — needs resumption.
+        now_dt = datetime.now()
         missing_dates = []
         for d in all_dates:
             if d not in by_date:
                 missing_dates.append(d)
                 continue
             last_txn = by_date[d]
+            if d == today:
+                # Today is the realtime loop's day: it is incomplete by
+                # construction and being written right now, so the past-day
+                # question ("does it reach hour 23?") is meaningless here.
+                # Only whole hours nobody wrote — an outage longer than an hour
+                # — make today a gap, and `run_backfill` asks the same helper
+                # so the two can never disagree (t_9951b23c).
+                if todays_unwritten_hours(last_txn, now_dt) is not None:
+                    missing_dates.append(d)
+                continue
             if last_txn.hour >= 23:
                 # ...and a day whose SALES are complete can still have a lost
                 # or half-written punch stream, which no later pass would ever
-                # revisit (t_30410dea). Today is excluded: an open shift on it
-                # is legitimate, exactly as data-lab's check excludes it.
-                if d < today:
-                    why = _punch_stream_verdict(conn, d)
-                    if why:
-                        log.warning(
-                            "%s — sales complete but the punch stream is not "
-                            "(%s); queued for punch repair", d, why)
-                        missing_dates.append(d)
+                # revisit (t_30410dea).
+                why = _punch_stream_verdict(conn, d)
+                if why:
+                    log.warning(
+                        "%s — sales complete but the punch stream is not "
+                        "(%s); queued for punch repair", d, why)
+                    missing_dates.append(d)
                 continue
             missing_dates.append(d)
 
@@ -1034,53 +1141,29 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
         if cfg.weather.enabled:
             weather.ensure_day(conn, cfg, cur_date)
 
-        # For past dates, check if this day is fully generated using max txn timestamp.
-        # Resume from the hour AFTER the last recorded transaction instead of hour 0.
-        skip_day = False
-        punch_repair_only = False
-        start_hour = 0  # default: regenerate full day from hour 0
+        # Which hours of this day still need a writer (`plan_day_write`). The
+        # rule is the same for every day — resume after the newest row on disk,
+        # never from hour 0 — and it used to hold for past days only, which is
+        # exactly how a mid-day restart came to rewrite today on top of
+        # realtime (t_9951b23c).
+        plan = plan_day_write(conn, cur_date, today, now_dt)
+        start_hour = plan['start_hour']
+        end_hour = plan['end_hour']
+        day_was_empty = plan['day_was_empty']
 
-        if cur_date != today:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT max(transaction_dt)::timestamp FROM pos.transactions "
-                    "WHERE transaction_dt::date = %s", (cur_date,)
-                )
-                row = cur.fetchone()
-            last_txn_time = row[0]
-
-            if last_txn_time is None:
-                # No data at all — generate the full day (start_hour stays 0)
-                pass
-            elif last_txn_time.hour >= 23:
-                # The sales are complete. That is only half the question: the
-                # clock is a separate stream and it can be lost or half-written
-                # on a day whose sales finished, which no later pass would ever
-                # revisit (t_30410dea). Repair the punches, not the sales.
-                why = _punch_stream_verdict(conn, cur_date)
-                if why is None:
-                    log.info("Skipping %s — already complete (last txn %s)",
-                             cur_date, last_txn_time)
-                    skip_day = True
-                else:
-                    punch_repair_only = True
-                    log.warning(
-                        "%s has a complete sales stream but an incomplete punch "
-                        "stream (%s) — writing the missing punches only",
-                        cur_date, why)
+        if plan['skip']:
+            if cur_date == today:
+                log.info("Today (%s) is already current (last txn %s) — nothing "
+                         "to backfill, the realtime loop continues the day",
+                         cur_date, plan['last_txn'])
             else:
-                # Partial day — resume from the hour AFTER the last recorded txn
-                resuming_from = last_txn_time.replace(minute=0, second=0) + timedelta(hours=1)
-                start_hour = min(resuming_from.hour, 24)
-                log.info("%s has partial data (last txn %s), regenerating from hour %d",
-                         cur_date, last_txn_time, start_hour)
-
-        if skip_day:
+                log.info("Skipping %s — already complete (last txn %s)",
+                         cur_date, plan['last_txn'])
             _advance_day_cursor(conn, cur_date)
             cur_date += timedelta(days=1)
             continue
 
-        if punch_repair_only:
+        if plan['punch_repair_only']:
             # Only the clock is written here: re-running the hourly loop would
             # double every sale the day already holds. `generate_day_events`
             # completes an employee-day it finds half-written (a `clock_out`
@@ -1097,19 +1180,29 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
             cur_date += timedelta(days=1)
             continue
 
-        # Partial day: today gets hours start_hour → current_hour; no end-of-day
+        # Partial day: today gets only its unwritten hours; no end-of-day
         # events (they will run tonight via the realtime midnight handler).
         is_partial = (cur_date == today)
-        end_hour = now_dt.hour if is_partial else 23
 
-        log.info("Backfilling %s%s (hours %d–%d)",
-                 cur_date, " [partial — up to current hour]" if is_partial else "", start_hour, end_hour)
+        if is_partial:
+            log.info(
+                "Backfilling %s [partial — up to the last completed hour] "
+                "(hours %d–%d)%s", cur_date, start_hour, end_hour,
+                " — nothing on disk yet, the last hour lands at now"
+                if day_was_empty else
+                " — last txn %s, the hour in progress belongs to realtime"
+                % plan['last_txn'])
+        else:
+            log.info("Backfilling %s (hours %d–%d)", cur_date, start_hour, end_hour)
 
         for hour in range(start_hour, end_hour + 1):
-            # For the last hour of a partial day, use the exact current time so
-            # the final backfill tick aligns with where realtime picks up.
-            # All previous hours use the hour boundary (e.g. 13:00:00).
-            if is_partial and hour == end_hour:
+            # The in-progress hour is only ever written on a day the backfill
+            # started from nothing (a fresh seed): then the final tick lands on
+            # the exact current time so realtime picks up with no gap. A day
+            # that already holds rows stops at the last COMPLETED hour, whose
+            # hours all sit on their boundary — stamping one of those at `now`
+            # would date the hour's sales later than they happened.
+            if is_partial and day_was_empty and hour == end_hour:
                 sim_dt = datetime.now()
             else:
                 sim_dt = datetime(cur_date.year, cur_date.month, cur_date.day, hour, 0, 0)

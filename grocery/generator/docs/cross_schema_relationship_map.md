@@ -456,6 +456,34 @@ harness scopes every time-bounded assertion to *completed* days
 (`<column>::date < CURRENT_DATE`), so an in-flight day never produces a false
 orphan.
 
+**Today is shared with the realtime loop, so a restart may not rewrite it
+(t_9951b23c).** The boot gap scan and `run_backfill` used to answer "is today
+complete?" the past-day way — does its last transaction reach hour 23? — which
+is never true for a day in progress, so every mid-day container restart replayed
+the day from hour 0 on top of the rows realtime had already written. On dev/106
+through 2026-11-15 two restarts (15:43 and 19:19) put the day's per-hour counts
+at ~3x the prior day's (hour 10: 1,507 vs 440) and drained the shelf
+(`Stockout: 3416 line(s) short — 4742.7 units`). Both writers now ask one
+function, `main.todays_unwritten_hours()`:
+
+* a day with no rows at all (fresh seed, data dir restored over night) is the
+  backfill's — hours 0 → the hour in progress, the last one stamped at `now` so
+  realtime continues seamlessly;
+* a day that already holds rows only gets the **whole hours after its newest
+  row and before the hour in progress**. The hour in progress belongs to
+  realtime: it writes it 120 times an hour from a per-tick volume law and cannot
+  see how much of that hour a backfill has already rung, so a backfill that
+  wrote it would double it. An hour *below* the newest row was written by
+  realtime however sparse it looks — its empty minutes are sampling, not
+  missing writing.
+
+The same rule as a past day, i.e. `main.plan_day_write()` is the single place a
+day's write plan is decided (`start_hour`, `end_hour`, skip, punch-repair-only).
+The one limitation inherited from the past-day path: a hole in the *middle* of
+the day (realtime rows at hours 0–9, an outage, rows again at 14+) is not
+noticed, because the resume point is the newest row. It leaves an under-volume
+day, never a doubled one.
+
 ### Fulfillment lifecycle and its two clocks (t_5a408514)
 
 `fulfillment.orders` carries a real state machine, advanced by the passes above:
