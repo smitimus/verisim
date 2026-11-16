@@ -122,6 +122,88 @@ def test_config_check_fails_when_a_config_is_missing(tmp_path):
     assert check_configs.run(tree) > 0, "a missing config.yaml must fail the check"
 
 
+# ── gen_api_docs ─────────────────────────────────────────────────────────────
+
+def _api_docs_tree(tmp_path, name="repo_api_docs"):
+    """A checkout holding exactly what `tools/gen_api_docs.py` reads.
+
+    The config cases copy the whole repo because the checker walks every industry's
+    generator; this one touches one source file, three strip scripts and three
+    generated docs, so the fixture builds those instead of dragging the tree along
+    twice.
+    """
+    tree = tmp_path / name
+    for rel in ("base/api/main.py",
+                "tools/gen_api_docs.py",
+                "grocery/standalone/strip_gas_station.py",
+                "gas-station/standalone/strip_grocery.py",
+                "support/standalone/strip_support.py",
+                "grocery/generator/docs/api_routes.md",
+                "gas-station/generator/docs/api_routes.md",
+                "support/generator/docs/api_routes.md"):
+        dest = tree / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / rel, dest)
+    return tree
+
+
+def test_generated_api_docs_match_the_served_routes():
+    """The committed route docs are exactly what the strip scripts produce today.
+
+    AGENTS.md's endpoint table documented twelve paths that no image has ever served
+    — `/grocery/transactions`, `/grocery/supply-chain/orders`, `/grocery/employees`
+    and friends, all of which answer 404 (t_f0e9c805) — because it was typed by hand
+    and nothing compared it with the build product. The table is generated now, and
+    this is the gate: add, rename or re-section a route without regenerating and the
+    blocking `test` job fails instead of letting the doc rot.
+    """
+    gen = _load("gen_api_docs")
+    assert gen.main(REPO, ["--industry", "all", "--check"]) == 0
+
+
+def test_api_doc_gate_has_teeth(tmp_path, capsys):
+    """RED, in both directions: a new route, and a hand-edited doc, must fail.
+
+    A gate nobody has watched fail is a gate that does not work. The two directions
+    are separate mistakes — a route added without regenerating is caught only by
+    regenerating, while a table edited by hand is caught only by comparing — so both
+    are exercised here.
+    """
+    gen = _load("gen_api_docs")
+    tree = _api_docs_tree(tmp_path)
+    assert gen.main(tree, ["--industry", "grocery", "--check"]) == 0, \
+        "the unmutated copy must pass, or the failures below prove nothing"
+    capsys.readouterr()
+
+    # 1. a route the committed doc has never seen
+    api = tree / "base" / "api" / "main.py"
+    source = api.read_text()
+    marker = '@app.get("/{industry}/status", tags=["Status"])'
+    assert source.count(marker) == 1, "the /{industry}/status decorator moved; retarget this mutation"
+    api.write_text(source.replace(marker, (
+        '@app.get("/{industry}/brand-new", tags=["Status"])\n'
+        'def brand_new(industry: str):\n'
+        '    return {}\n\n'
+        + marker)))
+    assert gen.main(tree, ["--industry", "grocery", "--check"]) == 1, \
+        "a route absent from the documented table must fail the check"
+    out, err = capsys.readouterr()
+    assert "brand-new" in out + err, out + err
+    assert "STALE" in err, err
+
+    # 2. the table edited by hand — the shape this card exists to stop
+    tree2 = _api_docs_tree(tmp_path, "repo_api_docs_edited")
+    doc = tree2 / "grocery/generator/docs/api_routes.md"
+    row = "| GET | `/{industry}/pos/transactions` |"
+    body = doc.read_text()
+    assert row in body, "the transactions row moved; retarget this mutation"
+    doc.write_text("\n".join(line for line in body.splitlines() if not line.startswith(row)) + "\n")
+    assert gen.main(tree2, ["--industry", "grocery", "--check"]) == 1, \
+        "a hand-deleted row must fail the check"
+    out, err = capsys.readouterr()
+    assert "pos/transactions" in out, out
+
+
 # ── the other checkers, on the real tree ─────────────────────────────────────
 
 def test_strip_scripts_keep_only_their_own_industry():
