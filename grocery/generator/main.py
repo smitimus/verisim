@@ -10,6 +10,9 @@ On startup:
 
 Backfill behaviour:
   - Skips any date that already has POS transaction data (no duplicates).
+  - ...but only when that date's punch stream is whole too: a day whose sales
+    reached hour 23 with a lost or half-written clock is repaired (punches
+    only, never a second set of sales) rather than skipped — t_30410dea.
   - When backfill_end_date is today, the last day is treated as a partial
     day: generates hours 0 → (current_hour - 1) at their hour boundaries,
     then one final tick at datetime.now() to align exactly with where
@@ -476,6 +479,27 @@ def has_data_for_date(conn, check_date):
         return cur.fetchone() is not None
 
 
+def _punch_stream_verdict(conn, day) -> Optional[str]:
+    """Why `day`'s punch stream is not whole, or None when it is.
+
+    The second half of "is this day done?". `run_backfill` and the boot gap scan
+    used to answer that from the POS stream alone, so a day whose sales reached
+    hour 23 was skipped for ever — even when its clock held 47 `clock_out` rows
+    with no `clock_in`, or nothing at all (t_30410dea). Two questions, because
+    neither alone is enough: did the store trade (so the roster owed it punches),
+    and is every employee-day on the clock paired.
+
+    `pos.transactions` is the trade test rather than a count, so a day that was
+    deliberately left empty (no sales) is never "repaired" into a full roster.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM pos.transactions "
+            "WHERE transaction_dt::date = %s)", (day,))
+        traded = bool(cur.fetchone()[0])
+    return timeclock.punch_stream_gap(conn, day, expect_stream=traded)
+
+
 def auto_backfill_if_fresh(conn, cfg):
     """
     Called once after seed_all(). Handles two scenarios:
@@ -484,6 +508,12 @@ def auto_backfill_if_fresh(conn, cfg):
     2. DB has data with gaps in the last 30 days: detect gaps, configure
        a targeted backfill to fill only the missing days, then transition to
        realtime once complete.
+
+    A day is covered only when BOTH streams are complete: its POS rows reach the
+    last open hour, and every employee-day on its clock is paired (see
+    `_punch_stream_verdict`). The clock can be lost on its own — a day-end pass
+    that died, a data dir restored without its punches — and skipping such a day
+    on the strength of its sales alone leaves a hole nothing ever revisits.
 
     Does nothing if all 30 days are covered — just stays running (or
     transitions to realtime if not already configured).
@@ -549,7 +579,18 @@ def auto_backfill_if_fresh(conn, cfg):
                 continue
             last_txn = by_date[d]
             if last_txn.hour >= 23:
-                continue  # complete
+                # ...and a day whose SALES are complete can still have a lost
+                # or half-written punch stream, which no later pass would ever
+                # revisit (t_30410dea). Today is excluded: an open shift on it
+                # is legitimate, exactly as data-lab's check excludes it.
+                if d < today:
+                    why = _punch_stream_verdict(conn, d)
+                    if why:
+                        log.warning(
+                            "%s — sales complete but the punch stream is not "
+                            "(%s); queued for punch repair", d, why)
+                        missing_dates.append(d)
+                continue
             missing_dates.append(d)
 
         if not missing_dates:
@@ -952,6 +993,17 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
 # Backfill mode
 # ---------------------------------------------------------------------------
 
+def _advance_day_cursor(conn, cur_date):
+    """Record `cur_date` as done and commit (skip / repair / end-of-day paths)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE control.generator_state
+            SET backfill_current_date = %s, updated_at = NOW()
+            WHERE state_id = 1
+        """, (cur_date + timedelta(days=1),))
+    conn.commit()
+
+
 def run_backfill(conn, cfg, state, locations, employees, departments,
                  products, trucks, members, coupons, deals):
     start = state['backfill_start_date']
@@ -985,6 +1037,7 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
         # For past dates, check if this day is fully generated using max txn timestamp.
         # Resume from the hour AFTER the last recorded transaction instead of hour 0.
         skip_day = False
+        punch_repair_only = False
         start_hour = 0  # default: regenerate full day from hour 0
 
         if cur_date != today:
@@ -1000,10 +1053,21 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 # No data at all — generate the full day (start_hour stays 0)
                 pass
             elif last_txn_time.hour >= 23:
-                # Fully generated — last open hour (22) has data
-                log.info("Skipping %s — already complete (last txn %s)",
-                         cur_date, last_txn_time)
-                skip_day = True
+                # The sales are complete. That is only half the question: the
+                # clock is a separate stream and it can be lost or half-written
+                # on a day whose sales finished, which no later pass would ever
+                # revisit (t_30410dea). Repair the punches, not the sales.
+                why = _punch_stream_verdict(conn, cur_date)
+                if why is None:
+                    log.info("Skipping %s — already complete (last txn %s)",
+                             cur_date, last_txn_time)
+                    skip_day = True
+                else:
+                    punch_repair_only = True
+                    log.warning(
+                        "%s has a complete sales stream but an incomplete punch "
+                        "stream (%s) — writing the missing punches only",
+                        cur_date, why)
             else:
                 # Partial day — resume from the hour AFTER the last recorded txn
                 resuming_from = last_txn_time.replace(minute=0, second=0) + timedelta(hours=1)
@@ -1012,13 +1076,24 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                          cur_date, last_txn_time, start_hour)
 
         if skip_day:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE control.generator_state
-                    SET backfill_current_date = %s, updated_at = NOW()
-                    WHERE state_id = 1
-                """, (cur_date + timedelta(days=1),))
-            conn.commit()
+            _advance_day_cursor(conn, cur_date)
+            cur_date += timedelta(days=1)
+            continue
+
+        if punch_repair_only:
+            # Only the clock is written here: re-running the hourly loop would
+            # double every sale the day already holds. `generate_day_events`
+            # completes an employee-day it finds half-written (a `clock_out`
+            # with no `clock_in` gets the planned `clock_in`, not an invented
+            # one) and writes the shift plan for a day it does not hold at all,
+            # so one call heals both shapes of the loss.
+            repaired = timeclock.generate_day_events(conn, cur_date, employees)
+            log.warning(
+                "%s — wrote %d punch row(s). A row stamped below the warehouse's "
+                "event_dt cursor is invisible to an incremental ingest: re-read "
+                "this day with an explicit window (grocery_ingest_api "
+                "start_dt/end_dt) before believing the EDW.", cur_date, repaired)
+            _advance_day_cursor(conn, cur_date)
             cur_date += timedelta(days=1)
             continue
 

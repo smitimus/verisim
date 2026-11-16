@@ -682,6 +682,48 @@ SELECT t.transaction_id, t.subtotal, t.coupon_savings, t.deal_savings,
                        - (ROUND(SUM(ROUND(ti.quantity * ti.unit_price, 2)), 2)
                           - ROUND(SUM(ti.line_total), 2))) > 0.01;
 
+-- [SEMA-34] timeclock.events — every employee-day on a completed day pairs its punches and its break halves
+-- This is data-lab's `assert_timeclock_pairs` (severity=error) restated at the
+-- source, so the generator's own suite catches the shape the instant it is
+-- written rather than one pipeline run later. Measured on test/107 2026-10-15:
+-- 16 `clock_in` against 63 `clock_out`, 47 employee-days carrying a clock-out
+-- whose clock-in did not exist — and no later backfill pass could reach them,
+-- because `run_backfill` decided a day was done from its POS rows alone
+-- (t_30410dea). Scoped to completed days for the same reason the warehouse test
+-- is: a shift still open today is legitimate.
+SELECT e.employee_id, e.event_dt::date AS event_date,
+                   count(*) FILTER (WHERE e.event_type = 'clock_in')    AS clock_ins,
+                   count(*) FILTER (WHERE e.event_type = 'clock_out')   AS clock_outs,
+                   count(*) FILTER (WHERE e.event_type = 'break_start') AS break_starts,
+                   count(*) FILTER (WHERE e.event_type = 'break_end')   AS break_ends
+            FROM timeclock.events e
+            WHERE e.event_dt::date < CURRENT_DATE
+            GROUP BY 1, 2
+            HAVING count(*) FILTER (WHERE e.event_type = 'clock_in')
+                   <> count(*) FILTER (WHERE e.event_type = 'clock_out')
+                OR count(*) FILTER (WHERE e.event_type = 'break_start')
+                   <> count(*) FILTER (WHERE e.event_type = 'break_end');
+
+-- [SEMA-35] timeclock.events — a completed day with sales has a punch stream at all
+-- The half of the invariant the warehouse test cannot see: `assert_timeclock_pairs`
+-- groups the rows that exist, so a day with NO rows passes it vacuously. Test/107
+-- after the 2026-11-16 reset held 2026-10-12 … 10-15 with 766–1,789 sales rows
+-- and zero punches, and nothing anywhere went red (t_30410dea). A store that
+-- traded owes its roster a clock.
+SELECT d.transaction_date, d.pos_rows, coalesce(t.punch_rows, 0) AS punch_rows
+            FROM (
+                SELECT transaction_dt::date AS transaction_date, count(*) AS pos_rows
+                FROM pos.transactions
+                WHERE transaction_dt::date < CURRENT_DATE
+                GROUP BY 1
+            ) d
+            LEFT JOIN (
+                SELECT event_dt::date AS event_date, count(*) AS punch_rows
+                FROM timeclock.events
+                GROUP BY 1
+            ) t ON t.event_date = d.transaction_date
+            WHERE coalesce(t.punch_rows, 0) = 0;
+
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
 -- --------------------------------------------------------------------------

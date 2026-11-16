@@ -82,6 +82,19 @@ the right delta clock is the insert clock this route does not surface yet).
   first tick of the new day closes whatever is still open on it, before any of
   the new day's rows exist — after that, a timestamp on yesterday would sit
   below today's rows and no incremental read could reach it.
+
+Day completeness is two streams, not one (t_30410dea)
+----------------------------------------------------
+`run_backfill` used to decide a past day was done from its POS stream alone
+(`max(transaction_dt).hour >= 23`) and skip it. The clock is a *separate*
+stream that can be missing or half-written on a day whose sales are complete —
+a day-end block that died after its hourly loop, a data dir restored without
+its punches, an older build that wrote a different shape. Such a day was never
+revisited: `timeclock.events` kept 47 `clock_out` rows whose `clock_in` did not
+exist, and data-lab's `assert_timeclock_pairs` stayed red on rows no later pass
+could reach, while a day whose whole stream was gone passed that test
+vacuously. `punch_stream_state()` / `punch_stream_gap()` are the second half of
+the completeness question; `main.py` asks both before it skips a day.
 """
 import hashlib
 import logging
@@ -202,6 +215,61 @@ def _events_on(conn, sim_date) -> Dict[str, Dict[str, datetime]]:
         for emp_id, etype, event_dt in cur.fetchall():
             today.setdefault(emp_id, {})[etype] = _local_naive(event_dt)
     return today
+
+
+def punch_stream_state(conn, sim_date) -> Dict[str, int]:
+    """How complete one day's punch stream is.
+
+    Returns ``{'events', 'employee_days', 'open'}``:
+
+    * ``events``        — rows on the clock for that day, every type;
+    * ``employee_days`` — employees the day holds at least one punch for;
+    * ``open``          — employee-days holding half a punch (a ``clock_in``
+      without its ``clock_out``, or the reverse) or half a break.
+
+    ``open`` is exactly what data-lab's ``assert_timeclock_pairs``
+    (severity=error) fails on, so 0 is the only acceptable value for a
+    completed day. ``employee_days == 0`` is the second failure shape and the
+    one that test cannot see: with no rows at all it passes vacuously, which is
+    how a day whose stream was never written stayed invisible (t_30410dea).
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT coalesce(sum(c.n), 0)                            AS events,
+                   count(*)                                         AS employee_days,
+                   count(*) FILTER (WHERE c.ci <> c.co OR c.bs <> c.be) AS open
+            FROM (
+                SELECT employee_id,
+                       count(*)                                           AS n,
+                       count(*) FILTER (WHERE event_type = 'clock_in')    AS ci,
+                       count(*) FILTER (WHERE event_type = 'clock_out')   AS co,
+                       count(*) FILTER (WHERE event_type = 'break_start') AS bs,
+                       count(*) FILTER (WHERE event_type = 'break_end')   AS be
+                FROM timeclock.events
+                WHERE event_dt::date = %s
+                GROUP BY employee_id
+            ) c
+        """, (sim_date,))
+        events, employee_days, open_days = cur.fetchone()
+    return {'events': int(events), 'employee_days': int(employee_days),
+            'open': int(open_days)}
+
+
+def punch_stream_gap(conn, sim_date, expect_stream: bool = True) -> Optional[str]:
+    """Why one *completed* day's punch stream is not whole, or None when it is.
+
+    `expect_stream` is the caller's cross-check that the day has trade the
+    roster must have served (POS rows on the same date). A day with sales and
+    no punches at all lost its stream; a day with no sales may legitimately hold
+    nothing, so the caller — which is the only place that knows about POS —
+    decides.
+    """
+    state = punch_stream_state(conn, sim_date)
+    if state['open']:
+        return "%d employee-day(s) hold half a punch or half a break" % state['open']
+    if state['employee_days'] == 0 and expect_stream:
+        return "no punch on the clock at all, on a day that has sales"
+    return None
 
 
 def _locations_for(conn, employee_ids: Iterable[str]) -> List[Tuple[str, str]]:

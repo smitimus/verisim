@@ -1086,6 +1086,46 @@ ASSERTIONS: List[AssertionSpec] = [
                           - ROUND(SUM(ti.line_total), 2))) > 0.01
         """,
     ),
+    AssertionSpec(
+        id="SEMA-34",
+        dimension="semantic_type",
+        title="timeclock.events — every employee-day on a completed day pairs its "
+              "punches and its break halves",
+        sql="""
+            SELECT e.employee_id, e.event_dt::date AS event_date,
+                   count(*) FILTER (WHERE e.event_type = 'clock_in')    AS clock_ins,
+                   count(*) FILTER (WHERE e.event_type = 'clock_out')   AS clock_outs,
+                   count(*) FILTER (WHERE e.event_type = 'break_start') AS break_starts,
+                   count(*) FILTER (WHERE e.event_type = 'break_end')   AS break_ends
+            FROM timeclock.events e
+            WHERE e.event_dt::date < CURRENT_DATE
+            GROUP BY 1, 2
+            HAVING count(*) FILTER (WHERE e.event_type = 'clock_in')
+                   <> count(*) FILTER (WHERE e.event_type = 'clock_out')
+                OR count(*) FILTER (WHERE e.event_type = 'break_start')
+                   <> count(*) FILTER (WHERE e.event_type = 'break_end')
+        """,
+    ),
+    AssertionSpec(
+        id="SEMA-35",
+        dimension="semantic_type",
+        title="timeclock.events — a completed day with sales has a punch stream at all",
+        sql="""
+            SELECT d.transaction_date, d.pos_rows, coalesce(t.punch_rows, 0) AS punch_rows
+            FROM (
+                SELECT transaction_dt::date AS transaction_date, count(*) AS pos_rows
+                FROM pos.transactions
+                WHERE transaction_dt::date < CURRENT_DATE
+                GROUP BY 1
+            ) d
+            LEFT JOIN (
+                SELECT event_dt::date AS event_date, count(*) AS punch_rows
+                FROM timeclock.events
+                GROUP BY 1
+            ) t ON t.event_date = d.transaction_date
+            WHERE coalesce(t.punch_rows, 0) = 0
+        """,
+    ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
     # The promo key resolves, but the promotion's validity window does not
     # cover the transaction date it was applied to. Fixed at the source by

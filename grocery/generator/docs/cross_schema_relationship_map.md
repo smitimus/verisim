@@ -735,8 +735,42 @@ No further serializer changes are required for #26–#31.
   them — regenerate via the module's generator snippet, or just re-run the
   pytest which reuses the module).
 
-**Assertion inventory:** 29 hard-FK checks + 15 semantic-type checks + 2
-temporal = 46 (t_2ffb43a0 added `HARD-29`, `SEMA-14`, `SEMA-15`).
+**Assertion inventory:** 39 hard-FK checks + 37 semantic-type checks + 5
+temporal = 81 (t_2ffb43a0 added `HARD-29`, `SEMA-14`, `SEMA-15`; t_30410dea
+added `SEMA-34`, `SEMA-35`).
+
+### Day completeness is two streams, not one (t_30410dea)
+
+`run_backfill` decided a past day was done from its POS stream alone
+(`max(transaction_dt).hour >= 23`) and skipped it. `timeclock.events` is a
+*separate* stream and it can be lost or half-written on a day whose sales
+finished, so such a day was never revisited by anything:
+
+* **half a punch stream** — test/107 2026-10-15 held 16 `clock_in` against 63
+  `clock_out`; 47 employee-days had a `clock_out` whose `clock_in` did not exist
+  anywhere, and data-lab's `assert_timeclock_pairs` (severity=error) was red on
+  rows no later pass could reach. `SEMA-34` now restates that test at the source.
+* **no punch stream at all** — after the 2026-11-16 reset the same slot held
+  2026-10-12 … 10-15 with 766–1,789 sales rows and zero punches. Nothing was
+  red: `assert_timeclock_pairs` groups the rows that exist, so it passes
+  vacuously on a day with none. `SEMA-35` is the assertion that sees it — a
+  completed day with sales owes its roster a clock.
+
+The generator now asks **both** questions before calling a day complete
+(`main._punch_stream_verdict` → `timeclock.punch_stream_gap`) at the boot gap
+scan and in `run_backfill`. When the sales are complete but the clock is not,
+the day is not skipped and its sales are not rewritten: only
+`timeclock.generate_day_events()` runs, which completes an employee-day it finds
+half-written (the *planned* `clock_in` for a `clock_out` that lost its partner,
+never an invented instant) and writes the shift plan for a day it holds nothing
+for. Untraded days are left alone — `pos.transactions` is the trade test, so an
+empty day is never "repaired" into a full roster.
+
+**The re-ingest half is data-lab's.** A repaired day is stamped at its business
+instants, i.e. *below* the warehouse's `event_dt` cursor, so an incremental
+ingest can never see it. The repair logs a WARNING naming the day; re-read it
+with an explicit window (`grocery_ingest_api` `start_dt`/`end_dt`) or the EDW
+keeps the old shape while the source is now correct.
 
 **Run after a fresh backfill:**
 
