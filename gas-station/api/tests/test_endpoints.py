@@ -131,6 +131,45 @@ def test_status_answers_once_the_generator_has_written_state(client):
     assert "state" in body, f"/gas-station/status has no state: {sorted(body)}"
 
 
+# ── the shared inventory routes, whose projections are guarded (t_04e1e8be) ──
+
+#: Each of these is a SHARED `/{industry}/...` route (`base/api/main.py` runs one
+#: SQL string for every industry) that names a column only grocery's schema.sql
+#: declares. Both answered HTTP 500 `42703` on this data dir — `column r.load_id
+#: does not exist`, `column ip.supplier_id does not exist` — until they probed
+#: for the column; the payload must now omit the key instead.
+GUARDED_SHARED_ROUTES = {
+    "/gas-station/inventory/receipts": "load_id",
+    "/gas-station/inventory/products": "supplier_id",
+}
+
+
+@pytest.mark.parametrize("path", tuple(GUARDED_SHARED_ROUTES))
+def test_shared_inventory_route_omits_the_column_this_schema_lacks(client, path):
+    """200, an envelope, and no key for a column gas-station's schema lacks.
+
+    The static half of this guard is `tools/check_api_schema_agreement.py` (it
+    audits the projection against every industry's schema.sql); this is the half
+    that sees the real image and the real data dir. A route that re-acquired an
+    unguarded projection fails here with the psycopg2 error in the response body,
+    which is the evidence a reader needs.
+    """
+    body = _get(client, path, limit=5)
+    assert isinstance(body, dict) and isinstance(body.get("data"), list), (
+        f"{path} did not return the {{data, total, limit, offset}} envelope: "
+        f"{type(body).__name__}")
+    absent = GUARDED_SHARED_ROUTES[path]
+    if not body["data"]:
+        # No rows yet is not a failure of the projection — the 200 above is the
+        # assertion that matters, and CI waits for the backfill before this runs.
+        pytest.skip(f"{path} has no rows yet on this data dir")
+    assert absent not in body["data"][0], (
+        f"{path} serves `{absent}`, which `gas-station/generator/schema.sql` does "
+        f"not declare — the shared projection must be guarded with "
+        f"`_has_column(industry, ...)` and omit the key here (t_04e1e8be). "
+        f"Keys were: {sorted(body['data'][0])}")
+
+
 # ── shape ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("path", BARE_LIST_ROUTES)
