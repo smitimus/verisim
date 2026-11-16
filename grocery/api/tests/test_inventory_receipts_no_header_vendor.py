@@ -178,17 +178,87 @@ def test_the_receipts_payload_carries_exactly_the_contracted_keys(
     "contains") so a later card cannot add `supplier_id` without deliberately
     updating this test — and the reason it is absent is in the module docstring.
 
-    This route returns a bare JSON array (unlike `/inventory/products`, which returns
-    the `{data, total, limit, offset}` envelope), so the rows come straight off the
-    response.
+    The route returns the `{data, total, limit, offset}` envelope its siblings use
+    (t_2ab8e903) — it was the last receipt-shaped route answering with a bare JSON
+    array — so the rows come out of `data`.
     """
     client = quiesced_generator
-    rows = client.get(RECEIPTS_REQUEST_PATH, params={"limit": 1}).json()
-    assert isinstance(rows, list) and rows, (
-        "the receipts route no longer returns a non-empty JSON array; the payload "
-        "shape is part of what data-lab's raw table is built from")
+    body = client.get(RECEIPTS_REQUEST_PATH, params={"limit": 1}).json()
+    assert isinstance(body, dict) and isinstance(body.get("data"), list), (
+        "the receipts route no longer returns the {data,total,limit,offset} "
+        "envelope; the payload shape is part of what data-lab's raw table is built "
+        "from (t_2ab8e903)")
+    rows = body["data"]
+    assert rows and body["total"] >= len(rows), (
+        "the receipts route returned no rows, or a `total` smaller than the page it "
+        "just served")
     keys = set(rows[0])
     assert keys == PAYLOAD_KEYS, (
         f"the receipts payload keys changed: missing {sorted(PAYLOAD_KEYS - keys)}, "
         f"unexpected {sorted(keys - PAYLOAD_KEYS)}")
+
+
+# ---------------------------------------------------------------------------
+# 4. Source-level: the route can be paged and counted (t_2ab8e903)
+# ---------------------------------------------------------------------------
+def _order_by_clause(body: str) -> str:
+    """The last ORDER BY clause in the route body, up to its LIMIT."""
+    clauses = re.findall(r"ORDER BY\s+(.*?)(?=\s*(?:\"\"\"|\n|LIMIT|\)))", body, re.S)
+    assert clauses, "the receipts route has no ORDER BY"
+    return clauses[-1].strip()
+
+
+def test_the_receipts_route_declares_offset_and_returns_a_total():
+    """
+    Offline (no container), so CI enforces it: the route was the one
+    receipt-shaped route a client could not page — `limit` capped at 1000, no
+    `offset`, and a bare JSON array with no `total` — so data-lab landed the
+    1,000-row page as a whole 32-day window and orphaned ~297k `receipt_items`
+    every night (data-lab t_6b215e70).
+
+    Both levers are asserted here because either one alone is not enough: `total`
+    without `offset` still cannot reach row 1,001, and `offset` without `total`
+    cannot tell a complete window from a truncated one.
+    """
+    body = _route_source(RECEIPTS_SOURCE_PATH)
+
+    signature = body[body.index("def inventory_receipts("):body.index("):", body.index(
+        "def inventory_receipts("))]
+    assert re.search(r"\boffset\s*:\s*int\s*=\s*0", signature), (
+        "`/inventory/receipts` no longer declares `offset: int = 0`; a client "
+        f"cannot page past `limit` without it (t_2ab8e903).\nSignature was:\n{signature}")
+    assert "OFFSET %s" in body, (
+        "`/inventory/receipts` slices with `LIMIT %s` and no `OFFSET`; the declared "
+        "`offset` parameter would be accepted and silently ignored (measured: "
+        "`limit=1000&offset=1000` returned the same rows as `offset=0`, t_2ab8e903)")
+    assert re.search(r'"total"\s*:\s*total\b', body), (
+        "`/inventory/receipts` no longer returns `total`; without it a client "
+        "cannot tell a complete window from a truncated page (t_2ab8e903)")
+    # The count has to be for the same WHERE — a `COUNT(*)` over the joined rows
+    # would report one per line item instead of one per receipt.
+    count_sql = re.search(r'SELECT\s+COUNT\(\*\)[^"]*?FROM\s+(\S+)', body, re.S)
+    assert count_sql and count_sql.group(1) == "inv.receipts", (
+        "the receipts `total` no longer counts `inv.receipts` rows; the row query "
+        "groups by `r.receipt_id`, so counting the join would multiply by line "
+        "count (t_2ab8e903)")
+
+
+def test_the_receipts_page_order_ends_on_the_primary_key():
+    """
+    `received_dt` is not unique — on the test data dir all 7,232 receipts share
+    their timestamp with at least one other across 85 distinct values, one day
+    holding 711 of them — so paging it was measured losing 191 rows to duplicate
+    pages while the count still matched (the t_d7892e10 signature).
+
+    `test_pagination.py` enforces this for every `OFFSET %s` query; this asserts
+    it for the route by name, because the route had no `offset` when that scan
+    was written and so was the one it could not see.
+    """
+    clause = _order_by_clause(_route_source(RECEIPTS_SOURCE_PATH))
+    last_key = clause.split(",")[-1].strip().split()[0]
+    assert last_key.split(".")[-1] == "receipt_id", (
+        f"`/inventory/receipts` pages on `{clause}`, which does not end on the "
+        "primary key; a tie cluster straddling a page boundary returns one row "
+        "twice and another never, while `total` still matches (t_d7892e10)")
+
 

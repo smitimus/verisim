@@ -1323,7 +1323,9 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
         return flat(f"{pfx}/inventory/stock-levels", p)
     if table == "inv.receipts":
         p.update({"start_dt": sd, "end_dt": ed})
-        return flat(f"{pfx}/inventory/receipts", p)
+        # `paged`, not `flat`: the route returns the {data,total,...} envelope (t_2ab8e903)
+        # so the explorer's row count is the advertised total rather than the page length.
+        return paged(f"{pfx}/inventory/receipts", p)
     if table == "inv.receipt_items":
         p.update({"start_dt": sd, "end_dt": ed})
         return paged(f"{pfx}/inventory/receipt-items", p)

@@ -2341,7 +2341,35 @@ def inventory_receipts(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
     limit: int = Query(200, le=1000),
+    offset: int = 0,
 ):
+    """Receipt headers, newest first, paged and counted (t_2ab8e903).
+
+    This was the one receipt-shaped route a client could not page: it took
+    `limit` (capped at 1000), declared no `offset`, and answered with a bare JSON
+    array — no `total` — so a window holding 6,804 receipts and its first 1,000
+    rows were the same answer. data-lab landed that page as the whole 32-day
+    window and left ~297,000 `receipt_items` rows orphaned on the
+    `receipt_items → receipts` edge on every nightly load (data-lab t_6b215e70).
+    It now returns the `{data, total, limit, offset}` envelope its siblings
+    (`/inventory/receipt-items`, `/inventory/products`) already use.
+
+    `total` counts RECEIPTS, not joined rows: the row query LEFT JOINs
+    `inv.receipt_items` to compute `line_items` and groups by `r.receipt_id`, so a
+    receipt with 40 lines is still one row — and the count itself needs no join.
+
+    The `ORDER BY` ends on `r.receipt_id` (t_d7892e10): `received_dt` is not
+    unique — on the test data dir all 7,232 receipts share their timestamp with
+    at least one other across 85 distinct values, and one day holds 711 of them
+    — so every page boundary falls inside a tie cluster, and a cluster straddling
+    a boundary can hand one row to two pages and another to none while `total`
+    still matches.
+
+    Payload-shape change: the bare list is gone. data-lab's loader accepts either
+    shape (`data if isinstance(data, list) else data["data"]`) and uses `total`,
+    when present, to prove a load complete; the UI's table loader already unwraps
+    an envelope.
+    """
     pool_for(industry)
     filters, params = ["TRUE"], []
     if location_id:
@@ -2354,7 +2382,10 @@ def inventory_receipts(
         filters.append("r.received_dt <= %s")
         params.append(end_dt)
     where = " AND ".join(filters)
-    return query(f"""
+    # One row per receipt, so the count is of receipts and needs no join.
+    total = query(f"SELECT COUNT(*) AS n FROM inv.receipts r WHERE {where}",
+                  params, industry)[0]["n"]
+    rows = query(f"""
         SELECT r.receipt_id, r.load_id, r.location_id, r.received_dt, r.supplier_name,
                r.po_number, r.total_cost,
                COUNT(ri.receipt_item_id) AS line_items
@@ -2362,8 +2393,9 @@ def inventory_receipts(
         LEFT JOIN inv.receipt_items ri ON ri.receipt_id = r.receipt_id
         WHERE {where}
         GROUP BY r.receipt_id
-        ORDER BY r.received_dt DESC LIMIT %s
-    """, params + [limit], industry)
+        ORDER BY r.received_dt DESC, r.receipt_id DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], industry)
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/{industry}/inventory/products", tags=["Inventory"])

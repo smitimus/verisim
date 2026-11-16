@@ -572,6 +572,25 @@ No further serializer changes are required for #26–#31.
 > `inv.receipts → transport.loads` without a second round-trip. Committed in
 > verisim `2cb9bed`.
 
+> **`/inventory/receipts` is paged AND counted (t_2ab8e903).** It used to be the one
+> receipt-shaped route a client could not page: `limit` capped at 1000, no `offset`,
+> and a **bare JSON array** with no `total`, so a window holding 6,804 receipts and
+> its first 1,000 rows were the same answer — data-lab landed that page as the whole
+> 32-day window and orphaned ~297,000 `receipt_items` on the `receipt_items →
+> receipts` edge on every nightly load (data-lab t_6b215e70, where the loader now
+> proves a count-less route complete from a short page). It now returns the
+> `{data, total, limit, offset}` envelope its siblings use, and `total` counts
+> **receipts**, not joined rows: the row query LEFT JOINs `inv.receipt_items` to
+> compute `line_items` and groups by `r.receipt_id`, so the count takes no join at
+> all. The `ORDER BY` also grew the primary-key tiebreaker it never had
+> (`received_dt DESC, receipt_id DESC`) — the route was missed by t_d7892e10 because
+> it had no `offset` to page with, and its sort key is the least unique of the
+> family: on the test data dir all 7,232 receipts share their `received_dt` with at
+> least one other across 85 distinct values (one day holds 711), and paging it at
+> `limit=1000` was measured returning 191 rows twice and 191 never while the count
+> still matched. Consumers that expected a bare list must unwrap `data`; data-lab's
+> loader already accepts either shape.
+
 > **A receipt header has NO vendor, and the route must not pretend otherwise
 > (t_7d966a37).** Every grocery receipt is one of *our own warehouse loads*, so a
 > receipt's goods are the PRODUCTS' vendors', not one vendor's: on a fresh 30-day

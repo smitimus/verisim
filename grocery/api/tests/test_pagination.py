@@ -102,6 +102,12 @@ PAGINATED_ROUTES = [
     # The tick ledger: 37k+ rows and two clocks, so it is the one route where paging
     # correctness and a window both matter (t_ac80c514).
     ("/grocery/stats/generation", "stat_id", 1000),
+    # The one receipt-shaped route that could not page at all until t_2ab8e903, and
+    # the worst sort key of the set it joins: `received_dt` is shared by every row
+    # (85 distinct values over 7,232 receipts on the test data dir), so paging it
+    # without a tiebreaker was measured losing 191 rows to duplicate pages while the
+    # count still matched.
+    ("/grocery/inventory/receipts", "receipt_id", 1000),
 ]
 
 
@@ -183,6 +189,11 @@ WINDOWED_ROUTES = [
     # `recorded_at` is the insert clock and is the only one a delta load can watermark on.
     ("/grocery/stats/generation", "simulation_dt", "start_dt", "end_dt"),
     ("/grocery/stats/generation", "recorded_at", "created_after", "created_before"),
+    # The receipts route's `total` only starts existing at t_2ab8e903, and this is the
+    # check that its count is for the SAME `where` as the page: a row query carrying a
+    # LEFT JOIN + GROUP BY is exactly the shape where a count taken over the join
+    # silently reports line items instead of receipts.
+    ("/grocery/inventory/receipts", "received_dt", "start_dt", "end_dt"),
 ]
 
 FAR_PAST = "2000-01-01T00:00:00+00:00"
