@@ -724,6 +724,28 @@ SELECT d.transaction_date, d.pos_rows, coalesce(t.punch_rows, 0) AS punch_rows
             ) t ON t.event_date = d.transaction_date
             WHERE coalesce(t.punch_rows, 0) = 0;
 
+-- [SEMA-36] pos.products — current_price stays anchored to reference_price
+-- `reference_price` is the demand curve's pivot and the SKU's everyday shelf
+-- price; `current_price` is the live walk around it. Before t_e58b4d3a that walk
+-- was a +1 %-mean multiplicative random walk with no anchor, driven by a
+-- 96-ticks/day frequency law nothing actually ran at, so it compounded: test/107
+-- (22 days of realtime) held a median ratio of 7.27x and a worst SKU at 60.52x,
+-- and once the ratio left `elasticity.DEMAND_WEIGHT_CLIP` the price stopped
+-- moving demand at all. Nothing went red — the elasticity and promotion marts
+-- simply published nonsense for three weeks.
+--
+-- The fix anchors the walk (mean reversion toward the pivot, stationary spread
+-- ~ +/-10 %), so this assertion is a *detector*, not a calibration: 2.0x / 0.25x
+-- sit far outside the walk's band and far inside the defect, and unlike the
+-- configured `pricing.price_max_ratio` they cannot move with a config change.
+SELECT product_id, sku, current_price, reference_price,
+                   ROUND(current_price / reference_price, 4) AS ratio
+            FROM pos.products
+            WHERE reference_price IS NOT NULL
+              AND reference_price > 0
+              AND (current_price / reference_price > 2.0
+                   OR current_price / reference_price < 0.25);
+
 -- --------------------------------------------------------------------------
 -- TEMPORAL — pos.transaction_items.coupon_id — transaction_dt must be inside the coupon's valid_from..valid_until
 -- --------------------------------------------------------------------------

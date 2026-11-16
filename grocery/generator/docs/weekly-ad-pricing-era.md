@@ -156,3 +156,37 @@ A coverage **threshold** is the only form that could describe this data, and it
 was already rejected on t_4de1aba8 as a constant that fits whichever dataset is
 deployed. That rejection still stands — the new fact is that the era framing
 should go too.
+
+## Addendum (t_e58b4d3a): the advertised price is a discount off the PIVOT
+
+The era question above is closed — coverage is a function of ordering, not of a
+deploy date. A second question this document did not ask turned out to matter as
+much, and it is answered now.
+
+`ensure_current_ad` used to price every ad item as
+`p['current_price'] * (1 - discount)` — the **live shelf price at the moment the
+ad row happened to be created**. For a current-week ad that is very nearly
+right. For an ad materialised after its week had already ended it is nonsense: on
+test/107, two ads covering `2026-09-28..10-04` and `2026-10-05..10-11` were
+created on 2026-11-16 and advertised `promoted_price = 23.87` for a SKU whose
+shelf price during that week was **1.88** — because the live shelf had by then
+walked 12x away from where it stood in September (the price-walk defect,
+t_e58b4d3a). `mart_promotion_effectiveness` then read a 92 % discount that never
+existed.
+
+An ad item's `promoted_price` is now
+`pos.products.reference_price * (1 - discount_pct)`
+(`promotions._ad_pivot_price`). The reference is the SKU's everyday shelf price
+and does not move with the walk, so the published number is a genuine
+`discount_pct` below the shelf of *any* day of the ad's week, and it is identical
+whether the ad was materialised live, by a backfill, or by a gap-fill months
+later. That also means history is **not** closed: a past week whose ad is
+missing still gets one, and gets one priced correctly.
+
+Two consequences for a consumer:
+
+* `promoted_price / reference_price` is the discount the ad really offered, and
+  is the right x-axis for a promotion-lift read.
+* `promoted_price` is NOT `current_price * (1 - discount)` on any day after the
+  ad's own week — do not recompute it from today's shelf, and do not treat a
+  gap between `promoted_price` and `current_price` as a data defect.

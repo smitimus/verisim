@@ -112,6 +112,30 @@ class PricingConfig:
     # grocer does not sell below cost forever either.
     price_min_ratio: float = 0.05
 
+    # --- The live shelf-price walk (t_e58b4d3a) ---------------------------
+    # `current_price` used to be a pure multiplicative random walk with a
+    # +1 %/change mean and nothing tying it to the shelf's pivot, so it
+    # compounded without bound: 7.3x `reference_price` after 22 days on
+    # test/107, 60x on the worst SKU, and once the ratio left the demand
+    # curve's clip band the price stopped moving demand at all.
+    #
+    # Two knobs re-anchor it. `price_change_volatility` is the half-width of
+    # ONE change's log-price step, drawn uniformly (mean 0, so no systematic
+    # drift — the old uniform(-0.06, +0.08) carried +1 %/change). The step is
+    # then pulled back toward `reference_price` by
+    # `price_mean_reversion` before it is applied. Together they give a
+    # stationary spread of sd ~= vol / sqrt(3 * (1 - (1-k)^2)) in log terms:
+    # with the defaults (0.06, 0.25) that is ~5.2 %, i.e. a median ratio of
+    # 1.00 with ~95 % of SKUs inside +/-10 % whatever the catalogue's age.
+    price_change_volatility: float = 0.06
+    price_mean_reversion: float = 0.25
+
+    # Ceiling on price/reference — the symmetric partner of
+    # `price_min_ratio`, and a hard stop rather than the curve: the reverting
+    # walk should never approach it, so a SKU that does is a configuration
+    # or arithmetic defect made visible instead of a silent 60x.
+    price_max_ratio: float = 2.5
+
     # How much of a seeded price change is a market-wide move rather than a
     # SKU's own decision (0..1). A walk with no shared factor gives every
     # product an independent price path, so a product's own price change and
@@ -489,6 +513,11 @@ SCHEMA = (
     (('pricing', 'elasticity_jitter'), ('pricing', 'elasticity_jitter')),
     (('pricing', 'price_min_ratio'), ('pricing', 'price_min_ratio')),
     (('pricing', 'price_market_factor_weight'), ('pricing', 'price_market_factor_weight')),
+    # The live shelf-price walk (t_e58b4d3a): step size, pull toward
+    # reference_price, and the hard ceiling that partners price_min_ratio.
+    (('pricing', 'price_change_volatility'), ('pricing', 'price_change_volatility')),
+    (('pricing', 'price_mean_reversion'), ('pricing', 'price_mean_reversion')),
+    (('pricing', 'price_max_ratio'), ('pricing', 'price_max_ratio')),
     # inventory
     (('inventory', 'initial_stock_per_product'), ('inventory', 'initial_stock_per_product')),
     (('inventory', 'restock_check_frequency_hours'), ('inventory', 'restock_check_frequency_hours')),
@@ -752,7 +781,9 @@ def _apply_yaml(cfg: 'Config', data: dict) -> None:
     if 'price_history_backfill_days' in pri:
         cfg.pricing.price_history_backfill_days = int(pri['price_history_backfill_days'])
     for key in ('default_price_elasticity', 'elasticity_jitter',
-                'price_min_ratio', 'price_market_factor_weight'):
+                'price_min_ratio', 'price_market_factor_weight',
+                'price_change_volatility', 'price_mean_reversion',
+                'price_max_ratio'):
         if key in pri:
             setattr(cfg.pricing, key, float(pri[key]))
 

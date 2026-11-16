@@ -3,6 +3,7 @@ POS model — seeds departments, products, coupons, combo deals, loyalty members
 generates store transactions with coupon/deal application.
 """
 import os
+import math
 import random
 import logging
 from datetime import datetime, date, timedelta
@@ -1445,27 +1446,175 @@ def _promo_line_indices(cart: List[Dict], promo: Dict, kind: str) -> List[int]:
 # Price changes
 # ---------------------------------------------------------------------------
 
-def maybe_update_product_prices(conn, cfg: Config, products: List[Dict], scenario=None) -> None:
-    """Randomly change a small number of product prices.
+# ---------------------------------------------------------------------------
+# The live shelf-price walk (t_e58b4d3a)
+# ---------------------------------------------------------------------------
+SECONDS_PER_DAY = 86400.0
 
-    When scenario.price_modifier != 1.0, price change magnitudes are scaled
-    (e.g. inflation_pressure=1.15 → 15% larger price swings upward).
+# Above this expectation the count is drawn from a normal approximation of the
+# Poisson instead of the exact product-of-exponentials loop. At 30 the exact
+# loop still terminates in ~30 iterations, and the approximation's error is far
+# below the sampling noise any single tick carries.
+_POISSON_EXACT_LIMIT = 30.0
+
+
+def expected_price_changes(n_products: int, cfg: Config, sim_seconds: float) -> float:
+    """How many SKU price changes a tick covering `sim_seconds` should write.
+
+    THE config contract is per SKU per DAY: `product_price_change_frequency_days`
+    says a given SKU changes its shelf price about once every N days. A tick that
+    covers `sim_seconds` of simulated time therefore owes
+
+        len(products) / frequency_days * (sim_seconds / 86400)
+
+    changes — on every path. Before this, the code hardcoded
+    `ticks_per_day = (24 * 60) / 15` (96 — a 15-minute cadence nothing uses) and,
+    having drawn one event, always changed five SKUs. The config therefore
+    governed nothing: realtime (2880 ticks/day) over-fired ~34x and a backfill
+    (one call per simulated day) under-fired ~19x. The same simulated day wrote
+    a different price history depending on which writer produced it, which is
+    why test/107 (long realtime) sat at 7.3x `reference_price` while dev/106
+    (fresh seed + one day) was at 1.08x.
     """
-    ticks_per_day = (24 * 60) / 15
-    prob = 1.0 / (cfg.pricing.product_price_change_frequency_days * ticks_per_day)
-    if random.random() > prob * len(products):
-        return
+    if n_products <= 0 or sim_seconds is None or float(sim_seconds) <= 0.0:
+        return 0.0
+    frequency = float(getattr(cfg.pricing,
+                              'product_price_change_frequency_days', 0.0) or 0.0)
+    if frequency <= 0.0:
+        # A non-positive period means "no price walk at all" rather than a
+        # division by zero at 30 s cadence; the demand curve keeps working on
+        # whatever prices are on file.
+        return 0.0
+    return (float(n_products) / frequency) * (float(sim_seconds) / SECONDS_PER_DAY)
+
+
+def draw_change_count(expected: float, rng=random) -> int:
+    """A Poisson draw with mean `expected` — how many SKUs change this tick.
+
+    Poisson, not "always five": the count is what the config implies, so a 30 s
+    tick that owes 0.012 changes usually changes none and occasionally one, and a
+    backfilled day that owes 35 writes about 35. A *drawn* number also keeps the
+    catalogue's changes independent of one another, which is what lets a
+    per-SKU elasticity regression tell a product's own price move from the
+    market's.
+    """
+    if expected <= 0.0:
+        return 0
+    if expected > _POISSON_EXACT_LIMIT:
+        return max(0, int(round(rng.gauss(expected, math.sqrt(expected)))))
+    limit = math.exp(-expected)
+    k, p = 0, 1.0
+    while True:
+        k += 1
+        p *= rng.random()
+        if p <= limit:
+            return k - 1
+
+
+def next_shelf_price(price: float, reference: Optional[float], cfg: Config,
+                     price_mod: float = 1.0, rng=random) -> float:
+    """One mean-reverting step of a SKU's shelf price around its reference.
+
+    The walk is in log space, so a change is a percentage whatever the price:
+
+        log(price/reference) += U(-vol, +vol) * price_mod
+        log(price/reference) *= (1 - mean_reversion)
+
+    The draw is symmetric. The old step was `uniform(-0.06, +0.08)` — a **+1 %
+    mean per change** — which at ~11 changes a SKU a day compounded to +11 %/day,
+    so 22 days put the median SKU at 7.3x `reference_price` with a 60x outlier.
+
+    The reversion term is what makes `reference_price` an anchor rather than a
+    birthmark: the ratio is pulled back toward 1.0 (the SKU's everyday shelf
+    price) on every change, so it is bounded by the ratio of step size to pull
+    instead of growing with the catalogue's age. With the shipped defaults
+    (0.06, 0.25) the stationary spread is `vol / sqrt(3 * (1 - (1-k)^2))` ~= 5.2 %
+    in log terms: a median ratio of 1.00 and ~95 % of SKUs inside +/-10 %,
+    however long the generator has been running. That band is also what the
+    demand curve needs — `elasticity.DEMAND_WEIGHT_CLIP` and
+    `mart_product_price_elasticity` are both meaningless once `price/reference`
+    walks out of it.
+
+    `price_max_ratio` / `price_min_ratio` are a hard stop on top of the walk, not
+    the mechanism: a reverting walk never approaches them, so a SKU that does is
+    a configuration or arithmetic defect made visible instead of a silent 60x.
+    """
+    current = float(price)
+    pivot = float(reference) if reference else current
+    if pivot <= 0.0:
+        pivot = max(current, 1.0)
+
+    volatility = abs(float(getattr(cfg.pricing, 'price_change_volatility', 0.0)))
+    volatility *= max(float(price_mod), 0.0)
+    reversion = min(max(float(getattr(cfg.pricing, 'price_mean_reversion', 0.0)),
+                        0.0), 1.0)
+
+    log_ratio = math.log(max(current, 1e-6) / pivot)
+    if volatility > 0.0:
+        log_ratio += rng.uniform(-volatility, volatility)
+    log_ratio *= (1.0 - reversion)
+
+    floor_ratio = max(float(getattr(cfg.pricing, 'price_min_ratio', 0.0)), 1e-6)
+    ceiling_ratio = max(float(getattr(cfg.pricing, 'price_max_ratio', 0.0) or 0.0),
+                        floor_ratio)
+    log_ratio = min(max(log_ratio, math.log(floor_ratio)),
+                    math.log(ceiling_ratio))
+
+    # 0.10 is a *cent* floor, not an economics one: a $0.01 SKU times a 5 %
+    # step rounds to zero, and `price NUMERIC(8,2)` with a zero price makes the
+    # demand ratio undefined.
+    return round(max(0.10, pivot * math.exp(log_ratio)), 2)
+
+
+def maybe_update_product_prices(conn, cfg: Config, products: List[Dict],
+                                scenario=None,
+                                sim_seconds: Optional[float] = None) -> int:
+    """Change a drawn number of product prices, anchored to `reference_price`.
+
+    `sim_seconds` is how much SIMULATED time this tick writes: 30 s for a
+    realtime tick at the default cadence, 3600 for one hour of a backfill. It is
+    the argument that makes the two paths agree — both are just "how many of the
+    catalogue's ~1-change-per-fortnight events fall inside this window" (see
+    `expected_price_changes`). It defaults to the configured realtime cadence, so
+    a caller that forgets to pass it under-writes history rather than 30x
+    over-writing it.
+
+    When `scenario.price_modifier != 1.0` the step SIZE is scaled (e.g.
+    inflation_pressure=1.15 → 15 % wider swings), never the direction: the mean
+    of the step stays zero, so a scenario cannot restart the runaway drift.
+
+    Returns the number of SKUs changed.
+    """
+    if not products:
+        return 0
+    if sim_seconds is None:
+        sim_seconds = cfg.generator.tick_interval_seconds
+    expected = expected_price_changes(len(products), cfg, sim_seconds)
+    count = min(len(products), draw_change_count(expected))
+    if count <= 0:
+        return 0
 
     price_mod = 1.0
     if scenario is not None:
         price_mod = getattr(scenario, 'price_modifier', 1.0)
 
-    to_change = random.sample(products, min(5, len(products)))
+    to_change = random.sample(products, count)
+    changed = 0
     with conn.cursor() as cur:
         for p in to_change:
-            change_pct = random.uniform(-0.06, 0.08) * price_mod
-            new_price = round(p['price'] * (1 + change_pct), 2)
-            new_price = max(0.10, new_price)
+            raw_price = p.get('price')
+            if raw_price is None:
+                raw_price = p.get('current_price')
+            if raw_price is None:
+                continue                       # a row with no usable price
+            try:
+                old_price = float(raw_price)
+            except (TypeError, ValueError):
+                continue
+            if old_price <= 0.0:
+                continue
+            reference = p.get('reference_price') or old_price
+            new_price = next_shelf_price(old_price, reference, cfg, price_mod)
             cur.execute("""
                 UPDATE pos.products SET current_price = %s, updated_at = NOW()
                 WHERE product_id = %s::uuid
@@ -1473,6 +1622,17 @@ def maybe_update_product_prices(conn, cfg: Config, products: List[Dict], scenari
             cur.execute("""
                 INSERT INTO pos.price_history (product_id, old_price, new_price)
                 VALUES (%s::uuid, %s, %s)
-            """, (p['product_id'], p['price'], new_price))
+            """, (p['product_id'], old_price, new_price))
+            # `price` and `current_price` are two keys for ONE column
+            # (`pos.products.current_price`): `pos`/`online` ring the till from
+            # `price`, while `promotions.ensure_current_ad` prices an ad from
+            # `current_price`. Moving only one left an ad created on day 10 of a
+            # backfill priced off the PASS-START shelf price, and left the till
+            # and the online channel quoting different prices for the same SKU
+            # in the same hour (t_e58b4d3a).
             p['price'] = new_price
+            p['current_price'] = new_price
+            changed += 1
     conn.commit()
+    return changed
+

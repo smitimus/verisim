@@ -987,8 +987,14 @@ def run_tick(conn, cfg, state, sim_dt, locations, employees, departments,
         fulfilled_parents=[d['transaction_id'] for d in depletion]
                           + [d['transaction_id'] for d in online_depletion])
 
-    # Probabilistic events
-    pos.maybe_update_product_prices(conn, cfg, products, scenario)
+    # Probabilistic events. The price walk is told how much SIMULATED time this
+    # tick writes (30 s at the default cadence), because that — not a
+    # hardcoded 96 ticks/day — is what turns
+    # `pricing.product_price_change_frequency_days` into a number of SKUs to
+    # change (t_e58b4d3a). A backfill hour passes SIM_HOUR_SECONDS and gets the
+    # same expected changes per SKU per day.
+    pos.maybe_update_product_prices(conn, cfg, products, scenario,
+                                    sim_seconds=tick_seconds)
     hr.maybe_hire_employee(conn, cfg, locations)
     hr.maybe_terminate_employee(conn)
 
@@ -1262,6 +1268,17 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 fulfilled_parents=[d['transaction_id'] for d in depletion]
                                   + [d['transaction_id'] for d in online_depletion])
 
+            # The shelf-price walk, one simulated HOUR at a time (t_e58b4d3a).
+            # It used to run once per backfilled DAY, in the end-of-day block,
+            # against a hardcoded 96-ticks-a-day law — so the same simulated day
+            # got a different price history depending on which writer produced
+            # it. One call per hour with the hour's own duration is the same
+            # arithmetic realtime does 120 times an hour, and it keeps the
+            # change timestamps spread across the day instead of all landing at
+            # 23:59.
+            pos.maybe_update_product_prices(conn, cfg, products, scenario,
+                                            sim_seconds=SIM_HOUR_SECONDS)
+
             # Partial day: generate timeclock events per-hour using the same
             # idempotent realtime logic (checks existing events before inserting).
             if is_partial:
@@ -1320,7 +1337,9 @@ def run_backfill(conn, cfg, state, locations, employees, departments,
                 datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59),
                 eod_scenario, vendor_cfg=cfg.vendors)
 
-            pos.maybe_update_product_prices(conn, cfg, products, eod_scenario)
+            # NB: no `maybe_update_product_prices` here — the walk runs inside
+            # the hourly loop above, so a backfilled day and a realtime day
+            # write the same expected number of changes per SKU (t_e58b4d3a).
 
             sim_day_end = datetime(cur_date.year, cur_date.month, cur_date.day, 23, 59)
             shrinkage.set_expiry_dates(conn, sim_day_end)

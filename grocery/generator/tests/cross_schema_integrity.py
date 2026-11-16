@@ -1126,6 +1126,31 @@ ASSERTIONS: List[AssertionSpec] = [
             WHERE coalesce(t.punch_rows, 0) = 0
         """,
     ),
+    # ---- THE SHELF PRICE STAYS ANCHORED TO ITS PIVOT (t_e58b4d3a) ----------
+    # `reference_price` is the demand curve's pivot and the everyday shelf price;
+    # `current_price` is the live walk around it. Before t_e58b4d3a that walk was
+    # a +1 %-mean multiplicative random walk with no anchor and a 96-ticks/day
+    # frequency law nothing ran at, so it compounded: test/107 (22 days) held a
+    # median ratio of 7.27x and a worst SKU at 60.52x, and once the ratio left
+    # `elasticity.DEMAND_WEIGHT_CLIP` the price stopped moving demand at all.
+    # Nothing anywhere went red — the marts simply published nonsense — so this
+    # restates the band as an assertion. 2.0x / 0.25x are deliberately far
+    # outside the reverting walk's ~+/-10 % (a config ceiling change cannot make
+    # the check lie) and far inside the defect.
+    AssertionSpec(
+        id="SEMA-36",
+        dimension="semantic_type",
+        title="pos.products — current_price stays anchored to reference_price",
+        sql="""
+            SELECT product_id, sku, current_price, reference_price,
+                   ROUND(current_price / reference_price, 4) AS ratio
+            FROM pos.products
+            WHERE reference_price IS NOT NULL
+              AND reference_price > 0
+              AND (current_price / reference_price > 2.0
+                   OR current_price / reference_price < 0.25)
+        """,
+    ),
     # ---- TEMPORAL WINDOW MISMATCHES ---------------------------------------
     # The promo key resolves, but the promotion's validity window does not
     # cover the transaction date it was applied to. Fixed at the source by

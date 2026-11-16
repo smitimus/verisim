@@ -38,6 +38,48 @@ def _week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
+def _ad_pivot_price(p: Dict) -> float:
+    """The shelf price a weekly ad is priced off: the SKU's `reference_price`.
+
+    WHY THE PIVOT AND NOT `current_price` (t_e58b4d3a). An ad item's
+    `promoted_price` is a published number: it must be a real discount against
+    the shelf the ad covers, and it must be the same number whatever day
+    materialises it. `current_price` satisfies neither. It is the *live* shelf
+    price, so an ad materialised on 2026-11-16 for a week that ended in
+    September advertised 23.87 for a SKU whose shelf price that week was 1.88 —
+    `mart_promotion_effectiveness` then reads a 92 % discount that never
+    happened. And it is a moving target inside one pass, so an ad created on day
+    10 of a backfill was priced off the pass-start shelf price while the pass
+    was already writing day 10's.
+
+    `reference_price` is the SKU's everyday shelf price and never moves with the
+    walk (that is exactly what makes it the demand curve's pivot), so:
+
+        promoted_price = reference_price * (1 - discount_pct)
+
+    is (a) a genuine `discount_pct` below the shelf of ANY day of the ad's week,
+    (b) reproducible whether the ad is materialised live, by a backfill, or by a
+    gap-fill months later, and (c) the same number the demand curve compares
+    against, which is what makes the ad's uplift measurable at all.
+
+    A row seeded before the elasticity columns existed has no `reference_price`;
+    it falls back to `price` (the in-memory alias of `current_price`) and then
+    to `current_price`, so a legacy data dir still prices its ads rather than
+    crashing the day's lifecycle.
+    """
+    for key in ('reference_price', 'price', 'current_price'):
+        value = p.get(key)
+        if value is None:
+            continue
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            continue
+        if price > 0.0:
+            return price
+    return 1.0
+
+
 def ensure_current_ad(conn, sim_date: date,
                       products: List[Dict]) -> List[Tuple[str, float]]:
     """
@@ -76,11 +118,13 @@ def ensure_current_ad(conn, sim_date: date,
         pool = dept_products.get(dept_name, [])
         if not pool:
             continue
-        count  = random.randint(min_count, min(max_count, len(pool)))
+        count  = random.randint(min(min_count, len(pool)), min(max_count, len(pool)))
         chosen = random.sample(pool, count)
         for p in chosen:
             discount = random.choice(DISCOUNT_TIERS)
-            promoted = round(float(p['current_price']) * (1 - discount), 2)
+            # Priced off the SKU's reference price — see `_ad_pivot_price` for
+            # why an ad may not be priced off the live shelf (t_e58b4d3a).
+            promoted = round(_ad_pivot_price(p) * (1 - discount), 2)
             ad_items.append((p['product_id'], promoted, round(discount * 100, 1)))
 
     if not ad_items:

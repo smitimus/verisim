@@ -213,6 +213,20 @@ pricing:
                                   # 0 makes every SKU identical
   price_min_ratio: 0.05            # floor on price/reference — a zero price makes
                                   # the ratio, and the curve, undefined
+  price_max_ratio: 2.5             # ceiling on price/reference — the symmetric
+                                  # partner of the floor, and a hard stop rather
+                                  # than a curve: the reverting walk below never
+                                  # approaches it, so a SKU that does is a defect
+  # The live shelf-price walk (t_e58b4d3a). `current_price` used to be a pure
+  # random walk with a +1%/change mean: 7.3x reference_price after 22 days, 60x
+  # on the worst SKU, and past the demand curve's clip band the price stopped
+  # moving demand at all. One change now moves log(price/reference) by
+  # uniform(-vol, +vol) (mean 0), then removes `price_mean_reversion` of the
+  # remaining distance to the reference. Stationary spread ~= 5.2% (defaults),
+  # i.e. median ratio 1.00 with ~95% of SKUs inside +/-10% at any age.
+  price_change_volatility: 0.06    # half-width of one change's log step
+  price_mean_reversion: 0.25       # share of the distance to reference_price
+                                   # removed per change; 0 = old unbounded walk
   price_market_factor_weight: 0.65 # how much of a seeded price change is a
                                   # store-wide inflation move (the rest is the
                                   # SKU's own decision, which is the part an

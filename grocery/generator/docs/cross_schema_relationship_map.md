@@ -396,6 +396,64 @@ transaction). data-lab's staging model derives `line_total` from
 `(unit_price - discount) * quantity`, i.e. the old per-unit reading — so the two
 repos have to move together.
 
+### The shelf price, its pivot, and the advertised price (t_e58b4d3a)
+
+Three columns describe one SKU's price, and before this card two of them had
+drifted into unrelated worlds:
+
+| Column | Meaning | Moves? |
+|---|---|---|
+| `pos.products.current_price` | the live shelf price of record (what the till charges when no ad applies) | yes — the price walk |
+| `pos.products.reference_price` | the SKU's *everyday* shelf price, the demand curve's pivot | no (seeded = the price at seed time) |
+| `pricing.ad_items.promoted_price` | the published weekly-ad price | once, when the ad is materialised |
+
+**The walk is anchored.** `models.pos.maybe_update_product_prices` moves
+`log(current_price / reference_price)` by `uniform(-vol, +vol)` and then removes
+`price_mean_reversion` of the remaining distance to the reference
+(`pricing.price_change_volatility`, `pricing.price_mean_reversion`). It used to
+be a driftless-plus-1 % multiplicative walk with nothing tying it to the pivot —
+`+11 %/day`, i.e. 7.27x the reference after 22 days on test/107 and 60.52x on the
+worst SKU — and once the ratio left the demand curve's clip band the price
+stopped moving demand at all. The intended long-run spread is a **median ratio of
+1.00 with ~95 % of SKUs inside ±10 %** (stationary log sd ≈ 5.2 % at the shipped
+0.06/0.25); `pricing.price_max_ratio` (2.5) is a hard stop the reverting walk
+never approaches, so a SKU that reaches it is a defect made visible.
+
+**The frequency is per SKU per day, on both writers.** A tick that covers
+`sim_seconds` of simulated time owes
+`len(products) / product_price_change_frequency_days * (sim_seconds / 86400)`
+changes, drawn as a Poisson count — so a 30 s realtime tick changes 0.012 SKUs on
+average and a backfill hour changes 1.47, and a day written either way holds the
+same expected ~35 changes for a 495-SKU catalogue. It used to hardcode
+`ticks_per_day = 96` and change a fixed five SKUs per event, which made the
+config govern nothing and made a realtime-written day and a backfilled day
+disagree by 30x/4x.
+
+**An ad is priced off the pivot, never off the live shelf.**
+`promotions._ad_pivot_price` sets `promoted_price = reference_price * (1 -
+discount_pct)`. Pricing it off `current_price` meant a week materialised after it
+had ended advertised today's price: two ads on test/107 (Sep 28–Oct 04 and Oct
+05–11) were created on 2026-11-16 advertising `promoted_price = 23.87` for a SKU
+whose shelf price during that week was 1.88, and `mart_promotion_effectiveness`
+read the 92 % discount as real. The pivot is stable and is the same number the
+demand curve compares against, so a retro-materialised ad is still a genuine
+`discount_pct` below the shelf of its own week. History is therefore **not**
+closed: a gap-filled past week still gets its ad, priced correctly.
+
+**`price` and `current_price` are one column.** The in-memory product dict
+carries both keys (`pos`/`online` ring the till from `price`, `promotions` prices
+its ad from `current_price`). The walk used to move only `price`, so an ad
+created on day 10 of a 30-day backfill was priced off the *pass-start* shelf, and
+POS and online quoted different prices for the same SKU in the same hour.
+
+`pos.price_history.changed_at` is still the **insert clock** (see the AGENTS.md
+table): the walk appends rows stamped when the pass ran, and the 90-day history
+is the separately-seeded `seed_price_history` walk. A backfilled day's live price
+changes therefore all carry the pass time — data-lab's `mart_product_price_elasticity`
+`price_on_day` lookup keys on `changed_at`, so it reads the seeded history rather
+than the replay. Making that column a business clock needs a new column and an
+ingest-side change; it is tracked on the data-lab side, not here.
+
 ### Loyalty points pay out, and a coupon has a usage cap (t_74280120)
 
 Two source columns existed, were read by marts whose whole purpose they are, and
