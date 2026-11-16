@@ -212,30 +212,37 @@ class ScenarioContext:
 
 def _apply_single_scenario(
     scenario_name: str,
-    volume_multiplier_override: float,
     cfg: Config,
     ctx: ScenarioContext,
 ) -> None:
-    """Merge a single scenario's effects into ctx in-place."""
+    """Merge a single scenario's effects into ctx in-place.
+
+    This function carries the scenario's OWN effects only. The operator's manual
+    `volume_multiplier` lever (control.generator_state) is applied by
+    `get_scenario_context` once, after every active scenario has merged, for two
+    reasons: a regime with no volume effect of its own (`redemption_rush`,
+    `supplier_disruption`, …) used to ignore the lever entirely — it reported
+    through `/status` and changed nothing — and a compound regime
+    (`promotion+weekend`) used to apply it once per active name. Attribution
+    belongs to the scenario's effects, not to the manual override.
+    """
     if scenario_name == 'promotion':
-        ctx.volume_multiplier *= volume_multiplier_override
         ctx.labor_multiplier = max(ctx.labor_multiplier, cfg.scenarios.promotion_labor_multiplier)
         for dept in cfg.scenarios.promotion_departments:
             if not any(p[0] == dept for p in ctx.active_promotions):
                 ctx.active_promotions.append((dept, cfg.scenarios.promotion_discount_pct))
 
     elif scenario_name == 'holiday_week':
-        ctx.volume_multiplier *= volume_multiplier_override * cfg.scenarios.holiday_week_multiplier
+        ctx.volume_multiplier *= cfg.scenarios.holiday_week_multiplier
         ctx.labor_multiplier = max(ctx.labor_multiplier, cfg.scenarios.holiday_labor_multiplier)
         ctx.coupon_multiplier = max(ctx.coupon_multiplier, 1.5)
 
     elif scenario_name == 'double_coupons':
-        ctx.volume_multiplier *= volume_multiplier_override
         ctx.coupon_multiplier = max(ctx.coupon_multiplier, cfg.scenarios.double_coupon_multiplier)
         ctx.loyalty_engagement_modifier = max(ctx.loyalty_engagement_modifier, 1.5)
 
     elif scenario_name == 'weekend':
-        ctx.volume_multiplier *= volume_multiplier_override * cfg.scenarios.weekend_multiplier
+        ctx.volume_multiplier *= cfg.scenarios.weekend_multiplier
         ctx.labor_multiplier = max(ctx.labor_multiplier, cfg.scenarios.weekend_labor_multiplier)
 
     elif scenario_name == 'inflation_pressure':
@@ -266,8 +273,9 @@ def _apply_single_scenario(
             ctx.loyalty_redemption_modifier, cfg.scenarios.redemption_rush_modifier)
 
     else:
-        # 'normal', 'rush_hour', or unknown — apply override only
-        ctx.volume_multiplier *= volume_multiplier_override
+        # 'normal', 'rush_hour', or an unknown name — no effect of its own.
+        # The manual volume override is applied by the caller for every regime.
+        pass
 
 
 def get_scenario_context(
@@ -298,7 +306,17 @@ def get_scenario_context(
         active = ['normal']
 
     for name in active:
-        _apply_single_scenario(name, volume_multiplier_override, cfg, ctx)
+        _apply_single_scenario(name, cfg, ctx)
+
+    # The manual `volume_multiplier` lever (control.generator_state, set through
+    # PATCH /{industry}/generator/config) scales EVERY regime exactly once. It
+    # lives here rather than in `_apply_single_scenario` because that function
+    # merges a scenario's own effects: while it owned the lever, a regime with no
+    # volume effect (redemption_rush, supplier_disruption, inflation_pressure, …)
+    # silently ignored it — `/status` reported 8 and the tick stayed at baseline —
+    # and a compound regime multiplied it once per active name. This is the same
+    # shape `support/generator/scenarios/scenario_engine.py` has always used.
+    ctx.volume_multiplier *= volume_multiplier_override
 
     # Build scenario tag from all non-normal scenarios
     non_normal = [s for s in active if s != 'normal']

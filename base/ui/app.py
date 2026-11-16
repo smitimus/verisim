@@ -1523,6 +1523,38 @@ GROCERY_SCENARIOS = {
         "icon": "✂️",
         "description": "Coupon value doubled. Higher loyalty member attach rate. Simulates a double-coupon event.",
     },
+    # Cross-domain scenarios (verisim#12) and the points-spend A/B regime
+    # (t_74280120). These are the names the scenario engine special-cases beyond
+    # the four above; `regional_peak` is deliberately absent — its effect
+    # (`per_store_multipliers`) has no consumer in the generator yet, so a card
+    # here would be a button that changes nothing.
+    # `grocery/generator/tests/test_scenario_api_parity.py` fails when this
+    # catalogue and VALID_SCENARIOS drift apart.
+    "inflation_pressure": {
+        "label": "Inflation Pressure",
+        "icon": "💸",
+        "description": "Faster price growth (price changes scaled ×1.15) with softer loyalty engagement (×0.85).",
+    },
+    "severe_weather": {
+        "label": "Severe Weather",
+        "icon": "⛈️",
+        "description": "0.7× volume and reduced staff attendance, with supply disruption on the next daily pass.",
+    },
+    "supplier_disruption": {
+        "label": "Supplier Disruption",
+        "icon": "🚚",
+        "description": "Short replenishment orders and a longer delivery cutoff, with shrinkage ×1.3.",
+    },
+    "deep_discount": {
+        "label": "Deep Discount",
+        "icon": "🔻",
+        "description": "Deeper markdowns (price changes scaled ×0.8) and a 1.3× loyalty engagement lift.",
+    },
+    "redemption_rush": {
+        "label": "Redemption Rush",
+        "icon": "🎯",
+        "description": "6× the probability a member spends points at the till. Volume, price and coupons stay at baseline, so an A/B run attributes the change to redemption alone.",
+    },
 }
 
 SUPPORT_SCENARIOS = {

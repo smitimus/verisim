@@ -493,8 +493,26 @@ def status(industry: str):
 # ---------------------------------------------------------------------------
 
 VALID_SCENARIOS = {
+    # The reachability contract for every scenario route: POST
+    # /{industry}/generator/scenarios, .../scenario-schedules and
+    # PATCH /{industry}/generator/config all validate against this mapping.
+    #
+    # It must name every scenario the industry's engine special-cases — plus the
+    # two the engine applies OUTSIDE its per-name switch (`normal`, the no-op
+    # baseline, and `rush_hour`, which stacks automatically from the simulated
+    # hour but can still be pinned or scheduled). Drift in either direction is
+    # silent: a name the engine honours here missing is a 400 on a lever the
+    # README advertises (redemption_rush and the five cross-domain scenarios,
+    # t_ec2f1107), and a name accepted with no engine branch is a 200 that
+    # changes nothing while the UI reports it as active.
+    # `grocery/generator/tests/test_scenario_api_parity.py` parses both sides
+    # and fails on either drift — add a scenario to the engine and to this set
+    # in the same commit.
     "gas-station": {"normal", "rush_hour", "weekend", "promotion", "fuel_spike"},
-    "grocery":     {"normal", "rush_hour", "weekend", "promotion", "holiday_week", "double_coupons"},
+    "grocery":     {"normal", "rush_hour", "weekend", "promotion", "holiday_week",
+                    "double_coupons", "inflation_pressure", "severe_weather",
+                    "supplier_disruption", "regional_peak", "deep_discount",
+                    "redemption_rush"},
     "support":     {"normal", "rush_hour", "weekend", "service_outage", "weather_outage",
                     "product_launch", "marketing_blast", "holiday_week"},
 }

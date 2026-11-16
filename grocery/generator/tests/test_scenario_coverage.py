@@ -7,6 +7,8 @@ propagate correctly to the target domain models.
 """
 from datetime import datetime
 
+import pytest
+
 from grocery.generator.config import Config
 from grocery.generator.scenarios.scenario_engine import (
     ScenarioContext,
@@ -18,7 +20,7 @@ from grocery.generator.scenarios.scenario_engine import (
 # Helper: build a fresh config and a default scenario context for a scenario
 # ---------------------------------------------------------------------------
 
-def _ctx_for(scenario_name: str, hour: int = 12) -> ScenarioContext:
+def _ctx_for(scenario_name: str, hour: int = 12, override: float = 1.0) -> ScenarioContext:
     cfg = Config()
     # flatten weights so volume_multiplier is easy to reason about
     cfg.volumes.hourly_weights = [1.0 for _ in range(24)]
@@ -27,7 +29,7 @@ def _ctx_for(scenario_name: str, hour: int = 12) -> ScenarioContext:
         'thursday': 1.0, 'friday': 1.0, 'saturday': 1.0, 'sunday': 1.0,
     }
     sim_dt = datetime(2026, 7, 6, hour, 0, 0)  # Monday
-    return get_scenario_context([scenario_name], 1.0, sim_dt, cfg)
+    return get_scenario_context([scenario_name], override, sim_dt, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +182,7 @@ ALL_SCENARIOS = [
     'supplier_disruption',
     'deep_discount',
     'regional_peak',
+    'redemption_rush',
 ]
 
 
@@ -193,3 +196,43 @@ def test_all_scenarios_produce_valid_context():
         assert 0.0 <= ctx.attendance_modifier <= 1.0, f"{name}: attendance_modifier out of range"
         assert 0.5 <= ctx.labor_multiplier <= 2.0, f"{name}: labor_multiplier out of range"
         assert 0.5 <= ctx.shrinkage_modifier <= 5.0, f"{name}: shrinkage_modifier out of range"
+
+
+# ---------------------------------------------------------------------------
+# The manual volume lever — it must move volume under EVERY regime
+# ---------------------------------------------------------------------------
+
+def test_manual_volume_override_scales_every_scenario():
+    """`PATCH /generator/config {"volume_multiplier": N}` must scale volume
+    whatever scenario is active.
+
+    The lever used to live inside `_apply_single_scenario`'s branch chain, so a
+    regime with no volume effect of its own ignored it outright: with
+    `redemption_rush` armed, `{"volume_multiplier": 8}` was stored, reported by
+    `/status`, and changed nothing (t_ec2f1107). The UI's own column description
+    calls the field "Scales all transaction counts", so this is the contract.
+    """
+    for name in ALL_SCENARIOS + ['rush_hour']:
+        baseline = _ctx_for(name, override=1.0)
+        boosted = _ctx_for(name, override=8.0)
+        assert boosted.volume_multiplier == pytest.approx(baseline.volume_multiplier * 8.0), (
+            f"{name}: volume_multiplier 8.0 produced "
+            f"{boosted.volume_multiplier} against a baseline of {baseline.volume_multiplier}"
+        )
+
+
+def test_manual_volume_override_applies_once_for_a_compound_regime():
+    """Two active scenarios must not multiply the operator's lever twice.
+
+    `promotion+weekend` applied the override once per name while it lived in the
+    branch chain — 3.0 became 9.0 — so a scheduled coupon week plus a weekend
+    silently produced nine times the requested volume.
+    """
+    cfg = Config()
+    cfg.volumes.hourly_weights = [1.0 for _ in range(24)]
+    cfg.volumes.day_of_week_multipliers = {d: 1.0 for d in (
+        'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')}
+    when = datetime(2026, 7, 6, 12, 0, 0)
+    baseline = get_scenario_context(['promotion', 'weekend'], 1.0, when, cfg)
+    boosted = get_scenario_context(['promotion', 'weekend'], 3.0, when, cfg)
+    assert boosted.volume_multiplier == pytest.approx(baseline.volume_multiplier * 3.0)
