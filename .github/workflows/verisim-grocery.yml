@@ -1,5 +1,10 @@
 name: Verisim Grocery CI/CD
 
+# Runner reality check before editing: `.github/CI-RUNNER.md`. The self-hosted
+# runner is an act runner on a 40 G volume shared with a monitoring stack, the job
+# runs INSIDE a container with the host's docker socket, and both facts have
+# produced red CI that said nothing about the commit (t_cbb3b8dc, t_19eb986e).
+
 on:
   push:
     branches: [main]
@@ -61,6 +66,25 @@ jobs:
   integration:
     name: Build standalone image + smoke + API contract tests
     runs-on: ubuntu-latest
+    # PUSHES ONLY — main and v* tags (t_19eb986e). This job builds a ~1 GB image
+    # and drives a buildx builder whose state volume is multi-GB; the self-hosted
+    # act runner has ONE 40 G volume, shared with a monitoring stack, and the
+    # blocking `test` job above needs that space to stay green (a full runner made
+    # it fail with OSError: [Errno 28] until infra pruned it, t_cbb3b8dc). A card
+    # branch typically pushes several times, so running this on every pull
+    # request was most of the runner's disk churn — and every one of those runs
+    # built an image nobody consumed, because `publish` builds and pushes its own.
+    #
+    # Nothing is lost by moving it to main: Gitea PRs are squash-merged, so every
+    # merge runs the image on main immediately, and `publish` needs BOTH this job
+    # and `test` — a broken image still cannot be released. What is given up is
+    # pre-merge feedback on image-level breakage (strip script, migrations,
+    # supervisord); that now shows up as a red main minutes after the merge.
+    #
+    # A second runner / separate buildx cache was considered and rejected: there
+    # is one volume, so a second cache directory on it is the same 40 G, and a
+    # second runner is a new host to keep (infra's call, no disk saved).
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
@@ -74,8 +98,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build only (no Docker Hub login) — PRs and forks can validate the image
-      # without repo secrets. Publishing is a separate job.
+      # Build only (no Docker Hub login) — a push can validate the image without
+      # repo secrets. Publishing is a separate job.
+      #
+      # `load: true` rather than `outputs: type=docker,dest=/tmp/image.tar` plus a
+      # `docker load` step: the tar is a second full copy of a ~1 GB image, and it
+      # lives inside this job container's writable layer on the runner's root.
+      # buildx's docker exporter loads straight into the daemon (t_19eb986e).
       - name: Build image
         uses: docker/build-push-action@v5
         with:
@@ -85,32 +114,92 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/image.tar
-
-      - name: Load image
-        run: docker load --input /tmp/image.tar
+          load: true
 
       - name: Smoke test
         run: |
+          set -u
+          IMAGE="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          API_PORT_DEFAULT=8010
+          API_PORT_IN_CONTAINER=8000
+
+          # WHERE DOES A PUBLISHED PORT LAND? (t_19eb986e)
+          #
+          # On a hosted runner the job runs directly on the VM, so `-p 8010:8000`
+          # publishes on the runner's own loopback and curl to 127.0.0.1:8010 works.
+          #
+          # On the self-hosted act runner (bench/108) the job runs INSIDE a
+          # container with the host's docker socket mounted. The publish then
+          # happens on the BENCH HOST, and `localhost` from the job container is
+          # the job container itself — a sibling container is not reachable there.
+          # Measured 2026-11-15 on a job-shaped container: `localhost:8010`
+          # against a published sibling is "connection refused" every single time,
+          # however healthy the image is. That is why this step used to spend its
+          # whole 180 s budget and fail while supervisord reported all four
+          # processes RUNNING: the image was fine, the address was wrong.
+          #
+          # So: work out whether this job is itself a container (its hostname, the
+          # HOSTNAME env var, or the container id in /proc/self/mountinfo —
+          # whichever docker can still inspect). If it is, give the smoke container
+          # THIS container's network namespace instead of publishing anything: the
+          # API is then on 127.0.0.1:8000, with no host publish, no host firewall
+          # rule and no DNS to get wrong. If it is not, keep the publish path and
+          # additionally try the bridge gateway and host.docker.internal, so a
+          # future runner setup that defeats detection still has a route in.
+          SELF_ID=""
+          for cand in "$(cat /etc/hostname 2>/dev/null || true)" \
+                      "${HOSTNAME:-}" \
+                      "$(grep -o -m1 'containers/[0-9a-f]\{64\}' /proc/self/mountinfo 2>/dev/null | cut -d/ -f2)"; do
+            [ -n "${cand}" ] || continue
+            if docker inspect "${cand}" >/dev/null 2>&1; then
+              SELF_ID="${cand}"
+              break
+            fi
+          done
+
+          if [ -n "${SELF_ID}" ]; then
+            echo "This job runs inside container ${SELF_ID}; the smoke container shares its network namespace."
+            NET_ARGS="--network container:${SELF_ID}"
+            CANDIDATE_URLS="http://127.0.0.1:${API_PORT_IN_CONTAINER}"
+          else
+            GW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+            echo "This job runs directly on the runner host; publishing the API on ${API_PORT_DEFAULT}."
+            NET_ARGS="-p ${API_PORT_DEFAULT}:${API_PORT_IN_CONTAINER}"
+            CANDIDATE_URLS="http://127.0.0.1:${API_PORT_DEFAULT}"
+            if [ -n "${GW}" ]; then
+              CANDIDATE_URLS="${CANDIDATE_URLS} http://${GW}:${API_PORT_DEFAULT}"
+            fi
+            CANDIDATE_URLS="${CANDIDATE_URLS} http://host.docker.internal:${API_PORT_DEFAULT}"
+          fi
+
+          # --rm plus an ANONYMOUS data volume: docker deletes the volume with the
+          # container, so a run cannot inherit a half-initialised PG data dir from
+          # an earlier one and nothing is left on the runner's root to prune.
           docker run -d --name verisim-test --rm \
-            -p 8010:8000 \
-            -v /tmp/verisim_data:/var/lib/postgresql/data \
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${NET_ARGS} \
+            -v /var/lib/postgresql/data \
+            "${IMAGE}"
+
           # Wait for /health up to 180s (fresh initdb + 30-day backfill startup)
           for i in $(seq 1 36); do
             sleep 5
-            HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
-              http://localhost:8010/health 2>/dev/null || echo "000")
-            if [ "$HEALTH" = "200" ]; then
-              echo "Smoke test: PASS"
-              break
-            fi
-            if [ "$i" = "36" ]; then
-              echo "Smoke test: FAIL"
-              docker logs verisim-test 2>&1 | tail -30
-              exit 1
-            fi
+            for url in ${CANDIDATE_URLS}; do
+              HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "${url}/health" 2>/dev/null || true)
+              echo "[${i}] GET ${url}/health -> ${HEALTH:-000}"
+              if [ "${HEALTH}" = "200" ]; then
+                # Every later step (the backfill wait below, the API contract
+                # suite) reads this, so no step hard-codes an address again.
+                echo "VERISIM_API_BASE_URL=${url}" >> "$GITHUB_ENV"
+                echo "Smoke test: PASS (${url})"
+                exit 0
+              fi
+            done
           done
+          echo "Smoke test: FAIL — no candidate answered 200 in 180s."
+          echo "Candidates tried: ${CANDIDATE_URLS}"
+          docker ps -a --filter name=verisim-test
+          docker logs verisim-test 2>&1 | tail -40
+          exit 1
 
       # /health answers as soon as uvicorn is up — long before the container's
       # first-boot 30-day backfill has finished writing. The contract tests compare
@@ -119,14 +208,18 @@ jobs:
       # 2026-09-21: 3 failures, all "the count changed between two reads"). Wait for
       # the generator to leave backfill mode; the suite's quiesced_generator fixture
       # then pauses realtime generation for each walk.
+      #
+      # The address comes from the Smoke test step (VERISIM_API_BASE_URL), which is
+      # the only place that knows where the container is reachable (t_19eb986e).
       - name: Wait for the initial 30-day backfill to finish
         run: |
+          API="${VERISIM_API_BASE_URL:?the smoke test step must resolve this}"
           for i in $(seq 1 180); do
-            MODE=$(curl -s http://localhost:8010/grocery/status \
+            MODE=$(curl -s "${API}/grocery/status" \
               | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p' | head -1)
-            TOTAL=$(curl -s "http://localhost:8010/grocery/pos/transactions?limit=1" \
+            TOTAL=$(curl -s "${API}/grocery/pos/transactions?limit=1" \
               | sed -n 's/.*"total":\([0-9]*\).*/\1/p' | head -1)
-            echo "[$i] mode=${MODE:-unknown} pos.transactions=${TOTAL:-unknown}"
+            echo "[$i] ${API} mode=${MODE:-unknown} pos.transactions=${TOTAL:-unknown}"
             if [ "$MODE" = "realtime" ] || [ "$MODE" = "stopped" ]; then
               echo "Generator is out of backfill (mode=$MODE) — contract tests can run."
               exit 0
@@ -139,6 +232,8 @@ jobs:
       # Hard-fail: image API regressions block the build. If the container's API
       # is up (smoke test passed) every contract test must pass; unreachable API
       # here means the smoke test raced, so fail rather than silently skip.
+      # The suite reads VERISIM_API_BASE_URL (grocery/api/tests/conftest.py, which
+      # defaults to http://localhost:8010 for local runs), set by the smoke step.
       - name: API contract tests (blocking)
         run: python -m pytest grocery/api/tests/ -v
 
@@ -365,6 +460,11 @@ jobs:
         env:
           GATE_REASON: ${{ steps.gate.outputs.reason }}
 
+      # On this runner a pull request never gets here: `integration` is push-only
+      # (t_19eb986e) and a skipped `needs` job skips this one too — measured on PR
+      # #17, where `publish` came back `skipped`, not `success`. Nothing is
+      # published from a pull request either way; this stays as the fallback for
+      # a runner that runs dependent jobs after a skip.
       - name: Publishing skipped — pull request
         if: github.event_name == 'pull_request'
         run: |

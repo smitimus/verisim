@@ -163,6 +163,96 @@ def test_workflows_gate_publish_on_both_test_jobs():
     assert check.main() == 0
 
 
+# ── the standalone-image job's PR gate and API address (t_19eb986e) ─────────
+
+_CLEAN_WORKFLOW = """\
+name: synthetic
+on:
+  pull_request:
+jobs:
+  test:
+    steps:
+      - run: "true"
+  integration:
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          load: true
+      - name: Smoke test
+        run: |
+          CANDIDATE_URLS="http://127.0.0.1:8000"
+          echo "VERISIM_API_BASE_URL=${CANDIDATE_URLS}" >> "$GITHUB_ENV"
+  publish:
+    needs: [test, integration]
+    steps:
+      - name: Require publish credentials
+        run: |
+          if [ -z "${DOCKER_USERNAME}" ]; then exit 1; fi
+"""
+
+# Everything the three new checks are supposed to catch, in one file: the image
+# job runs on PRs, the smoke step curls a loopback that is the job container on
+# the act runner, the address is not exported for later steps, and the build
+# round-trips a ~1 GB tar through the job container's writable layer.
+_REGRESSED_WORKFLOW = """\
+name: synthetic
+on:
+  pull_request:
+jobs:
+  test:
+    steps:
+      - run: "true"
+  integration:
+    steps:
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          outputs: type=docker,dest=/tmp/image.tar
+      - name: Load image
+        run: docker load --input /tmp/image.tar
+      - name: Smoke test
+        run: |
+          curl -s http://localhost:8010/health
+  publish:
+    needs: [test, integration]
+    steps:
+      - name: Require publish credentials
+        run: |
+          if [ -z "${DOCKER_USERNAME}" ]; then exit 1; fi
+"""
+
+
+def test_workflows_checker_catches_the_pr_build_and_localhost_regressions(tmp_path, capsys):
+    """RED: plant the t_19eb986e defects and the checker must fail by name.
+
+    The runner has one 40 G volume shared with a monitoring stack, and the
+    blocking `test` job needs it: a ~1 GB image build on every PR push is disk
+    churn against the gate, not coverage. And on the self-hosted act runner the
+    job runs INSIDE a container with the host's docker socket, so a `-p` publish
+    lands on the runner host and `localhost` from the job is the job itself —
+    measured "connection refused" every time. Both were live regressions, so
+    both get a case that must fail.
+    """
+    check = _load("check_workflows")
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "clean.yml").write_text(_CLEAN_WORKFLOW)
+
+    # The clean copy must pass first, or the failing assertion below proves
+    # nothing about the mutation.
+    assert check.main(tmp_path) == 0, "the unmutated workflow must pass"
+    assert "gated off pull requests" in capsys.readouterr().out
+
+    (wf_dir / "regressed.yml").write_text(_REGRESSED_WORKFLOW)
+    assert check.main(tmp_path) == 1, "the regressed workflow must fail"
+    out = capsys.readouterr().out
+    assert "pull requests" in out, out
+    assert "localhost" in out, out
+    assert "load: true" in out, out
+
+
 @pytest.mark.parametrize(
     "name", ["check_strip_scripts", "check_api_schema_agreement", "check_workflows"]
 )

@@ -1,5 +1,8 @@
 name: Verisim Gas Station CI/CD
 
+# Runner reality check before editing: `.github/CI-RUNNER.md` (the act runner's
+# disk budget and the job-inside-a-container address problem, t_19eb986e).
+
 # Why a second workflow instead of a job in verisim-grocery.yml (t_a6ecb731).
 #
 # gas-station had a unit-test step and nothing else: its standalone image was
@@ -59,6 +62,13 @@ jobs:
   integration:
     name: Build standalone image + smoke + API contract tests
     runs-on: ubuntu-latest
+    # PUSHES ONLY — main and v* tags. Same decision as the grocery workflow
+    # (t_19eb986e): this job builds a ~1 GB image plus a multi-GB buildx builder
+    # state on the single 40 G act-runner volume that the blocking unit-test job
+    # shares with a monitoring stack, and a card branch pushes several times per
+    # PR. Every merge runs it again on main and `publish` needs both jobs, so a
+    # broken gas-station image still cannot be released.
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
@@ -72,8 +82,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build only (no Docker Hub login) — PRs and forks can validate the image
-      # without repo secrets. Publishing is a separate job.
+      # Build only (no Docker Hub login) — a push can validate the image without
+      # repo secrets. Publishing is a separate job.
+      #
+      # `load: true` instead of `outputs: type=docker,dest=/tmp/image.tar` + a
+      # `docker load` step: the tar is a second full copy of a ~1 GB image inside
+      # this job container's writable layer on the runner's root (t_19eb986e).
       - name: Build image
         uses: docker/build-push-action@v5
         with:
@@ -83,10 +97,7 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/image.tar
-
-      - name: Load image
-        run: docker load --input /tmp/image.tar
+          load: true
 
       # This is the step that did not exist before. build-and-push.sh has always
       # smoke-tested the image it built; CI had never done so for gas-station, so
@@ -95,37 +106,85 @@ jobs:
       # and do not run supervisord — which is where every one of this product's
       # historical failures lived (permission denied for schema X, t_ac80c514;
       # a stripped API that no longer imports).
+      #
+      # It has to be reachable from INSIDE the job, and on the self-hosted act
+      # runner the job runs in a container with the host's docker socket: a `-p`
+      # publish lands on the runner host, where the job cannot reach it (measured
+      # "connection refused" every time, t_19eb986e). The block below shares this
+      # container's network namespace with the smoke container when the job is
+      # itself a container, and keeps the publish path on a hosted runner. See the
+      # grocery workflow for the long version of this comment.
       - name: Smoke test
         run: |
-          docker run -d --name verisim-gas-test --rm \
-            -p 8011:8000 \
-            -v /tmp/verisim_gas_data:/var/lib/postgresql/data \
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          for i in $(seq 1 36); do
-            sleep 5
-            HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
-              http://localhost:8011/health 2>/dev/null || echo "000")
-            if [ "$HEALTH" = "200" ]; then
-              echo "Smoke test: PASS"
+          set -u
+          IMAGE="${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          API_PORT_DEFAULT=8011
+          API_PORT_IN_CONTAINER=8000
+
+          SELF_ID=""
+          for cand in "$(cat /etc/hostname 2>/dev/null || true)" \
+                      "${HOSTNAME:-}" \
+                      "$(grep -o -m1 'containers/[0-9a-f]\{64\}' /proc/self/mountinfo 2>/dev/null | cut -d/ -f2)"; do
+            [ -n "${cand}" ] || continue
+            if docker inspect "${cand}" >/dev/null 2>&1; then
+              SELF_ID="${cand}"
               break
             fi
-            if [ "$i" = "36" ]; then
-              echo "Smoke test: FAIL"
-              docker logs verisim-gas-test 2>&1 | tail -40
-              exit 1
-            fi
           done
+
+          if [ -n "${SELF_ID}" ]; then
+            echo "This job runs inside container ${SELF_ID}; the smoke container shares its network namespace."
+            NET_ARGS="--network container:${SELF_ID}"
+            CANDIDATE_URLS="http://127.0.0.1:${API_PORT_IN_CONTAINER}"
+          else
+            GW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+            echo "This job runs directly on the runner host; publishing the API on ${API_PORT_DEFAULT}."
+            NET_ARGS="-p ${API_PORT_DEFAULT}:${API_PORT_IN_CONTAINER}"
+            CANDIDATE_URLS="http://127.0.0.1:${API_PORT_DEFAULT}"
+            if [ -n "${GW}" ]; then
+              CANDIDATE_URLS="${CANDIDATE_URLS} http://${GW}:${API_PORT_DEFAULT}"
+            fi
+            CANDIDATE_URLS="${CANDIDATE_URLS} http://host.docker.internal:${API_PORT_DEFAULT}"
+          fi
+
+          # --rm plus an anonymous data volume: no half-initialised PG data dir
+          # survives between runs, and nothing is left on the runner's root.
+          docker run -d --name verisim-gas-test --rm \
+            ${NET_ARGS} \
+            -v /var/lib/postgresql/data \
+            "${IMAGE}"
+
+          for i in $(seq 1 36); do
+            sleep 5
+            for url in ${CANDIDATE_URLS}; do
+              HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "${url}/health" 2>/dev/null || true)
+              echo "[${i}] GET ${url}/health -> ${HEALTH:-000}"
+              if [ "${HEALTH}" = "200" ]; then
+                echo "VERISIM_GAS_API_BASE_URL=${url}" >> "$GITHUB_ENV"
+                echo "Smoke test: PASS (${url})"
+                exit 0
+              fi
+            done
+          done
+          echo "Smoke test: FAIL — no candidate answered 200 in 180s."
+          echo "Candidates tried: ${CANDIDATE_URLS}"
+          docker ps -a --filter name=verisim-gas-test
+          docker logs verisim-gas-test 2>&1 | tail -40
+          exit 1
 
       # /health answers as soon as uvicorn is up, long before the first-boot
       # 30-day backfill has finished. The contract tests below compare row counts
       # between two calls, so running them mid-backfill makes a moving row count
-      # look like pagination loss.
+      # look like pagination loss. The address is the smoke step's
+      # VERISIM_GAS_API_BASE_URL, which is the only thing that knows where the
+      # container is reachable (t_19eb986e).
       - name: Wait for the initial 30-day backfill to finish
         run: |
+          API="${VERISIM_GAS_API_BASE_URL:?the smoke test step must resolve this}"
           for i in $(seq 1 180); do
-            MODE=$(curl -s http://localhost:8011/gas-station/status \
+            MODE=$(curl -s "${API}/gas-station/status" \
               | sed -n 's/.*"mode":"\([a-z]*\)".*/\1/p' | head -1)
-            echo "[$i] mode=${MODE:-unknown}"
+            echo "[$i] ${API} mode=${MODE:-unknown}"
             if [ "$MODE" = "realtime" ] || [ "$MODE" = "stopped" ]; then
               echo "Generator is out of backfill (mode=$MODE) — contract tests can run."
               exit 0
@@ -243,6 +302,9 @@ jobs:
         env:
           GATE_REASON: ${{ steps.gate.outputs.reason }}
 
+      # On this runner a pull request never gets here: `integration` is push-only
+      # and a skipped `needs` job skips this one too (t_19eb986e). Kept as the
+      # fallback for a runner that runs dependent jobs after a skip.
       - name: Publishing skipped — pull request
         if: github.event_name == 'pull_request'
         run: |
