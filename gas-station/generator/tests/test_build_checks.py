@@ -595,8 +595,20 @@ def test_publish_tag_gate_catches_a_pyproject_drift(tmp_path):
     tree = _mini_tree(tmp_path, "repo_version_drift")
     assert check.main(tree) == 0
 
+    # Read the version to drift instead of naming one here. This used to
+    # hardcode `version = "1.3.4"`, so on the next release (VERSION 1.3.4 ->
+    # 1.3.5) the replace found nothing, no drift was planted, the gate rightly
+    # returned 0, and this test failed the release push instead of the bug it
+    # exists for (t_f6ce3eed). A mutation that changes nothing proves nothing,
+    # so the plant itself is asserted.
+    current = (tree / "VERSION").read_text().strip()
     pyproject = tree / "pyproject.toml"
-    pyproject.write_text(pyproject.read_text().replace(
-        'version = "1.3.4"', 'version = "0.1.0"', 1))
+    original = pyproject.read_text()
+    drifted = original.replace(f'version = "{current}"', 'version = "0.1.0"', 1)
+    assert drifted != original, (
+        "the drift must actually be planted: pyproject.toml does not contain "
+        f'version = "{current}"'
+    )
+    pyproject.write_text(drifted)
 
     assert check.main(tree) != 0, "a VERSION/pyproject drift must fail the gate"
