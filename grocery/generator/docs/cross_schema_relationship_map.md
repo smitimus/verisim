@@ -590,6 +590,26 @@ No further serializer changes are required for #26–#31.
 > `limit=1000` was measured returning 191 rows twice and 191 never while the count
 > still matched. Consumers that expected a bare list must unwrap `data`; data-lab's
 > loader already accepts either shape.
+>
+> **`/pos/coupons` is the last of them, and it has the same envelope now (t_e3008391).**
+> With `/{industry}/inventory/receipts` fixed, `GET /grocery/pos/coupons` was the only
+> route left in the API whose `limit` could silently truncate a read: `limit` capped at
+> 1000, **no `offset`**, and a **bare JSON array** with no `total`. Every other count-less
+> route in the family (`/{industry}/hr/locations`, `pos/departments`,
+> `transport/trucks`, `pos/combo-deals`) returns the whole relation and has no `limit`
+> at all — there is nothing to page — so after this change **no route caps a read without
+> also advertising `total` and accepting `offset`**. That is what lets data-lab retire its
+> read-time short-page rule (`docs/RETENTION.md` §3b): a rule about *no route at all*
+> rather than about this one. `total` counts `pos.coupons` rows under the same filter
+> (`active_only` included) and takes no join — the row query LEFT JOINs `pos.departments`
+> only to name the department, on its primary key, so the join cannot multiply rows.
+> The `ORDER BY` ends on `coupon_id`: `valid_until` is the worst sort key in the API, not
+> merely a tied one — on the test data dir all 8 coupons share a single `valid_until`
+> (2027-09-21), so the entire relation is one tie cluster and every page boundary falls
+> inside it. `active_only` is unchanged: the ingest calls `active_only=false` and counts
+> every advertised row, so a retired-but-referenced coupon stays resolvable. Consumers
+> that expected a bare list must unwrap `data`; the UI's table loader already did, and
+> data-lab's loader accepts either shape.
 
 > **A receipt header has NO vendor, and the route must not pretend otherwise
 > (t_7d966a37).** Every grocery receipt is one of *our own warehouse loads*, so a

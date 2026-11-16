@@ -1375,7 +1375,10 @@ def _load_table(table: str, start_date, end_date, loc_id, limit: int, extra: dic
     if table == "pos.departments":
         return flat(f"{pfx}/pos/departments", {})
     if table == "pos.coupons":
-        return flat(f"{pfx}/pos/coupons", {})
+        # `paged`, not `flat`: the route returns the {data,total,...} envelope
+        # (t_e3008391), so the explorer's row count is the advertised total
+        # rather than the length of the page it happened to fetch.
+        return paged(f"{pfx}/pos/coupons", {"limit": limit})
     if table == "pos.combo_deals":
         return flat(f"{pfx}/pos/combo-deals", {})
     if table == "timeclock.events":
@@ -1956,7 +1959,11 @@ with tab4:
             # ── Coupons ──────────────────────────────────────────────────────────
             with promo_tab_coupons:
                 st.markdown("#### Active Coupons")
-                coupons_all = api_get("/grocery/pos/coupons", {"active_only": False, "limit": 500}) or []
+                coupons_all = (api_get("/grocery/pos/coupons",
+                                       {"active_only": False, "limit": 500}) or {})
+                # The route returns the {data,total,limit,offset} envelope (t_e3008391),
+                # so iterating the response itself would walk its keys.
+                coupons_all = coupons_all.get("data", []) if isinstance(coupons_all, dict) else coupons_all
 
                 if coupons_all:
                     for coup in coupons_all:

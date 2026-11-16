@@ -1311,8 +1311,9 @@ def pos_departments():
 
 
 @app.get("/grocery/pos/coupons", tags=["Grocery — POS"])
-def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
-    """Coupons. `active_only=false` serves retired-but-referenced coupons too.
+def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000),
+                offset: int = 0):
+    """Coupons, paged and counted (t_e3008391). `active_only=false` serves retired-but-referenced coupons too.
 
     `pos.transaction_items.coupon_id` carries a real FK to this table, so every
     coupon a line item references is guaranteed to exist here — but
@@ -1330,27 +1331,47 @@ def pos_coupons(active_only: bool = True, limit: int = Query(200, le=1000)):
     consumer can still tell retired from current — without it a full load is
     indistinguishable from an active one.
 
-    No `offset`, unlike most list routes: `limit` alone caps this response at
-    1000 rows. That is above the relation's size (8 named coupons plus whatever
-    `seed_coupons` tops the active set up to, which retires the expired ones
-    rather than accumulating), so the whole relation fits in one request. It is
-    a ceiling rather than a page — a consumer that ever needed row 1001 would
-    get the first 1000 on every request instead of a `total` to reconcile
-    against. Pinned by grocery/api/tests/test_coupon_resolvability.py.
+    This route used to be the LAST count-less capped route in the API
+    (t_e3008391): `limit` capped at 1000, no `offset`, and a bare JSON array —
+    so a relation of 1,001 coupons and its first 1,000 rows were the same
+    answer, and a consumer could neither reach row 1,001 nor prove its window
+    complete. It now returns the `{data, total, limit, offset}` envelope its
+    siblings use (`/inventory/receipts` got the same shape in t_2ab8e903) and
+    `total` counts `pos.coupons` rows under the SAME filter, so the count needs
+    no join: the row query LEFT JOINs `pos.departments` only to name the
+    department, and `departments.department_id` is its primary key, so the join
+    cannot multiply rows.
+
+    The `ORDER BY` ends on `c.coupon_id` (t_d7892e10). `valid_until` is not a
+    total order — it is not even close: on the test data dir all 8 coupons share
+    one `valid_until` (2027-09-21), i.e. the whole relation is a single tie
+    cluster, so every page boundary falls inside it and Postgres is free to
+    order the cluster differently per plan. `seed_coupons` retires and tops the
+    set back up rather than letting it grow, so the relation stays small today;
+    the tiebreaker is what keeps that from being a correctness argument.
+
+    Payload-shape change: the bare list is gone. data-lab's loader accepts
+    either shape (`data if isinstance(data, list) else data["data"]`) and uses
+    `total`, when present, to prove a load complete; the UI's table loader
+    already unwraps an envelope.
     """
     filters, params = ["TRUE"], []
     if active_only:
         filters.append("c.is_active = TRUE AND c.valid_until >= CURRENT_DATE")
     where = " AND ".join(filters)
-    return query(f"""
+    # One row per coupon, so the count is of coupons and needs no join.
+    total = query(f"SELECT COUNT(*) AS n FROM pos.coupons c WHERE {where}",
+                  params, "grocery")[0]["n"]
+    rows = query(f"""
         SELECT c.coupon_id, c.code, c.description, c.coupon_type, c.discount_value,
                c.min_purchase, d.name AS department, c.uses_count, c.max_uses,
                c.valid_from, c.valid_until, c.is_active
         FROM pos.coupons c
         LEFT JOIN pos.departments d ON d.department_id = c.department_id
         WHERE {where}
-        ORDER BY c.valid_until DESC LIMIT %s
-    """, params + [limit], "grocery")
+        ORDER BY c.valid_until DESC, c.coupon_id DESC LIMIT %s OFFSET %s
+    """, params + [limit, offset], "grocery")
+    return {"data": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/grocery/pos/combo-deals", tags=["Grocery — POS"])

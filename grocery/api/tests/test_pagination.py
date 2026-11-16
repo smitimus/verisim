@@ -102,6 +102,13 @@ PAGINATED_ROUTES = [
     # The tick ledger: 37k+ rows and two clocks, so it is the one route where paging
     # correctness and a window both matter (t_ac80c514).
     ("/grocery/stats/generation", "stat_id", 1000),
+    # The last count-less capped route (t_e3008391): `limit` capped at 1000, no
+    # `offset`, bare list. Its sort key is the least discriminating in the API —
+    # `valid_until` is identical on every row of the relation, so the page order
+    # inside that single tie cluster is entirely up to the plan. Page size 3 on
+    # purpose: the relation is ~8 rows everywhere, and a limit=1000 walk would be
+    # one request that proves nothing about `offset`.
+    ("/grocery/pos/coupons", "coupon_id", 3),
     # The one receipt-shaped route that could not page at all until t_2ab8e903, and
     # the worst sort key of the set it joins: `received_dt` is shared by every row
     # (85 distinct values over 7,232 receipts on the test data dir), so paging it
